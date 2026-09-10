@@ -13,6 +13,11 @@ services:
     environment:
       # Only used by the delivery loop; harmless when unset in sign-only mode.
       RUST_LOG: "${RUST_LOG:-info}"
+      # The marker observer's credential (Indexer scope). The delivering relayer
+      # reads the gate's ["executed"|"refunded", id] markers and reports observed
+      # claimed/cancelled/refunded to the store — the Solana gate's stand-in for
+      # the EVM indexer. Named by `[store] indexer_token_env` in the config.
+      SIG_STORE_INDEXER_TOKEN: "${SIG_STORE_INDEXER_TOKEN:?set SIG_STORE_INDEXER_TOKEN}"
 
 secrets:
   # The Solana keypair that pays fees and rent for claim transactions. It holds

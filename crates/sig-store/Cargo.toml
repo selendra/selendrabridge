@@ -28,3 +28,5 @@ bridge-core = { workspace = true, features = ["axum-auth", "abi"] }
 alloy = { workspace = true }
 alloy-primitives = { workspace = true }
 hex = { workspace = true }
+# The live test ages a row into the refund path with a negative sweep timeout.
+chrono = { workspace = true }

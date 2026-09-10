@@ -20,6 +20,37 @@ pub struct Config {
     /// both need this block.
     #[serde(default)]
     pub refund: Option<RefundConfig>,
+    /// The marker observer (see [`crate::observer`]). Optional: the defaults
+    /// apply when the block is absent, and whether the loop RUNS at all is
+    /// decided by whether `[store]` resolves an indexer token — the observer's
+    /// reports are authoritative, so it must never run on some other credential.
+    #[serde(default)]
+    pub observer: ObserverConfig,
+}
+
+/// Tuning for the observer loop that reports Solana terminal markers to the
+/// store. Presence of a token, not of this block, is what switches it on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverConfig {
+    /// How often to list the store's pending queues and read their markers.
+    /// Slower than the claim loop on purpose: it exists to close out delivered
+    /// transfers, not to race the submitter.
+    #[serde(default = "default_observer_poll")]
+    pub poll_interval_ms: u64,
+    /// **SECURITY.** Commitment the markers are read at. A report is
+    /// authoritative — it takes the transfer out of every work queue for good —
+    /// so a marker that a fork later discards would hide a transfer that was
+    /// never delivered. `finalized` is the only safe choice; anything lower
+    /// needs `[source].allow_unfinalized` (local test validator only).
+    #[serde(default = "default_commitment")]
+    pub commitment: String,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        ObserverConfig { poll_interval_ms: default_observer_poll(), commitment: default_commitment() }
+    }
 }
 
 /// The refund attester's on-chain verification sources.
@@ -155,6 +186,47 @@ pub struct Store {
     /// since this process does exactly what a validator does: it signs.
     #[serde(default = "default_token_env")]
     pub token_env: String,
+    /// The OBSERVER's credential (`Indexer` scope), inline. Prefer
+    /// `indexer_token_env`. When neither is configured — or the named variable
+    /// is unset/empty — the observer loop does not run and this process only
+    /// signs/delivers/attests. The token IS the switch: its reports are
+    /// authoritative and must never ride on the validator token above, so
+    /// nothing is inferred from the environment that the config did not name.
+    #[serde(default)]
+    pub indexer_token: Option<String>,
+    /// Env var holding the observer's credential, e.g. `SIG_STORE_INDEXER_TOKEN`.
+    /// `scripts/bridge-from-json.sh` writes it for the relayers that deliver.
+    #[serde(default)]
+    pub indexer_token_env: Option<String>,
+}
+
+impl Store {
+    /// The validator-scoped bearer, if the environment has one.
+    pub fn token(&self) -> Option<String> {
+        std::env::var(&self.token_env).ok().filter(|t| !t.is_empty())
+    }
+
+    /// The observer's `Indexer`-scoped bearer: the inline value wins, then the
+    /// named environment variable. `None` means "run no observer". Never falls
+    /// back to `token_env` or to the legacy `SIG_STORE_TOKEN`: an authoritative
+    /// write must ride only on the credential the operator handed out for it.
+    pub fn indexer_token(&self) -> Option<String> {
+        self.indexer_token.clone().filter(|t| !t.is_empty()).or_else(|| {
+            self.indexer_token_env
+                .as_deref()
+                .and_then(|var| std::env::var(var).ok())
+                .filter(|t| !t.is_empty())
+        })
+    }
+
+    /// What to name in the log when the observer is (in)active.
+    pub fn indexer_token_source(&self) -> String {
+        match (&self.indexer_token, &self.indexer_token_env) {
+            (Some(_), _) => "[store].indexer_token".into(),
+            (None, Some(var)) => format!("[store].indexer_token_env = {var}"),
+            (None, None) => "[store].indexer_token_env (not configured)".into(),
+        }
+    }
 }
 
 fn default_commitment() -> String {
@@ -171,6 +243,9 @@ fn default_batch() -> usize {
 }
 fn default_token_env() -> String {
     "SIG_STORE_VALIDATOR_TOKEN".into()
+}
+fn default_observer_poll() -> u64 {
+    10_000
 }
 
 impl Config {
@@ -200,6 +275,20 @@ impl Config {
         }
         if !matches!(cfg.source.commitment.as_str(), "finalized" | "confirmed" | "processed") {
             anyhow::bail!("unknown commitment {:?}", cfg.source.commitment);
+        }
+        // The observer's reports are authoritative (they retire a transfer from
+        // every work queue), so its read depth gets the same fail-closed rule.
+        if !matches!(cfg.observer.commitment.as_str(), "finalized" | "confirmed" | "processed") {
+            anyhow::bail!("unknown [observer].commitment {:?}", cfg.observer.commitment);
+        }
+        if cfg.observer.commitment != "finalized" && !cfg.source.allow_unfinalized {
+            anyhow::bail!(
+                "[observer].commitment = {:?} — a marker that a fork later discards would be \
+                 reported as a delivered transfer and hidden from the claim and refund queues \
+                 for good. Use \"finalized\", or set [source].allow_unfinalized = true ONLY for a \
+                 local test validator.",
+                cfg.observer.commitment
+            );
         }
         if let Some(r) = &cfg.refund {
             // A zero or negative timeout silently disables the age gate — the
@@ -340,5 +429,88 @@ mod tests {
     fn no_refund_block_is_still_a_valid_config() {
         let c = Config::from_toml(&cfg("")).unwrap();
         assert!(c.refund.is_none());
+    }
+
+    // --- [observer] / indexer token -------------------------------------------
+
+    #[test]
+    fn observer_defaults_to_ten_seconds_finalized_and_no_token() {
+        let c = Config::from_toml(&cfg("")).unwrap();
+        assert_eq!(c.observer.poll_interval_ms, 10_000);
+        assert_eq!(c.observer.commitment, "finalized");
+        assert!(c.store.indexer_token_env.is_none());
+        assert!(c.store.indexer_token.is_none());
+        assert_eq!(c.store.indexer_token(), None, "nothing configured => no observer");
+    }
+
+    /// The token IS the switch: with nothing configured, no observer — even if
+    /// `SIG_STORE_INDEXER_TOKEN` happens to be exported (host mode exports every
+    /// token to every process; only the relayer whose config names it observes).
+    /// The validator token is never a substitute, whatever the environment holds.
+    #[test]
+    fn the_indexer_token_is_read_only_from_where_the_config_points() {
+        let mut c = Config::from_toml(&cfg("")).unwrap();
+        c.store.token_env = "SOLANA_RELAYER_TEST_VAL_TOKEN".into();
+        std::env::set_var("SOLANA_RELAYER_TEST_VAL_TOKEN", "val");
+        std::env::set_var("SIG_STORE_TOKEN", "legacy");
+        std::env::set_var("SIG_STORE_INDEXER_TOKEN", "exported-but-not-named");
+        assert_eq!(c.store.token().as_deref(), Some("val"));
+        assert_eq!(c.store.indexer_token(), None, "an unnamed variable is not a credential");
+
+        // Named but unset: still none.
+        c.store.indexer_token_env = Some("SOLANA_RELAYER_TEST_IDX_TOKEN_UNSET".into());
+        std::env::remove_var("SOLANA_RELAYER_TEST_IDX_TOKEN_UNSET");
+        assert_eq!(c.store.indexer_token(), None);
+
+        // An empty variable is "unset", not an empty credential.
+        c.store.indexer_token_env = Some("SOLANA_RELAYER_TEST_IDX_TOKEN_EMPTY".into());
+        std::env::set_var("SOLANA_RELAYER_TEST_IDX_TOKEN_EMPTY", "");
+        assert_eq!(c.store.indexer_token(), None);
+
+        // Inline wins over the environment; the named environment works alone.
+        c.store.indexer_token = Some("inline".into());
+        assert_eq!(c.store.indexer_token().as_deref(), Some("inline"));
+        c.store.indexer_token = None;
+        c.store.indexer_token_env = Some("SIG_STORE_INDEXER_TOKEN".into());
+        assert_eq!(c.store.indexer_token().as_deref(), Some("exported-but-not-named"));
+        for v in [
+            "SIG_STORE_TOKEN",
+            "SIG_STORE_INDEXER_TOKEN",
+            "SOLANA_RELAYER_TEST_VAL_TOKEN",
+            "SOLANA_RELAYER_TEST_IDX_TOKEN_EMPTY",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    #[test]
+    fn observer_block_is_parsed_and_the_store_names_its_token_env() {
+        let raw = format!(
+            "{}indexer_token_env = \"MY_IDX\"\n[observer]\npoll_interval_ms = 3000\n",
+            cfg("")
+        );
+        let c = Config::from_toml(&raw).unwrap();
+        assert_eq!(c.observer.poll_interval_ms, 3000);
+        assert_eq!(c.store.indexer_token_env.as_deref(), Some("MY_IDX"));
+    }
+
+    /// Same fail-closed rule as the scanner: an authoritative report must not
+    /// come from a read a fork can still discard.
+    #[test]
+    fn an_unfinalized_observer_commitment_is_refused_without_the_opt_in() {
+        let err = Config::from_toml(&format!("{}[observer]\ncommitment = \"confirmed\"\n", cfg("")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[observer].commitment"), "{err}");
+        let ok = Config::from_toml(&format!(
+            "{}[observer]\ncommitment = \"confirmed\"\n",
+            cfg("allow_unfinalized = true")
+        ))
+        .expect("opt-in should load");
+        assert_eq!(ok.observer.commitment, "confirmed");
+        let err = Config::from_toml(&format!("{}[observer]\ncommitment = \"final\"\n", cfg("")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown"), "{err}");
     }
 }

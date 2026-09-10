@@ -5,8 +5,8 @@
 //! dedupes by signer, so multiple validators converge on one record per id.
 
 use crate::allow::{
-    AllowedChain, AllowedToken, Allowlist, AttestationRequest, ClaimedRequest, SubmissionHistory,
-    SwapRecord,
+    AllowedChain, AllowedToken, Allowlist, AttestationRequest, ClaimedRequest,
+    ObservedCancelledRequest, ObservedRefundedRequest, SubmissionHistory, SwapRecord,
 };
 use crate::store::{SigKind, SignerSig, SubmissionRecord};
 
@@ -82,6 +82,20 @@ impl RemoteStore {
             .ok()
             .filter(|t| !t.is_empty())
             .or_else(|| std::env::var("SIG_STORE_TOKEN").ok());
+        Self::with_token(base, token)
+    }
+
+    /// A client for an OBSERVER: a process that reads terminal markers on a
+    /// chain the EVM indexer cannot see and reports them through the
+    /// `Indexer`-scoped `/observed/*` routes. `indexer_token_env` is that
+    /// process's own variable (`SIG_STORE_INDEXER_TOKEN` by convention).
+    ///
+    /// No `SIG_STORE_TOKEN` fallback here, deliberately: the reports are
+    /// authoritative, so the credential must be one the operator handed out for
+    /// exactly that purpose. With the variable unset the store answers 401 and
+    /// nothing moves.
+    pub fn for_indexer(base: impl Into<String>, indexer_token_env: &str) -> Self {
+        let token = std::env::var(indexer_token_env).ok().filter(|t| !t.is_empty());
         Self::with_token(base, token)
     }
 
@@ -297,10 +311,72 @@ impl RemoteStore {
         json_capped(self.client.get(url).send().await?).await
     }
 
-    // The `cancelled`/`refunded` lifecycle is written only by the indexer from
-    // observed on-chain events, so the keeper/relayer client intentionally has no
-    // method to set it (that would be reporting a candidate-gating state on the
-    // caller's word). See sig-store's router note.
+    // The `cancelled`/`refunded` lifecycle is written only from OBSERVED on-chain
+    // events — by the EVM indexer directly, or through the `Indexer`-scoped
+    // `/observed/*` routes below — so the keeper/relayer client intentionally has
+    // no method to set it on its own word. See sig-store's router note.
+
+    // --- observed terminal states (Indexer scope) ---------------------------
+
+    /// Report a `Claimed` this process OBSERVED on the destination chain.
+    ///
+    /// **Authoritative**: the store runs the same `mark_claimed` the EVM indexer
+    /// does (status → `claimed`, an `eligible` refund flag cleared, an unknown id
+    /// parked until its `Sent` row arrives). Only an `Indexer`-scoped credential
+    /// is accepted — the keeper's `Relay` token gets 401 here, which is the M-1
+    /// posture: a report of one's OWN claim is advisory, a report of what the
+    /// chain says is not.
+    pub async fn report_observed_claimed(
+        &self,
+        submission_id: &str,
+        claim_tx: &str,
+    ) -> Result<(), RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/observed/claimed", self.base);
+        self.client
+            .post(url)
+            .json(&ClaimedRequest { claim_tx: claim_tx.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Report a destination burn (`Cancelled`) this process OBSERVED. Authoritative;
+    /// see [`RemoteStore::report_observed_claimed`].
+    pub async fn report_observed_cancelled(
+        &self,
+        submission_id: &str,
+        cancel_tx: &str,
+    ) -> Result<(), RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/observed/cancelled", self.base);
+        self.client
+            .post(url)
+            .json(&ObservedCancelledRequest { cancel_tx: cancel_tx.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Report a source payout (`Refunded`) this process OBSERVED. Authoritative;
+    /// see [`RemoteStore::report_observed_claimed`].
+    pub async fn report_observed_refunded(
+        &self,
+        submission_id: &str,
+        refund_tx: &str,
+    ) -> Result<(), RemoteError> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let url = format!("{}/submissions/{id}/observed/refunded", self.base);
+        self.client
+            .post(url)
+            .json(&ObservedRefundedRequest { refund_tx: refund_tx.to_string() })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +496,103 @@ mod tests {
         .await;
         let resp = get(&base).await;
         assert!(matches!(json_capped::<Vec<AllowedChain>>(resp).await, Err(RemoteError::Http(_))));
+    }
+
+    /// Serve one `204` and hand back everything the client sent (head + body).
+    async fn capture_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut seen = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                // Head complete and the declared body fully read?
+                if let Some(pos) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&seen[..pos]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if seen.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// The observer's three reports land on the `Indexer`-scoped `/observed/*`
+    /// routes — NOT on the keeper's advisory `/claimed` — with the id un-prefixed
+    /// the way every other per-id route is addressed, the bearer attached, and
+    /// the tx under the field name the store's request type reads.
+    #[tokio::test]
+    async fn observed_reports_hit_the_indexer_routes_with_the_bearer() {
+        let id = format!("0x{}", "ab".repeat(32));
+        let cases: [(&str, &str, &str); 3] = [
+            ("claimed", "claim_tx", "sig-claim"),
+            ("cancelled", "cancel_tx", "sig-cancel"),
+            ("refunded", "refund_tx", "sig-refund"),
+        ];
+        for (route, field, tx) in cases {
+            let (base, rx) = capture_server().await;
+            let store = RemoteStore::with_token(&base, Some("obs-token".into()));
+            let res = match route {
+                "claimed" => store.report_observed_claimed(&id, tx).await,
+                "cancelled" => store.report_observed_cancelled(&id, tx).await,
+                _ => store.report_observed_refunded(&id, tx).await,
+            };
+            res.unwrap_or_else(|e| panic!("{route}: {e}"));
+            let raw = rx.await.unwrap();
+            let first = raw.lines().next().unwrap();
+            assert_eq!(first, format!("POST /submissions/{}/observed/{route} HTTP/1.1", &id[2..]), "{route}");
+            assert!(
+                !first.starts_with(&format!("POST /submissions/{}/claimed", &id[2..])),
+                "must not use the advisory Relay route"
+            );
+            assert!(raw.contains("authorization: Bearer obs-token"), "{route}: bearer missing in {raw}");
+            let body = raw.split("\r\n\r\n").nth(1).unwrap();
+            let json: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(json[field], tx, "{route}: body {body}");
+        }
+    }
+
+    /// `for_indexer` has NO legacy fallback: with its variable unset the client
+    /// sends no credential at all, so a store that enforces auth answers 401 and
+    /// an authoritative write can never ride on a token nobody meant for it.
+    #[tokio::test]
+    async fn for_indexer_does_not_fall_back_to_the_legacy_token() {
+        let id = format!("0x{}", "cd".repeat(32));
+        std::env::set_var("SIG_STORE_TOKEN", "legacy-all-scopes");
+        std::env::remove_var("REMOTE_TEST_INDEXER_TOKEN_UNSET");
+        let (base, rx) = capture_server().await;
+        RemoteStore::for_indexer(&base, "REMOTE_TEST_INDEXER_TOKEN_UNSET")
+            .report_observed_claimed(&id, "sig")
+            .await
+            .unwrap();
+        let raw = rx.await.unwrap().to_ascii_lowercase();
+        assert!(!raw.contains("authorization:"), "no credential must be sent: {raw}");
+        std::env::remove_var("SIG_STORE_TOKEN");
+
+        std::env::set_var("REMOTE_TEST_INDEXER_TOKEN_SET", "obs");
+        let (base, rx) = capture_server().await;
+        RemoteStore::for_indexer(&base, "REMOTE_TEST_INDEXER_TOKEN_SET")
+            .report_observed_claimed(&id, "sig")
+            .await
+            .unwrap();
+        let raw = rx.await.unwrap();
+        assert!(raw.contains("authorization: Bearer obs"), "{raw}");
+        std::env::remove_var("REMOTE_TEST_INDEXER_TOKEN_SET");
     }
 
     /// The client is built with both timeouts. reqwest does not expose them, so

@@ -449,6 +449,63 @@ impl SolanaGate {
     }
 }
 
+/// Marker bytes the gate writes into `["executed", id]` — mirrored from
+/// `solana-gate` (`MARKER_CLAIMED` / `MARKER_CANCELLED`) and from the relayer's
+/// `gate.rs`, and pinned by `marker_state_*` below.
+// `executed` is "any program-owned data" (a burn sets it too, as on EVM), so
+// only the cancelled byte is consulted at runtime; the claimed byte is kept
+// alongside it so the pair is pinned against the program in one place.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MARKER_CLAIMED: u8 = 1;
+pub const MARKER_CANCELLED: u8 = 2;
+
+/// What a `["executed", id]` account says: `(executed, cancelled)`. Pure, so the
+/// rule is testable without a cluster.
+///
+/// Only a PDA the PROGRAM owns, with data, is state — anyone can fund a derived
+/// address, and treating that as "executed" would show a user's undelivered
+/// transfer as delivered. `executed` covers both a claim and a burn, exactly as
+/// the EVM `Gate.executed` does; `cancelled` says which.
+pub fn marker_state(account: Option<(bool, &[u8])>) -> (bool, bool) {
+    match account {
+        Some((true, data)) if !data.is_empty() => (true, data[0] == MARKER_CANCELLED),
+        _ => (false, false),
+    }
+}
+
+impl SolanaGate {
+    /// The destination marker for a submission: `(executed, cancelled)`, read
+    /// from the `["executed", id]` PDA at `confirmed` — the same account the
+    /// Solana relayer's submitter and observer read, so the explorer shows what
+    /// they act on.
+    pub async fn executed_marker(&self, submission_id: &str) -> anyhow::Result<(bool, bool)> {
+        let program = from_b58(&self.program)
+            .ok_or_else(|| anyhow::anyhow!("gate program is not base58"))?;
+        let id = hex_32(submission_id).ok_or_else(|| anyhow::anyhow!("submissionId must be 0x + 64 hex"))?;
+        let (pda, _) = swap_math::pda::find_program_address(&[b"executed", &id], &program)
+            .ok_or_else(|| anyhow::anyhow!("no executed PDA"))?;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [b58(&pda), {"encoding": "base64", "commitment": "confirmed"}],
+        });
+        let resp: serde_json::Value =
+            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
+        if let Some(err) = resp.get("error") {
+            anyhow::bail!("getAccountInfo failed: {err}");
+        }
+        let value = &resp["result"]["value"];
+        if value.is_null() {
+            return Ok(marker_state(None));
+        }
+        let owner_is_program = value["owner"].as_str() == Some(self.program.as_str());
+        let b64 = value["data"][0].as_str().ok_or_else(|| anyhow::anyhow!("account data is not base64"))?;
+        let data = base64::engine::general_purpose::STANDARD.decode(b64)?;
+        Ok(marker_state(Some((owner_is_program, &data))))
+    }
+}
+
 fn hex_32(s: &str) -> Option<[u8; 32]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
     if h.len() != 64 {
@@ -479,6 +536,39 @@ pub fn from_b58(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the destination marker (EVM->Solana explorer status) -----------------
+
+    /// A program-owned `["executed", id]` holding the claimed byte is a
+    /// delivered transfer: `executed`, not `cancelled` — EXECUTED in the explorer.
+    #[test]
+    fn marker_state_reads_a_claim_as_executed() {
+        assert_eq!(marker_state(Some((true, &[MARKER_CLAIMED]))), (true, false));
+    }
+
+    /// A burn sets `executed` too (as `Gate.cancel` does on EVM) and is told
+    /// apart by the byte — CANCELLED, never EXECUTED, so nobody is told their
+    /// funds arrived when they were returned.
+    #[test]
+    fn marker_state_reads_a_burn_as_cancelled() {
+        assert_eq!(marker_state(Some((true, &[MARKER_CANCELLED]))), (true, true));
+    }
+
+    /// Absent, foreign-owned (anyone can fund a derived address) or empty: not
+    /// executed. A false "delivered" here would hide an undelivered transfer.
+    #[test]
+    fn marker_state_trusts_only_program_owned_data() {
+        for acct in [None, Some((false, &[MARKER_CLAIMED][..])), Some((true, &[][..]))] {
+            assert_eq!(marker_state(acct), (false, false), "{acct:?}");
+        }
+    }
+
+    /// The bytes are mirrored from the program; pin them.
+    #[test]
+    fn marker_bytes_match_the_program() {
+        assert_eq!(MARKER_CLAIMED, 1);
+        assert_eq!(MARKER_CANCELLED, 2);
+    }
 
     #[test]
     fn base58_round_trips() {

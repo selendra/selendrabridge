@@ -18,6 +18,7 @@
 pub mod config;
 pub mod evm;
 pub mod gate;
+pub mod observer;
 pub mod refund;
 pub mod source;
 pub mod state;

@@ -133,6 +133,80 @@ impl Store {
         }
         Ok(res.json().await?)
     }
+
+    /// The store's target-side work queue for `chain_id_to`: transfers it still
+    /// believes may need a claim or a cancel there (`status <> 'claimed'`, not
+    /// cancelled/refunded). Filtered server-side on the lifecycle the indexer —
+    /// and, for Solana, the observer — maintains.
+    pub async fn pending_claims(&self, chain_id_to: u64) -> anyhow::Result<Vec<SubmissionRecord>> {
+        self.get_json(&format!("/submissions?pending=claims&chain_id_to={chain_id_to}")).await
+    }
+
+    /// The store's source-side work queue for `chain_id_from`: transfers with a
+    /// refund attestation that are not yet recorded as repaid.
+    pub async fn pending_refunds(&self, chain_id_from: u64) -> anyhow::Result<Vec<SubmissionRecord>> {
+        self.get_json(&format!("/submissions?pending=refunds&chain_id_from={chain_id_from}")).await
+    }
+}
+
+/// A terminal state an observer saw on-chain, and the store route that records
+/// it. The store treats the report as AUTHORITATIVE (it runs the same `mark_*`
+/// the EVM indexer does), which is why it is accepted only from the
+/// `Indexer`-scoped credential — never from the validator token this process
+/// otherwise carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Terminal {
+    /// Destination delivered it: `["executed", id]` holds `MARKER_CLAIMED`.
+    Claimed,
+    /// Destination burned it: `["executed", id]` holds `MARKER_CANCELLED`.
+    Cancelled,
+    /// Source repaid it: `["refunded", id]` exists.
+    Refunded,
+}
+
+impl Terminal {
+    /// The route suffix and the body field the store reads for this state.
+    pub fn route(self) -> &'static str {
+        match self {
+            Terminal::Claimed => "claimed",
+            Terminal::Cancelled => "cancelled",
+            Terminal::Refunded => "refunded",
+        }
+    }
+
+    pub fn tx_field(self) -> &'static str {
+        match self {
+            Terminal::Claimed => "claim_tx",
+            Terminal::Cancelled => "cancel_tx",
+            Terminal::Refunded => "refund_tx",
+        }
+    }
+}
+
+impl Store {
+    /// Report an OBSERVED terminal state: `POST /submissions/:id/observed/<state>`
+    /// with the tx (a Solana signature, or the marker address when the
+    /// signature could not be fetched cheaply) under the field the store expects.
+    ///
+    /// Must be sent from a client built with the indexer token; the store answers
+    /// 401 to anything else, and this returns that as an error so the caller
+    /// retries on the next tick rather than marking the id reported.
+    pub async fn report_observed(&self, submission_id: &str, what: Terminal, tx: &str) -> anyhow::Result<()> {
+        let id = submission_id.strip_prefix("0x").unwrap_or(submission_id);
+        let body = serde_json::json!({ what.tx_field(): tx });
+        let res = self
+            .client
+            .post(format!("{}/submissions/{id}/observed/{}", self.base, what.route()))
+            .json(&body)
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            anyhow::bail!("sig-store rejected the observed-{} report ({status}): {text}", what.route());
+        }
+        Ok(())
+    }
 }
 
 /// One whitelisted asset, as the sig-store serves it at `/allowed/tokens`.
@@ -332,6 +406,17 @@ mod tests {
                 .expect("parses the served shape");
         assert_eq!(chains[0].chain_id_from, 7_565_164);
         assert_eq!(chains[0].chain_id_to, 11_155_111);
+    }
+
+    /// The observed-report wire shape, pinned the same way: route suffix and body
+    /// field must match `sig-store`'s `/observed/*` handlers and their request
+    /// types (`ClaimedRequest { claim_tx }`, `ObservedCancelledRequest
+    /// { cancel_tx }`, `ObservedRefundedRequest { refund_tx }`).
+    #[test]
+    fn the_observed_report_wire_format_matches_the_sig_store() {
+        assert_eq!((Terminal::Claimed.route(), Terminal::Claimed.tx_field()), ("claimed", "claim_tx"));
+        assert_eq!((Terminal::Cancelled.route(), Terminal::Cancelled.tx_field()), ("cancelled", "cancel_tx"));
+        assert_eq!((Terminal::Refunded.route(), Terminal::Refunded.tx_field()), ("refunded", "refund_tx"));
     }
 
     /// The store parses `bridge_domain` with `B256::from_str`, which accepts only

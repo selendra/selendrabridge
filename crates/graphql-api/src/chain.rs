@@ -475,15 +475,44 @@ impl Chains {
     /// `executed(submissionId)` on the destination gate. `None` when `chain_id_to`
     /// isn't configured, the id is malformed, or the RPC call fails — a flaky RPC
     /// must never fail the whole GraphQL query, only leave status unknown.
+    ///
+    /// A Solana destination answers from the gate's `["executed", id]` marker
+    /// PDA (see [`Chains::solana_marker`]), so an EVM->Solana transfer reads
+    /// EXECUTED/CANCELLED in the explorer once the relayer delivered or burned
+    /// it — before this it fell through to READY for good, because only EVM
+    /// gates were consulted and the store's `SubmissionRecord` carries no
+    /// lifecycle.
     pub async fn executed(&self, chain_id_to: u64, submission_id: &str) -> Option<bool> {
-        let (provider, gate) = self.gates.get(&chain_id_to)?;
         if let Some(v) = self.terminal.executed(chain_id_to, submission_id) {
             return Some(v);
         }
+        if self.solana_gates.contains_key(&chain_id_to) {
+            return self.solana_marker(chain_id_to, submission_id).await.map(|(e, _)| e);
+        }
+        let (provider, gate) = self.gates.get(&chain_id_to)?;
         let id = B256::from_str(submission_id).ok()?;
         let v = Gate::new(*gate, provider).executed(id).call().await.ok()?;
         self.terminal.note_executed(chain_id_to, submission_id, v);
         Some(v)
+    }
+
+    /// One read of a Solana destination's marker, memoised like the EVM flags:
+    /// `(executed, cancelled)`, or `None` on an RPC failure (status unknown,
+    /// never a failed query).
+    async fn solana_marker(&self, chain_id_to: u64, submission_id: &str) -> Option<(bool, bool)> {
+        let gate = self.solana_gates.get(&chain_id_to)?;
+        let (executed, cancelled) = match gate.executed_marker(submission_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(chain_id_to, submission_id, error = %e, "solana marker unreadable");
+                return None;
+            }
+        };
+        self.terminal.note_executed(chain_id_to, submission_id, executed);
+        // Both flags come from ONE account, so `cancelled == false` is settled
+        // the moment `executed == true` — note both, as the EVM path does.
+        self.terminal.note_cancelled(chain_id_to, submission_id, cancelled);
+        Some((executed, cancelled))
     }
 
     /// `cancelled(submissionId)` on the destination gate.
@@ -493,10 +522,13 @@ impl Chains {
     /// transfer as EXECUTED would tell a user their funds arrived when in fact
     /// they were returned on the source chain, so the two are read together.
     pub async fn cancelled(&self, chain_id_to: u64, submission_id: &str) -> Option<bool> {
-        let (provider, gate) = self.gates.get(&chain_id_to)?;
         if let Some(v) = self.terminal.cancelled(chain_id_to, submission_id) {
             return Some(v);
         }
+        if self.solana_gates.contains_key(&chain_id_to) {
+            return self.solana_marker(chain_id_to, submission_id).await.map(|(_, c)| c);
+        }
+        let (provider, gate) = self.gates.get(&chain_id_to)?;
         let id = B256::from_str(submission_id).ok()?;
         let v = Gate::new(*gate, provider).cancelled(id).call().await.ok()?;
         self.terminal.note_cancelled(chain_id_to, submission_id, v);
@@ -615,6 +647,92 @@ mod tests {
         let raw = r#"[{"chain_id": 1, "name": "x", "gate": "not a gate!"}]"#;
         let err = parse_registry(raw, "chains.json").unwrap_err().to_string();
         assert!(err.contains("neither an 0x address nor a base58"), "got: {err}");
+    }
+
+    /// A mock Solana JSON-RPC that answers `getAccountInfo` with one fixed
+    /// account (or `null`) and counts the calls. Returns its URL.
+    async fn mock_solana_rpc(owner: &'static str, data: Option<&'static [u8]>, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use axum::{routing::post, Json, Router};
+        use base64::Engine as _;
+        let value = match data {
+            None => serde_json::Value::Null,
+            Some(d) => serde_json::json!({
+                "owner": owner,
+                "data": [base64::engine::general_purpose::STANDARD.encode(d), "base64"],
+                "lamports": 1, "executable": false, "rentEpoch": 0,
+            }),
+        };
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let value = value.clone();
+                let calls = calls.clone();
+                async move {
+                    assert_eq!(req["method"], "getAccountInfo");
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":value}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    const SUB_ID: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// THE explorer half of the fix: a Solana destination answers `executed` /
+    /// `cancelled` from the gate's `["executed", id]` marker, so a delivered
+    /// EVM->Solana transfer reads EXECUTED rather than READY forever. And a
+    /// settled answer is memoised exactly like an EVM flag: one RPC read, ever.
+    #[tokio::test]
+    async fn a_solana_destination_reports_a_claimed_marker_as_executed_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana_rpc(SOL_PROGRAM, Some(&[1u8]), calls.clone()).await;
+        let mut chains = Chains::new();
+        chains.add(7565164, &url, SOL_PROGRAM).unwrap();
+
+        assert_eq!(chains.executed(7565164, SUB_ID).await, Some(true));
+        assert_eq!(chains.cancelled(7565164, SUB_ID).await, Some(false));
+        assert_eq!(chains.executed(7565164, SUB_ID).await, Some(true));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "terminal => memoised");
+    }
+
+    /// A burn is CANCELLED (executed AND cancelled), never a delivery.
+    #[tokio::test]
+    async fn a_solana_destination_reports_a_burn_as_cancelled() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana_rpc(SOL_PROGRAM, Some(&[2u8]), calls.clone()).await;
+        let mut chains = Chains::new();
+        chains.add(7565164, &url, SOL_PROGRAM).unwrap();
+        assert_eq!(chains.cancelled(7565164, SUB_ID).await, Some(true));
+        assert_eq!(chains.executed(7565164, SUB_ID).await, Some(true));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// No marker yet: pending, and NOT cached — the next request must look again.
+    /// A marker owned by someone else is the same as none.
+    #[tokio::test]
+    async fn a_missing_or_foreign_solana_marker_is_pending_and_not_cached() {
+        for (owner, data) in [(SOL_PROGRAM, None), ("11111111111111111111111111111111", Some(&[1u8][..]))] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let url = mock_solana_rpc(owner, data, calls.clone()).await;
+            let mut chains = Chains::new();
+            chains.add(7565164, &url, SOL_PROGRAM).unwrap();
+            assert_eq!(chains.executed(7565164, SUB_ID).await, Some(false));
+            assert_eq!(chains.executed(7565164, SUB_ID).await, Some(false));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "a false is re-read");
+        }
+    }
+
+    /// An unreachable Solana RPC leaves status UNKNOWN (null), never an error.
+    #[tokio::test]
+    async fn an_unreachable_solana_rpc_yields_unknown() {
+        let mut chains = Chains::new();
+        chains.add(7565164, "http://127.0.0.1:1", SOL_PROGRAM).unwrap();
+        assert_eq!(chains.executed(7565164, SUB_ID).await, None);
+        assert_eq!(chains.cancelled(7565164, SUB_ID).await, None);
     }
 
     /// An explicit `--gate` still wins over the file for the same chain.

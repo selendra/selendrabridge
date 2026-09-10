@@ -45,6 +45,18 @@ url = "https://sig-store.example.com"
 # Defaults to SIG_STORE_VALIDATOR_TOKEN; stated here so it is obvious that this
 # process presents the validator credential, because it does a validator's job.
 token_env = "SIG_STORE_VALIDATOR_TOKEN"
+# The marker OBSERVER's credential (Indexer scope). Naming it is what switches
+# the observer on: every [observer] poll it lists the store's pending claims and
+# refunds for this chain, reads the gate's ["executed", id] / ["refunded", id]
+# markers at `finalized`, and reports each observed claimed/cancelled/refunded
+# ONCE. Those reports are authoritative (the same writes the EVM indexer makes),
+# so the store accepts them from this scope alone; the validator token above can
+# never stand in for it. Run it on the delivering relayer only.
+indexer_token_env = "SIG_STORE_INDEXER_TOKEN"
+
+# [observer]
+# poll_interval_ms = 10000     # default; slower than the claim loop on purpose
+# commitment = "finalized"     # default; anything lower needs [source].allow_unfinalized
 
 # ── EVM -> Solana delivery: the KEEPER role ───────────────────────────────────
 # Presence of this block is what turns the relayer into a claim submitter. On

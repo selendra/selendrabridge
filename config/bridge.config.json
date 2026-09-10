@@ -30,7 +30,8 @@
       "validator": null,
       "keeper": null,
       "reader": null,
-      "admin": null
+      "admin": null,
+      "indexer": null
     }
   },
   "defaults": {

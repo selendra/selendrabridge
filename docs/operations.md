@@ -17,7 +17,7 @@ Eight crates, five of them binaries.
 | `sig-store` | Postgres (or a directory) | Nothing works. It is the bulletin board every other process reads. |
 | `validator` | source RPC, a signing key, the store | No transfer is ever attested. One per independent operator. |
 | `keeper` | target RPC, a funded key, the store | Nothing is ever submitted on-chain. Anyone can run one; it is permissionless. |
-| `indexer` | Postgres, RPC per chain | History, stuck detection, and **the entire refund lifecycle**. It is the only writer of `refund_status`. |
+| `indexer` | Postgres, RPC per chain | History, stuck detection, and **the entire refund lifecycle**. It writes `refund_status` for EVM gates; the delivering Solana relayer's observer (`SIG_STORE_INDEXER_TOKEN`) does the same for the Solana gate. |
 | `graphql-api` | the store (read scope only) | The frontend has no backend. Holds no database credential: history comes back through the sig-store. |
 
 The dependency that catches people out is the refund one.
@@ -83,7 +83,11 @@ Override the shared sig-store secret, which defaults to `dev-local-bridge-token`
 SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
 ```
 
-`SIG_STORE_TOKEN` is the legacy all-scopes secret: whoever holds it can read, sign, relay and edit the allowlist, and the service logs a warning when it is set. It is fine for a throwaway local stack. For anything else, give each service the narrowest one instead — `SIG_STORE_VALIDATOR_TOKEN`, `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN`, `SIG_STORE_ADMIN_TOKEN` — so a leak from one component cannot write on behalf of the others. `scripts/bridge-from-json.sh` generates the four separately when `sig_store.tokens.generate_if_unset` is set.
+`SIG_STORE_TOKEN` is the legacy all-scopes secret: whoever holds it can read, sign, relay, report observed lifecycle and edit the allowlist, and the service logs a warning when it is set. It is fine for a throwaway local stack. For anything else, give each service the narrowest one instead — `SIG_STORE_VALIDATOR_TOKEN`, `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN`, `SIG_STORE_ADMIN_TOKEN`, `SIG_STORE_INDEXER_TOKEN` — so a leak from one component cannot write on behalf of the others. `scripts/bridge-from-json.sh` generates the five separately when `sig_store.tokens.generate_if_unset` is set.
+
+### the Solana marker observer (`SIG_STORE_INDEXER_TOKEN`)
+
+The store's lifecycle (`status`, `refund_status`) gates every work queue, so it moves only on an *observed* on-chain event: the keeper's own `POST /submissions/:id/claimed` is advisory (audit M-1) and a leaked keeper token cannot hide a transfer. The EVM `indexer` supplies those observations for EVM gates, directly into Postgres. The Solana gate has no indexer, so the Solana relayer that `deliver`s runs an **observer** loop: every `[observer] poll_interval_ms` (default 10 s) it lists the store's pending claims and refunds for its chain, reads the gate's `["executed", id]` / `["refunded", id]` marker PDAs at `finalized`, and reports each newly seen `claimed` / `cancelled` / `refunded` once through `POST /submissions/:id/observed/{claimed,cancelled,refunded}`. Those routes run the same authoritative `mark_*` writes the indexer does — park-if-missing included — which is why they sit behind a scope of their own, `Indexer`, that no keeper, validator or operator token carries (`Admin` does not imply it either). The relayer runs the observer only when `[store] indexer_token_env` (or `indexer_token`) resolves, logs `observer ACTIVE` / `observer INACTIVE` at startup, and logs one INFO line per observation. Without it a transfer delivered on Solana stays `signed`, is flagged stuck by the indexer's sweep, and never leaves the claim and refund-candidate queues.
 
 ### 2.3 Frontend
 
@@ -326,7 +330,7 @@ Other secrets in the system:
 
 | Secret | Where it comes from | Notes |
 | --- | --- | --- |
-| sig-store bearer tokens | `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN` | One per role (scoped). The store **fails closed**: with none configured it refuses to bind unless started with `--allow-unauthenticated`, the explicit dev opt-out. Both launchers generate a random token per role per run into `RUN_DIR/tokens.env` (0600); the compose generator writes them to the stack's gitignored `.env`. |
+| sig-store bearer tokens | `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN,INDEXER}_TOKEN` | One per role (scoped). The store **fails closed**: with none configured it refuses to bind unless started with `--allow-unauthenticated`, the explicit dev opt-out. Both launchers generate a random token per role per run into `RUN_DIR/tokens.env` (0600); the compose generator writes them to the stack's gitignored `.env`. `INDEXER` goes to the delivering Solana relayer only (the marker observer). |
 | Postgres password | `PG_PASSWORD` (run.config) / `database.docker.password` (bridge.config.json) | Random per run dir when unset, persisted in `RUN_DIR/tokens.env` and re-applied to the volume on every start; `DATABASE_URL` is derived from it. The container is bound to `127.0.0.1` only (M-10). |
 | validator operator API token | `[api] token` or `VALIDATOR_API_TOKEN` | Unset means `/pause`, `/resume`, and `/rescan` are unauthenticated. |
 | Postgres URL | `DATABASE_URL` or config | `sig-store` and `indexer` only. `graphql-api` deliberately has none — it is the internet-facing service, and a direct connection would sit outside the scope model in `bridge_core::auth`. |
@@ -452,7 +456,7 @@ cast send $GATE "setValidator(address,bool)" $NEW_VALIDATOR true
 
 ### 9.2 Deploying the store
 
-`sig-store` refuses to bind with no bearer token configured, rather than serving an open store. Set at least one of `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN`; `--allow-unauthenticated` is the explicit dev opt-out. `graphql-api` takes `--production` to drop GraphiQL and introspection. The `chains` query serves each network's `public_rpc_url` (as `rpcUrl`, or `null`) and never its `rpc_url`; under `--production` a chain without a public url is a startup error. Every gate (EVM by `0x` address, Solana by base58 program id) and every swap pool (`swap_pool`) is registered from the chains file and read over that entry's `rpc_url`, so no url appears on the API's command line at all.
+`sig-store` refuses to bind with no bearer token configured, rather than serving an open store. Set at least one of `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN,INDEXER}_TOKEN`; `--allow-unauthenticated` is the explicit dev opt-out. `graphql-api` takes `--production` to drop GraphiQL and introspection. The `chains` query serves each network's `public_rpc_url` (as `rpcUrl`, or `null`) and never its `rpc_url`; under `--production` a chain without a public url is a startup error. Every gate (EVM by `0x` address, Solana by base58 program id) and every swap pool (`swap_pool`) is registered from the chains file and read over that entry's `rpc_url`, so no url appears on the API's command line at all.
 
 ### 9.3 Wiring a gate: supportedChain, corridors, seal
 

@@ -55,6 +55,9 @@ services:
       SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
       SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:?set SIG_STORE_ADMIN_TOKEN}"
+      # The Solana marker observer's credential (Indexer scope): authoritative
+      # lifecycle reports for the Solana gate. Hand it to the delivering relayer only.
+      SIG_STORE_INDEXER_TOKEN: "${SIG_STORE_INDEXER_TOKEN:?set SIG_STORE_INDEXER_TOKEN}"
       RUST_LOG: "${RUST_LOG:-info}"
     depends_on:
       postgres: { condition: service_healthy }

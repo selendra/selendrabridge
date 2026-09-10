@@ -5027,6 +5027,7 @@ dependencies = [
  "axum 0.7.9",
  "bridge-core",
  "bridge-db",
+ "chrono",
  "clap",
  "hex",
  "serde",

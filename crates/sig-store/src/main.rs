@@ -29,12 +29,21 @@
 //!   GET    /refund-candidates            -> submissions a refund relayer should
 //!                                           examine (still requires on-chain checks)
 //!
-//! The lifecycle (`status`, `refund_status`) has NO write route at all: those
-//! columns gate the claim and refund queues, so they are set only by the indexer
-//! from observed on-chain `Claimed`/`Cancelled`/`Refunded` events, never on a
-//! caller's word. `/claimed` used to be the exception (audit 2026-09-09, M-1): a
-//! leaked keeper token could mark any transfer — including future ones, ids
-//! being deterministic — claimed, hiding it from both queues forever.
+//!   # observed terminal states (Indexer scope ONLY — authoritative)
+//!   POST   /submissions/:id/observed/claimed   {"claim_tx":  ".."} -> mark_claimed
+//!   POST   /submissions/:id/observed/cancelled {"cancel_tx": ".."} -> mark_cancelled
+//!   POST   /submissions/:id/observed/refunded  {"refund_tx": ".."} -> mark_refunded
+//!
+//! The lifecycle (`status`, `refund_status`) gates the claim and refund queues,
+//! so it moves only on an OBSERVED on-chain `Claimed`/`Cancelled`/`Refunded`,
+//! never on a caller's word. The EVM indexer writes those straight into Postgres.
+//! The Solana gate has no such indexer, so the Solana relayer's observer loop
+//! reads the gate's marker PDAs and reports them through the `/observed/*`
+//! routes above — the SAME authoritative `mark_*` writes, behind a scope
+//! (`Indexer`, `SIG_STORE_INDEXER_TOKEN`) that no other component is handed.
+//! `/claimed` stays advisory (audit 2026-09-09, M-1): a leaked keeper token
+//! could otherwise mark any transfer — including future ones, ids being
+//! deterministic — claimed, hiding it from both queues forever.
 //!
 //!   # allowlists
 //!   GET    /allowed/tokens               -> whitelisted tokens
@@ -51,7 +60,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bridge_core::allow::{
     AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
-    SubmissionHistory, SwapRecord,
+    ObservedCancelledRequest, ObservedRefundedRequest, SubmissionHistory, SwapRecord,
 };
 use bridge_core::auth::{require_scope, Auth, Scope};
 use bridge_core::ratelimit::{enforce as rate_limit, RateLimit};
@@ -88,6 +97,12 @@ struct Args {
     /// Operators: allowlist mutations, itself a security control.
     #[arg(long, env = "SIG_STORE_ADMIN_TOKEN")]
     admin_token: Option<String>,
+    /// The Solana observer: read + report OBSERVED on-chain terminal states
+    /// (`/submissions/:id/observed/*`). These reports are authoritative — they
+    /// run the same `mark_*` writes the EVM indexer makes — so this token must
+    /// be handed to nothing but an observer. Unset => the routes answer 401.
+    #[arg(long, env = "SIG_STORE_INDEXER_TOKEN")]
+    indexer_token: Option<String>,
     /// Sustained write requests per second, per bearer token (L-1).
     #[arg(long, env = "SIG_STORE_RATE_PER_SECOND", default_value_t = 50.0)]
     rate_per_second: f64,
@@ -116,8 +131,8 @@ impl Args {
         let mut entries: Vec<(String, std::collections::HashSet<Scope>)> = Vec::new();
         if let Some(t) = self.auth_token.clone().filter(|t| !t.is_empty()) {
             warn!(
-                "SIG_STORE_TOKEN grants ALL scopes to every holder (read+sign+relay+admin). \
-                 Prefer SIG_STORE_{{VALIDATOR,KEEPER,READER,ADMIN}}_TOKEN so a leak from one \
+                "SIG_STORE_TOKEN grants ALL scopes to every holder (read+sign+relay+indexer+admin). \
+                 Prefer SIG_STORE_{{VALIDATOR,KEEPER,READER,ADMIN,INDEXER}}_TOKEN so a leak from one \
                  component cannot write on behalf of the others."
             );
             entries.push((t, Scope::all()));
@@ -133,6 +148,9 @@ impl Args {
         }
         if let Some(t) = self.admin_token.clone() {
             entries.push((t, [Scope::Read, Scope::Admin].into_iter().collect()));
+        }
+        if let Some(t) = self.indexer_token.clone() {
+            entries.push((t, [Scope::Read, Scope::Indexer].into_iter().collect()));
         }
         Auth::new(entries)
     }
@@ -188,12 +206,14 @@ fn build_app(state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usi
     // L-5: each route group demands the NARROWEST scope that lets it work, so a
     // credential leaked from one component cannot act as another.
     //
-    // NOTE: there is deliberately no write route for the lifecycle (`status`,
-    // `refund_status`) at ANY scope. Those columns gate the claim and refund
+    // NOTE: the lifecycle (`status`, `refund_status`) gates the claim and refund
     // queues, so a forged "claimed" or "refunded" would permanently hide a
-    // transfer from the keeper and the relayers. They are written ONLY by the
-    // indexer, from observed on-chain `Claimed`/`Cancelled`/`Refunded` events —
-    // never on a caller's word. `/claimed` below is advisory (M-1).
+    // transfer from the keeper and the relayers. It is written ONLY from
+    // observed on-chain `Claimed`/`Cancelled`/`Refunded` — by the EVM indexer
+    // directly, and by the Solana observer through the `Indexer`-scoped
+    // `/observed/*` group below, which is the one write route it has and the one
+    // credential (`SIG_STORE_INDEXER_TOKEN`) that reaches it. `/claimed` below is
+    // advisory (M-1) and must stay so.
     let read = Router::new()
         .route("/submissions", get(list_submissions))
         .route("/submissions/:id", get(get_submission))
@@ -227,6 +247,18 @@ fn build_app(state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usi
         .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Relay), require_scope));
 
+    // AUTHORITATIVE lifecycle reports from an OBSERVER of a chain the EVM indexer
+    // cannot read (the Solana gate's marker PDAs). Its own scope, held by the
+    // observer alone: not `Relay` (every keeper has that, and it must stay
+    // advisory — M-1), not `Admin` (an operator's allowlist credential must not
+    // be able to hide a transfer). Rate-limited like every other writer.
+    let observed = Router::new()
+        .route("/submissions/:id/observed/claimed", post(post_observed_claimed))
+        .route("/submissions/:id/observed/cancelled", post(post_observed_cancelled))
+        .route("/submissions/:id/observed/refunded", post(post_observed_refunded))
+        .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
+        .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Indexer), require_scope));
+
     // The allowlists are a security control, so they get their own scope.
     let admin = Router::new()
         .route("/allowed/tokens", post(add_token))
@@ -241,6 +273,7 @@ fn build_app(state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usi
         .merge(read)
         .merge(sign)
         .merge(relay)
+        .merge(observed)
         .merge(admin)
         // A submission with its signatures is a few kB; the default 2 MB let a
         // caller make the server allocate far more than any real request needs.
@@ -280,9 +313,9 @@ fn require_credentials(auth: &Auth, allow_unauthenticated: bool) -> anyhow::Resu
     anyhow::bail!(
         "refusing to start: no bearer token is configured, which would leave signatures, \
          claim status and the allowlist world-writable. Set at least one of \
-         SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN (or the \
-         legacy SIG_STORE_TOKEN), or pass --allow-unauthenticated to accept an open store \
-         on a trusted local network."
+         SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN / \
+         _INDEXER_TOKEN (or the legacy SIG_STORE_TOKEN), or pass --allow-unauthenticated \
+         to accept an open store on a trusted local network."
     )
 }
 
@@ -505,9 +538,51 @@ async fn get_refund_candidates(
     Ok(Json(s.db.refund_candidates().await.map_err(db_err)?))
 }
 
-// `cancelled`/`refunded` are written only by the indexer from observed on-chain
-// events (see the router note), so there are intentionally no HTTP handlers for
-// them here.
+// --- observed terminal states (Indexer scope) -----------------------------
+//
+// These are the ONLY HTTP writes to the lifecycle, and they exist for one
+// caller: an observer of a chain the EVM indexer cannot read. Today that is the
+// Solana relayer's observer loop, which reads the gate's `["executed", id]` /
+// `["refunded", id]` marker PDAs at `finalized` and reports what it saw. Each
+// handler is a thin skin over the SAME `Db::mark_*` the indexer calls on an EVM
+// event, park-if-missing included: a `Claimed` observed before the source `Sent`
+// row exists is parked and applied when the row arrives, exactly as for an EVM
+// destination during backfill. Nothing here reads the caller's word about
+// anything but the tx it saw; the scope is what makes the caller trustworthy,
+// and the scope is handed to nothing else.
+
+/// An observed destination `Claimed`. Authoritative — see the group note.
+async fn post_observed_claimed(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ClaimedRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    s.db.mark_claimed(&id, &body.claim_tx).await.map_err(db_err)?;
+    info!(submission_id = %id, claim_tx = %body.claim_tx, "observed Claimed (reported by an observer)");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// An observed destination burn (`Cancelled`). Authoritative — see the group note.
+async fn post_observed_cancelled(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ObservedCancelledRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    s.db.mark_cancelled(&id, &body.cancel_tx).await.map_err(db_err)?;
+    info!(submission_id = %id, cancel_tx = %body.cancel_tx, "observed Cancelled (reported by an observer)");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// An observed source payout (`Refunded`). Authoritative — see the group note.
+async fn post_observed_refunded(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ObservedRefundedRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    s.db.mark_refunded(&id, &body.refund_tx).await.map_err(db_err)?;
+    info!(submission_id = %id, refund_tx = %body.refund_tx, "observed Refunded (reported by an observer)");
+    Ok(StatusCode::NO_CONTENT)
+}
 
 // --- allowlists -----------------------------------------------------------
 
@@ -577,6 +652,7 @@ mod tests {
     const KEEP: &str = "keeper-token";
     const READ: &str = "reader-token";
     const ADMIN: &str = "admin-token";
+    const OBS: &str = "indexer-token";
 
     fn test_auth() -> Auth {
         Auth::new([
@@ -584,8 +660,15 @@ mod tests {
             (KEEP.to_string(), [Scope::Read, Scope::Relay].into_iter().collect()),
             (READ.to_string(), [Scope::Read].into_iter().collect()),
             (ADMIN.to_string(), [Scope::Read, Scope::Admin].into_iter().collect()),
+            (OBS.to_string(), [Scope::Read, Scope::Indexer].into_iter().collect()),
         ])
     }
+
+    const OBSERVED_ROUTES: [&str; 3] = [
+        "/submissions/0xabc/observed/claimed",
+        "/submissions/0xabc/observed/cancelled",
+        "/submissions/0xabc/observed/refunded",
+    ];
 
     /// The same scope layering main() uses, with stub handlers so the test
     /// exercises the AUTH wiring rather than the database.
@@ -615,6 +698,15 @@ mod tests {
                 (auth.clone(), Scope::Relay),
                 require_scope,
             ));
+        let observed = Router::new()
+            .route("/submissions/:id/observed/claimed", post(|| async { "observed" }))
+            .route("/submissions/:id/observed/cancelled", post(|| async { "observed" }))
+            .route("/submissions/:id/observed/refunded", post(|| async { "observed" }))
+            .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
+            .route_layer(middleware::from_fn_with_state(
+                (auth.clone(), Scope::Indexer),
+                require_scope,
+            ));
         let admin = Router::new()
             .route("/allowed/tokens", post(|| async { "added" }))
             .route_layer(middleware::from_fn_with_state(
@@ -626,6 +718,7 @@ mod tests {
             .merge(read)
             .merge(sign)
             .merge(relay)
+            .merge(observed)
             .merge(admin)
     }
 
@@ -747,8 +840,83 @@ mod tests {
     /// Every component still reads — the shared capability.
     #[tokio::test]
     async fn every_service_token_can_read() {
-        for t in [VAL, KEEP, READ, ADMIN] {
+        for t in [VAL, KEEP, READ, ADMIN, OBS] {
             assert_eq!(status("GET", "/submissions", Some(t)).await, StatusCode::OK, "{t}");
+        }
+    }
+
+    // --- the observer's authoritative reports: Indexer scope only --------------
+
+    /// THE scope matrix for the one HTTP write that moves the lifecycle. The
+    /// keeper's `Relay` token must NOT reach it (that is M-1: a keeper's word is
+    /// advisory), the operator's `Admin` token must not either (an allowlist
+    /// credential must not be able to hide a transfer), and a validator or reader
+    /// obviously not. Only the observer's own token does. Unauthenticated: 401,
+    /// so with `SIG_STORE_INDEXER_TOKEN` unset the routes are simply closed.
+    #[tokio::test]
+    async fn only_the_indexer_token_can_report_an_observed_terminal_state() {
+        for uri in OBSERVED_ROUTES {
+            assert_eq!(status("POST", uri, Some(OBS)).await, StatusCode::OK, "{uri}");
+            for t in [VAL, KEEP, READ, ADMIN] {
+                assert_eq!(
+                    status("POST", uri, Some(t)).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{t} must not reach {uri}"
+                );
+            }
+            assert_eq!(status("POST", uri, None).await, StatusCode::UNAUTHORIZED, "{uri} open");
+            assert_eq!(status("POST", uri, Some("bogus")).await, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    /// And the observer's token carries nothing else: it cannot sign, cannot
+    /// use the keeper's advisory route, cannot edit the allowlist.
+    #[tokio::test]
+    async fn the_indexer_token_carries_no_other_capability() {
+        assert_eq!(status("POST", "/submissions", Some(OBS)).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("POST", "/submissions/0xabc/claimed", Some(OBS)).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("POST", "/allowed/tokens", Some(OBS)).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The observed routes are writers, so they sit under the same per-credential
+    /// budget as every other write.
+    #[tokio::test]
+    async fn observed_reports_are_rate_limited() {
+        let app = app_limited(RateLimit::new(2, 0.001));
+        let uri = OBSERVED_ROUTES[0];
+        assert_eq!(status_on(app.clone(), "POST", uri, Some(OBS)).await, StatusCode::OK);
+        assert_eq!(status_on(app.clone(), "POST", uri, Some(OBS)).await, StatusCode::OK);
+        assert_eq!(status_on(app.clone(), "POST", uri, Some(OBS)).await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// With no indexer token configured the scope exists but nothing holds it —
+    /// the routes stay closed rather than falling open to some other credential.
+    #[test]
+    fn an_unset_indexer_token_leaves_the_observed_routes_closed() {
+        let args = Args {
+            bind: String::new(),
+            database_url: String::new(),
+            auth_token: None,
+            validator_token: Some(VAL.into()),
+            keeper_token: Some(KEEP.into()),
+            reader_token: Some(READ.into()),
+            admin_token: Some(ADMIN.into()),
+            indexer_token: None,
+            rate_per_second: 1.0,
+            rate_burst: 1,
+            max_body_bytes: 1,
+            allow_unauthenticated: false,
+        };
+        let auth = args.auth();
+        assert!(auth.is_enforced());
+        for t in [VAL, KEEP, READ, ADMIN, "", "nope"] {
+            assert!(!auth.grants(t, Scope::Indexer), "{t:?} must not gain Indexer by default");
+        }
+        // And once set, it grants Indexer + Read and nothing more.
+        let auth = Args { indexer_token: Some(OBS.into()), ..args }.auth();
+        assert!(auth.grants(OBS, Scope::Indexer) && auth.grants(OBS, Scope::Read));
+        for s in [Scope::Sign, Scope::Relay, Scope::Admin] {
+            assert!(!auth.grants(OBS, s), "the indexer token must not carry {}", s.as_str());
         }
     }
 
@@ -1006,6 +1174,90 @@ mod tests {
         let row = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&id)).unwrap();
         assert_eq!(row.status, "claimed");
         assert_eq!(row.claim_tx.as_deref(), Some(claim.claim_tx.as_str()));
+    }
+
+    /// THE fix for delivered EVM->Solana transfers that stayed `signed` forever:
+    /// an OBSERVED claim reported on the Indexer-scoped route is authoritative —
+    /// the row flips to `claimed`, leaves the claim queue, and a stale `eligible`
+    /// refund flag is cleared so it leaves the refund-candidate list too. The
+    /// keeper's advisory route on the same id does none of that (the M-1 test
+    /// above); this one is the observer's counterpart.
+    #[tokio::test]
+    async fn an_observed_claim_reported_by_the_indexer_token_is_authoritative() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
+        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+
+        let chain_to = 800_000 + (std::process::id() as u64 % 90_000);
+        let rec = signed_record(chain_to);
+        let id = rec.submission_id.clone();
+        assert_eq!(post_json(app.clone(), "/submissions", Some(VAL), &rec).await.status(), StatusCode::OK);
+
+        // Age it into the refund path, as the indexer's sweep does for a transfer
+        // nobody has claimed: the symptom was a DELIVERED transfer sitting here.
+        db.sweep_refund_eligible(chrono::Duration::seconds(-1)).await.unwrap();
+        let queue_uri = format!("/submissions?pending=claims&chain_id_to={chain_to}");
+        let has = |q: &Vec<SubmissionRecord>| q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&id));
+        assert!(has(&get_json(app.clone(), &queue_uri, KEEP).await), "premise: in the claim queue");
+        assert!(has(&get_json(app.clone(), "/refund-candidates", VAL).await), "premise: flagged stuck");
+
+        // Every OTHER credential is refused, before the database is touched.
+        let claim = ClaimedRequest { claim_tx: "5VERYsolanaSIGNATURE".into() };
+        let uri = format!("/submissions/{}/observed/claimed", &id[2..]);
+        for t in [VAL, KEEP, READ, ADMIN] {
+            assert_eq!(post_json(app.clone(), &uri, Some(t), &claim).await.status(), StatusCode::UNAUTHORIZED, "{t}");
+        }
+        assert!(has(&get_json(app.clone(), &queue_uri, KEEP).await), "nothing moved");
+
+        // The observer's report moves it.
+        assert_eq!(post_json(app.clone(), &uri, Some(OBS), &claim).await.status(), StatusCode::NO_CONTENT);
+        assert!(!has(&get_json(app.clone(), &queue_uri, KEEP).await), "left the claim queue");
+        assert!(!has(&get_json(app.clone(), "/refund-candidates", VAL).await), "left the refund candidates");
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let row = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&id)).expect("in history");
+        assert_eq!(row.status, "claimed");
+        assert_eq!(row.claim_tx.as_deref(), Some(claim.claim_tx.as_str()));
+        assert_eq!(row.refund_status, "none", "the stale eligible flag is cleared");
+        assert!(!row.stuck);
+
+        // A report for an id with no row yet PARKS (unlike the advisory route):
+        // when the row appears it comes up claimed, never queued — the same
+        // backfill behaviour the EVM indexer relies on.
+        let future = signed_record(chain_to);
+        let fid = future.submission_id.clone();
+        let furi = format!("/submissions/{}/observed/claimed", &fid[2..]);
+        assert_eq!(post_json(app.clone(), &furi, Some(OBS), &claim).await.status(), StatusCode::NO_CONTENT);
+        let mut observed = future.clone();
+        observed.signatures.clear();
+        db.observe_submission(observed).await.unwrap();
+        let q: Vec<SubmissionRecord> = get_json(app.clone(), &queue_uri, KEEP).await;
+        assert!(!q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&fid)), "parked marker applied on arrival");
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let frow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&fid)).unwrap();
+        assert_eq!(frow.status, "claimed");
+
+        // Cancel + refund reports flow through the same way (Solana-source leg).
+        let third = signed_record(chain_to);
+        let tid = third.submission_id.clone();
+        assert_eq!(post_json(app.clone(), "/submissions", Some(VAL), &third).await.status(), StatusCode::OK);
+        let curi = format!("/submissions/{}/observed/cancelled", &tid[2..]);
+        let cbody = ObservedCancelledRequest { cancel_tx: "cancelSIG".into() };
+        assert_eq!(post_json(app.clone(), &curi, Some(KEEP), &cbody).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_json(app.clone(), &curi, Some(OBS), &cbody).await.status(), StatusCode::NO_CONTENT);
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let trow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&tid)).unwrap();
+        assert_eq!(trow.refund_status, "cancelled");
+        assert_eq!(trow.cancel_tx.as_deref(), Some("cancelSIG"));
+        let ruri = format!("/submissions/{}/observed/refunded", &tid[2..]);
+        let rbody = ObservedRefundedRequest { refund_tx: "refundSIG".into() };
+        assert_eq!(post_json(app.clone(), &ruri, Some(ADMIN), &rbody).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_json(app.clone(), &ruri, Some(OBS), &rbody).await.status(), StatusCode::NO_CONTENT);
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let trow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&tid)).unwrap();
+        assert_eq!(trow.refund_status, "refunded");
+        assert_eq!(trow.refund_tx.as_deref(), Some("refundSIG"));
+        assert!(!has(&get_json(app.clone(), "/refund-candidates", VAL).await));
     }
 
     /// Paging through the real router: `limit` bounds the page and `offset` walks

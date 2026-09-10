@@ -64,6 +64,22 @@ pub struct ClaimedRequest {
     pub claim_tx: String,
 }
 
+/// Request body for an OBSERVED destination cancel (observer → sig-store,
+/// `POST /submissions/:id/observed/cancelled`, `Indexer` scope).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservedCancelledRequest {
+    /// The destination-chain cancel tx (EVM hash, or the Solana signature /
+    /// marker address when no signature is available).
+    pub cancel_tx: String,
+}
+
+/// Request body for an OBSERVED source refund (observer → sig-store,
+/// `POST /submissions/:id/observed/refunded`, `Indexer` scope).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservedRefundedRequest {
+    pub refund_tx: String,
+}
+
 /// Request body to post a cancel/refund attestation (validator → sig-store).
 /// The signature is verified against `kind`'s own digest server-side, so a
 /// mislabelled or replayed signature is rejected rather than miscounted.
