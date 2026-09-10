@@ -47,7 +47,7 @@ ALLOW_LOCAL_ON_CHAIN=false
 #   17000 Holesky, 84532 Base Sepolia, 421614 Arbitrum Sepolia, 11155420 OP
 #   Sepolia, 80002 Polygon Amoy, 97 BSC testnet, 43113 Fuji, 1313161555 Aurora
 #   testnet, 1953 Selendra testnet
-DEV_CHAIN_IDS=(31337 31338 31339 1337 1338 1339 11155111 560048 17000 84532 421614 11155420 80002 97 43113 1313161555 1953)
+DEV_CHAIN_IDS=(31337 31338 31339 1337 1338 1339 11155111 560048 17000 84532 421614 11155420 80002 97 43113 1313161555 1953 10143 46630)
 is_dev_chain() { local c; for c in "${DEV_CHAIN_IDS[@]}"; do [[ "$1" == "$c" ]] && return 0; done; return 1; }
 
 for arg in "$@"; do
@@ -198,6 +198,13 @@ for cid in "${CHAIN_IDS[@]}"; do
   got="$(cast chain-id --rpc-url "${RPC[$cid]}" 2>/dev/null)" || die "RPC unreachable: ${RPC[$cid]}"
   [[ "$got" == "$cid" ]] || die "${RPC[$cid]} reports chainId $got, config says $cid"
   FLOOR[$cid]="$(cast block-number --rpc-url "${RPC[$cid]}")"
+  # A resumed run reuses gates and pools an EARLIER run deployed; stamping
+  # today's head as their floor would hide every event they emitted before
+  # it (the pool's TokenListed logs, any transfer in flight). Keep the lowest
+  # floor already on record for this chain — the previous deploy record, or
+  # the runtime config's start_block — so scanners start where they should.
+  prev_floor="$( { [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .deploy_block // empty' "$OUT_FILE";                    [[ -n "${BRIDGE_CFG:-}" && -f "$BRIDGE_CFG" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .start_block // empty' "$BRIDGE_CFG"; } 2>/dev/null | grep -E '^[0-9]+$' | sort -n | head -1 )"
+  if [[ -n "$prev_floor" && "$prev_floor" -gt 0 && "$prev_floor" -lt "${FLOOR[$cid]}" ]]; then FLOOR[$cid]="$prev_floor"; fi
 done
 
 say "deploying gates"

@@ -1,4 +1,6 @@
 target
+crates/*/target
+**/target/
 contracts/out
 contracts/cache
 contracts/broadcast
