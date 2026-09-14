@@ -1,6 +1,6 @@
 import { test, expect, startApp, connectWallet, gotoView } from "../fixtures/app";
 import { driftChain, sentTransactions, walletCalls, ACCOUNT } from "../fixtures/wallet";
-import { GATE_A, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
+import { GATE_A, GATE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
 
 /**
  * BridgeView, direct mode: the lock-and-emit path.
@@ -13,6 +13,15 @@ import { GATE_A, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
 const BAL = 1000n * 10n ** 18n;
 const DEC_18 = { "313ce567": "12", "70a08231": BAL.toString(16), "dd62ed3e": "0" };
 const APPROVED = { ...DEC_18, dd62ed3e: (2n ** 255n).toString(16) };
+
+const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, "0");
+/** What a real gate's `send` leaves in the receipt — the only proof funds locked. */
+const SENT_LOG = {
+  address: GATE_A,
+  topics: [SENT_TOPIC0, "0x" + "11".repeat(32), "0x" + "22".repeat(32)],
+  data: "0x" + word(10n ** 18n) + word(0) + word(0) + word(0) + word(0),
+};
 
 const primaryButton = (page: import("@playwright/test").Page) => page.locator(".review-btn");
 const field = (page: import("@playwright/test").Page, label: string) =>
@@ -27,7 +36,7 @@ async function openBridge(
   calls: Record<string, string> = APPROVED,
   extra: Record<string, unknown> = {}
 ) {
-  await startApp(page, { wallet: { chainId: 1337, calls, ...extra } });
+  await startApp(page, { wallet: { chainId: 1337, calls, receiptLogs: [SENT_LOG], ...extra } });
   await connectWallet(page);
   await gotoView(page, "Bridge");
   await expect(page.getByRole("heading", { name: "Bridge" })).toBeVisible();
@@ -38,6 +47,20 @@ test.describe("form state", () => {
     await openBridge(page);
     await expect(field(page, "Gate contract")).toHaveValue(GATE_A);
     await expect(tokenField(page)).toHaveValue(TOKEN_18);
+  });
+
+  test("re-targets the gate to the new chain when the wallet switches", async ({ page }) => {
+    await openBridge(page);
+    await expect(field(page, "Gate contract")).toHaveValue(GATE_A);
+    await page.evaluate(() =>
+      (window as unknown as { ethereum: { request(a: unknown): Promise<unknown> } }).ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: "0x53a" }],
+      })
+    );
+    await expect(page.locator(".bridge-route__node").first()).toContainText("Chain B");
+    // Chain A's gate address means nothing on chain B.
+    await expect(field(page, "Gate contract")).toHaveValue(GATE_B);
   });
 
   test("defaults the receiver to the connected account", async ({ page }) => {
@@ -170,6 +193,16 @@ test.describe("approve → bridge", () => {
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
     await primaryButton(page).click();
     await expect(page.locator(".txbar--error")).toContainText(/reverted/i, { timeout: 15_000 });
+  });
+
+  test("a mined send with no Sent event from the gate is an error, not a lock", async ({ page }) => {
+    // What a send to a wrong/stale gate address looks like: a call to an address
+    // with no code succeeds, emits nothing, and locks nothing.
+    await openBridge(page, APPROVED, { receiptLogs: [] });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await primaryButton(page).click();
+    await expect(page.locator(".txbar--error")).toContainText(/no Sent event/, { timeout: 15_000 });
+    await expect(page.locator(".txbar--done")).toHaveCount(0);
   });
 
   test("reports a wallet rejection in plain language", async ({ page }) => {

@@ -677,28 +677,51 @@ impl Query {
         ctx: &Context<'_>,
         chain_id: u64,
         // `symbol` is the asset as the registry lists it; the debridgeId is
-        // derived from the DESTINATION chain's token for that symbol.
+        // derived from an EVM chain's token for that symbol.
         symbol: String,
         chain_id_to: u64,
     ) -> Option<SolanaGateContext> {
         let st = state(ctx);
         let gate = st.chains.solana_gate(chain_id)?;
-        // The debridgeId is DERIVED, not configured: it is `keccak(chainId,
-        // token)` of the asset on the chain it is native to — here, the
-        // destination. Deriving it from the registry means one less value that
-        // can be stale, and the same value the destination gate will look up
-        // when it claims.
-        let dest = st.registry.iter().find(|c| c.chain_id == chain_id_to)?;
-        let token = dest
-            .tokens
+        // The debridgeId is DERIVED, not configured: `keccak(chainId, token)` of
+        // the asset on some EVM chain that carries it. It must be registered on
+        // BOTH ends — the Solana program (or `send` is refused) and the
+        // destination gate (or `claim` reverts UnknownAsset, which the keeper
+        // skips silently, stranding the lock until a refund).
+        //
+        // The destination's OWN id is the one a full-mesh deploy never maps:
+        // each gate registers the ids of its PEERS' tokens, not its own. So
+        // prefer peer-derived ids, keep the destination's last, and ask the
+        // destination gate which it can actually pay out.
+        let mut candidates: Vec<(u64, alloy_primitives::Address)> = st
+            .registry
             .iter()
-            .find(|t| t.symbol.eq_ignore_ascii_case(&symbol))
-            .map(|t| t.address.clone())?;
-        let token: alloy_primitives::Address = token.parse().ok()?;
-        let id = bridge_core::debridge_id(alloy_primitives::U256::from(chain_id_to), token);
-        let debridge_id = format!("{id:#x}");
-        match gate.send_context(&debridge_id, chain_id_to).await {
-            Ok(c) => Some(SolanaGateContext {
+            .filter(|c| c.chain_id != chain_id)
+            .filter_map(|c| {
+                let t = c.tokens.iter().find(|t| t.symbol.eq_ignore_ascii_case(&symbol))?;
+                Some((c.chain_id, t.address.parse().ok()?))
+            })
+            .collect();
+        candidates.sort_by_key(|(cid, _)| *cid == chain_id_to);
+
+        // An unreadable destination gate (RPC down, not configured) is not a
+        // "no": fall back to the first id the Solana side accepts, which is what
+        // this resolver always did.
+        let mut fallback = None;
+        for (cid, token) in candidates {
+            let id = bridge_core::debridge_id(alloy_primitives::U256::from(cid), token);
+            let mapped = st.chains.maps_asset(chain_id_to, id).await;
+            if mapped == Some(false) {
+                continue;
+            }
+            let c = match gate.send_context(&format!("{id:#x}"), chain_id_to).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(chain_id, from_chain = cid, error = %e, "debridgeId unusable on solana gate");
+                    continue;
+                }
+            };
+            let ctx = SolanaGateContext {
                 program_id: c.program_id,
                 bridge_domain: c.bridge_domain,
                 chain_id: c.chain_id,
@@ -707,12 +730,16 @@ impl Query {
                 vault: c.vault,
                 decimals: c.decimals,
                 paused: c.paused,
-            }),
-            Err(e) => {
-                tracing::warn!(chain_id, error = %e, "solana gate context unavailable");
-                None
+            };
+            if mapped == Some(true) {
+                return Some(ctx);
             }
+            fallback.get_or_insert(ctx);
         }
+        if fallback.is_none() {
+            tracing::warn!(chain_id, chain_id_to, %symbol, "no debridgeId mapped on both solana gate and destination");
+        }
+        fallback
     }
 
     /// A recent blockhash for a Solana pool's cluster. The browser builds and

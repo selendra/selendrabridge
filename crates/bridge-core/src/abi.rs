@@ -164,6 +164,15 @@ sol! {
             external
             view
             returns (uint256 reserve, uint256 usdValue);
+
+        // --- oracle surface (used by price-keeper) ---
+        function oracle() external view returns (address);
+        function setPrice(address token, uint256 newPrice) external;
+        function priceSetAt(address token) external view returns (uint256);
+        function lastPriceUpdate(address token) external view returns (uint256);
+        function maxPriceAge() external view returns (uint256);
+        function minPriceUpdateInterval() external view returns (uint256);
+        function maxPriceDeviationBps() external view returns (uint16);
     }
 
     /// Composes {SwapPool} + {Gate} for cross-chain "swap on arrival" transfers.

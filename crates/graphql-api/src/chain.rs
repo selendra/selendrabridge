@@ -515,6 +515,15 @@ impl Chains {
         Some((executed, cancelled))
     }
 
+    /// Whether an EVM gate can pay out `debridge_id` — `tokenOf(id) != 0`.
+    /// `None` when the chain has no EVM gate configured or the RPC call fails,
+    /// so a caller can tell "not registered" from "could not ask".
+    pub async fn maps_asset(&self, chain_id: u64, debridge_id: B256) -> Option<bool> {
+        let (provider, gate) = self.gates.get(&chain_id)?;
+        let token = Gate::new(*gate, provider).tokenOf(debridge_id).call().await.ok()?;
+        Some(token != Address::ZERO)
+    }
+
     /// `cancelled(submissionId)` on the destination gate.
     ///
     /// `executed` alone cannot distinguish "delivered" from "burned so it could

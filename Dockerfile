@@ -10,7 +10,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release \
-      -p validator -p keeper -p sig-store -p indexer -p graphql-api
+      -p validator -p keeper -p sig-store -p indexer -p graphql-api -p price-keeper
 
 FROM debian:bookworm-slim
 # ca-certificates + libssl3 cover reqwest's TLS stack (HTTPS RPCs / sig-store);
@@ -27,6 +27,7 @@ COPY --from=builder /build/target/release/keeper       /usr/local/bin/keeper
 COPY --from=builder /build/target/release/sig-store    /usr/local/bin/sig-store
 COPY --from=builder /build/target/release/indexer      /usr/local/bin/indexer
 COPY --from=builder /build/target/release/graphql-api  /usr/local/bin/graphql-api
+COPY --from=builder /build/target/release/price-keeper /usr/local/bin/price-keeper
 
 ENV RUST_LOG=info
 USER bridge

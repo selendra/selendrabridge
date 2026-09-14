@@ -4036,6 +4036,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "price-keeper"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "bridge-core",
+ "serde",
+ "swap-math",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "primitive-types"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

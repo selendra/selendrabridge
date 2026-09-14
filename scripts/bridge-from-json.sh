@@ -490,6 +490,88 @@ if [[ "$(j '.indexer.enabled')" == "true" ]]; then
   info "indexer -> $IDX_CFG"
 fi
 
+# price keepers — the pools' oracle, for STATIC prices ------------------------
+#
+# Every pool refuses a price older than its max age (a day by default), so a
+# mesh with pools and no oracle loses every non-stable swap a day after deploy.
+# `price-keeper` (EVM) and `solana-price-keeper` re-assert each token's
+# configured price before it expires, or step toward a changed one within the
+# pool's cooldown/cap. Targets, most specific first:
+#   price_keeper.chain_prices["<chain_id>"][SYM]  >  price_keeper.prices[SYM]
+#   > (Solana only) solana.swap.tokens[].price
+# A token with no target is left alone (the stable/hub never needs one).
+PK_CFG="" SPK_CFG="" SPK_KEYPAIR=""
+if [[ "$(j '.price_keeper.enabled // false')" == "true" ]]; then
+  pk_target() { # $1 chain id, $2 symbol, $3 fallback
+    jq -r --arg c "$1" --arg s "$2" --arg f "${3:-}" \
+      '.price_keeper.chain_prices[$c][$s] // .price_keeper.prices[$s] // (if $f == "" then empty else $f end)' "$CONFIG"
+  }
+  PK_POLL="$(j '.price_keeper.poll_interval_secs // 600')"
+  PK_MARGIN="$(j '.price_keeper.refresh_margin_secs // 21600')"
+  pools_toml=""
+  for cid in "${CHAIN_IDS[@]}"; do
+    pool="$(jr ".chains[] | select(.chain_id == $cid) | .pool")"
+    [[ "$pool" =~ ^0x[0-9a-fA-F]{40}$ ]] || continue
+    toks=""
+    while IFS=$'\t' read -r sym addr; do
+      [[ -n "$sym" ]] || continue
+      price="$(pk_target "$cid" "$sym")"
+      [[ -n "$price" ]] || continue
+      toks+=$'\n'"[[pools.tokens]]"$'\n'"symbol = \"$sym\""$'\n'"address = \"$addr\""$'\n'"price = \"$price\""$'\n'
+    done < <(jq -r ".chains[] | select(.chain_id == $cid) | .tokens[]? | [.symbol, .address] | @tsv" "$CONFIG")
+    if [[ -z "$toks" ]]; then
+      warn "price keeper: chain $cid has pool $pool but no token with a target price — it will go stale"
+      continue
+    fi
+    pools_toml+=$'\n'"[[pools]]"$'\n'"chain_id = $cid"$'\n'"rpc = \"$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")\""$'\n'"pool = \"$pool\""$'\n'"$toks"
+  done
+  if [[ -n "$pools_toml" ]]; then
+    [[ "$(j '.price_keeper.signer != null')" == "true" ]] || die "price_keeper.signer is required: the key must be each EVM pool's oracle"
+    PK_CFG="$CFG_DIR/price-keeper.toml"
+    {
+      echo "poll_interval_secs = $PK_POLL"
+      echo "refresh_margin_secs = $PK_MARGIN"
+      echo
+      echo "[oracle]"
+      emit_signer ".price_keeper.signer"
+      printf '%s' "$pools_toml"
+    } > "$PK_CFG"
+    info "price keeper -> $PK_CFG"
+  fi
+
+  SOL_SWAP_PROGRAM="$(jr '.solana.swap.program_id')"
+  SPK_KEYPAIR="$(jr '.price_keeper.solana_oracle_keypair')"
+  if [[ "$SOLANA_ON" == "true" && -n "$SOL_SWAP_PROGRAM" ]]; then
+    if [[ -z "$SPK_KEYPAIR" ]]; then
+      warn "price keeper: solana.swap is configured but price_keeper.solana_oracle_keypair is not — the Solana pool will go stale"
+    else
+      [[ "$SPK_KEYPAIR" = /* ]] || SPK_KEYPAIR="$ROOT/$SPK_KEYPAIR"
+      [[ -f "$SPK_KEYPAIR" ]] || die "price_keeper.solana_oracle_keypair not found: $SPK_KEYPAIR"
+      kp="$SPK_KEYPAIR"; [[ -n "$KEYS_DIR" ]] && kp="$KEYS_DIR/$(basename "$SPK_KEYPAIR")"
+      toks=""
+      while IFS=$'\t' read -r sym mint fallback; do
+        [[ -n "$sym" ]] || continue
+        price="$(pk_target "$SOL_CHAIN_ID" "$sym" "$fallback")"
+        [[ -n "$price" ]] || continue
+        toks+=$'\n'"[[tokens]]"$'\n'"symbol = \"$sym\""$'\n'"mint = \"$mint\""$'\n'"price = \"$price\""$'\n'
+      done < <(j '.solana.swap.tokens[]? | [.symbol, .mint, (.price // "")] | @tsv')
+      if [[ -n "$toks" ]]; then
+        SPK_CFG="$CFG_DIR/solana-price-keeper.toml"
+        {
+          echo "rpc = \"$(j '.solana.rpc')\""
+          echo "program = \"$SOL_SWAP_PROGRAM\""
+          echo "oracle_keypair = \"$kp\""
+          echo "poll_interval_secs = $PK_POLL"
+          echo "refresh_margin_secs = $PK_MARGIN"
+          printf '%s' "$toks"
+        } > "$SPK_CFG"
+        info "solana price keeper -> $SPK_CFG"
+      fi
+    fi
+  fi
+  [[ -n "$PK_CFG$SPK_CFG" ]] || warn "price_keeper.enabled but no pool has a token with a target price — nothing to refresh"
+fi
+
 # registry the graphql API serves to the UI
 #
 # `rpc_url` is the SERVER-SIDE endpoint (rpcs[0], may carry a key) — the API uses
@@ -572,14 +654,15 @@ if [[ "$MODE" == "compose" ]]; then
   # mount is resolved by the daemon, so the container still reads the file.
   # (The same reasoning covers configs/, which hold validator private keys.)
   chmod 700 "$COMPOSE_DIR"
-  if (( ${#SOL_FILES[@]} )); then
+  if (( ${#SOL_FILES[@]} )) || [[ -n "$SPK_CFG" ]]; then
     # 0755 on the directory itself: a DIRECTORY bind mount keeps its own mode
     # inside the container, so 0700 here would stop the container uid at the
     # traversal even with a readable file inside. Other host users are still
     # blocked — they cannot traverse the 0700 stack directory above it.
     mkdir -p "$COMPOSE_DIR/keys"; chmod 755 "$COMPOSE_DIR/keys"
-    for kp in $(j '.solana.relayers[] | select(.enabled != false and .deliver == true) | .payer_keypair // empty'); do
-      [[ "$kp" = /* ]] || kp="$ROOT/$kp"
+    for kp in $( { j '.solana.relayers[] | select(.enabled != false and .deliver == true) | .payer_keypair // empty'
+                   [[ -n "$SPK_CFG" ]] && echo "$SPK_KEYPAIR"; } | while read -r k; do
+                   [[ "$k" = /* ]] && echo "$k" || echo "$ROOT/$k"; done | sort -u ); do
       install -m 0644 "$kp" "$COMPOSE_DIR/keys/$(basename "$kp")"
       info "staged $(basename "$kp") -> keys/ (readable by the container uid)"
     done
@@ -638,6 +721,19 @@ if [[ "$MODE" == "compose" ]]; then
       printf '    volumes: ["./configs:/configs:ro"]\n'
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
     done
+
+    # --- price keepers (pool oracles) ---
+    # No store, no database: each holds only its oracle key and talks to chains.
+    if [[ -n "$PK_CFG" ]]; then
+      printf '  price-keeper:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
+      printf '    command: ["price-keeper", "/configs/price-keeper.toml"]\n'
+      printf '    volumes: ["./configs:/configs:ro"]\n\n'
+    fi
+    if [[ -n "$SPK_CFG" ]]; then
+      printf '  solana-price-keeper:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$CTX"
+      printf '    command: ["solana-price-keeper", "/configs/solana-price-keeper.toml"]\n'
+      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys:/keys:ro\n\n'
+    fi
 
     # --- solana relayers ---
     for i in "${!SOL_NAMES[@]}"; do
@@ -771,6 +867,7 @@ if [[ "$(j '.runtime.build')" == "true" ]]; then
   say "building rust services"
   pkgs=(-p sig-store -p validator -p keeper -p graphql-api)
   [[ -n "$IDX_CFG" ]] && pkgs+=(-p indexer)
+  [[ -n "$PK_CFG" ]] && pkgs+=(-p price-keeper)
   ( cd "$ROOT" && cargo build "${pkgs[@]}" ) || die "cargo build failed"
 fi
 for b in sig-store validator keeper graphql-api; do
@@ -873,6 +970,22 @@ if (( ${#SOL_FILES[@]} )); then
     spawn "$SOL_BIN ${SOL_FILES[$i]}" "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}"
     info "${SOL_NAMES[$i]}"
   done
+fi
+
+if [[ -n "$PK_CFG" ]]; then
+  say "starting price keeper"
+  [[ -x "$BIN_DIR/price-keeper" ]] || die "missing $BIN_DIR/price-keeper (cargo build -p price-keeper)"
+  spawn "$BIN_DIR/price-keeper $PK_CFG" price-keeper.log price-keeper "$PK_CFG"
+fi
+if [[ -n "$SPK_CFG" ]]; then
+  SPK_BIN="$(dirname "$SOL_BIN")/solana-price-keeper"
+  if [[ ! -x "$SPK_BIN" && "$(j '.solana.build')" == "true" ]]; then
+    ( cd "$ROOT" && cargo build --manifest-path crates/solana-relayer/Cargo.toml --bin solana-price-keeper ) \
+      || die "building solana-price-keeper failed"
+  fi
+  [[ -x "$SPK_BIN" ]] || die "missing $SPK_BIN (cargo build --manifest-path crates/solana-relayer/Cargo.toml --bin solana-price-keeper)"
+  say "starting solana price keeper"
+  spawn "$SPK_BIN $SPK_CFG" solana-price-keeper.log solana-price-keeper "$SPK_CFG"
 fi
 
 if [[ -n "$IDX_CFG" ]]; then

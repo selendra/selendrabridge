@@ -34,9 +34,12 @@ export function usePoll<T>(fn: () => Promise<T>, deps: unknown[], intervalMs = 4
   // previous deps-arming) could resolve after a fresher one and clobber current
   // data with stale results — a flicker or a wrong-filter view.
   const genRef = useRef(0);
+  // When the outstanding request of the CURRENT arming started (null = none).
+  const inFlightRef = useRef<number | null>(null);
 
   const run = useCallback(async () => {
     const myGen = ++genRef.current;
+    inFlightRef.current = Date.now();
     try {
       const d = await fnRef.current();
       if (genRef.current !== myGen) return; // superseded by a newer run
@@ -48,14 +51,27 @@ export function usePoll<T>(fn: () => Promise<T>, deps: unknown[], intervalMs = 4
     } finally {
       // Only the newest run clears loading (interval ticks don't re-raise it, so
       // the spinner shows on the initial arming, not on every background poll).
-      if (genRef.current === myGen) setLoading(false);
+      if (genRef.current === myGen) {
+        setLoading(false);
+        inFlightRef.current = null;
+      }
     }
   }, []);
 
   useEffect(() => {
     setLoading(true);
+    inFlightRef.current = null;
+    // A request that never settles (no fetch timeout) must not stall polling
+    // forever: past this age a tick supersedes it after all.
+    const stuckMs = Math.max(30_000, 3 * intervalMs);
     const id = setInterval(() => {
-      if (document.visibilityState !== "hidden") run();
+      // A tick must not supersede a request for the SAME deps that is merely
+      // slow: when the backend takes longer than `intervalMs`, every response
+      // would be discarded by the next tick and `data` would never arrive —
+      // which is exactly how the Swap view sat on "No pool on this chain" while
+      // the API answered in 13s against a 10s poll.
+      const since = inFlightRef.current;
+      if (document.visibilityState !== "hidden" && (since === null || Date.now() - since > stuckMs)) run();
     }, intervalMs);
     run();
     return () => {

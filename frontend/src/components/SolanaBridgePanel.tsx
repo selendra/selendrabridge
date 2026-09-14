@@ -140,6 +140,13 @@ export function SolanaBridgePanel({ solanaChain, chains, wallet }: Props) {
         status = (await fetchSolanaSignatureStatus(solanaChain.chainId, signature)) ?? "pending";
         if (status === "failed") throw new Error("Send failed on-chain");
       }
+      // Running out of polls is NOT confirmation: a transaction that dropped
+      // (expired blockhash, never landed) looks exactly like this.
+      if (status !== "confirmed" && status !== "finalized") {
+        throw new Error(
+          `Not confirmed yet (status: ${status}) — check ${shortHex(signature, 8, 8)} in an explorer before retrying`
+        );
+      }
       // Locked, not delivered: the validators still have to sign and a keeper
       // still has to claim on the destination. Say so rather than imply arrival.
       setTx({

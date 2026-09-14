@@ -203,7 +203,21 @@ for cid in "${CHAIN_IDS[@]}"; do
   # it (the pool's TokenListed logs, any transfer in flight). Keep the lowest
   # floor already on record for this chain — the previous deploy record, or
   # the runtime config's start_block — so scanners start where they should.
-  prev_floor="$( { [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .deploy_block // empty' "$OUT_FILE";                    [[ -n "${BRIDGE_CFG:-}" && -f "$BRIDGE_CFG" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .start_block // empty' "$BRIDGE_CFG"; } 2>/dev/null | grep -E '^[0-9]+$' | sort -n | head -1 )"
+  #
+  # The runtime config's floor only counts when it describes the SAME gate this
+  # run ends up with. A new generation's runtime config usually starts as a copy
+  # of the last one: inheriting its start_block for a freshly deployed gate
+  # points every scanner at blocks from before that gate existed — days of
+  # 10-block getLogs chunks before the first real event.
+  cfg_gate="$(jq -r --argjson c "$cid" '.chains[] | select(.chain_id == $c) | .gate // empty' "$CONFIG")"
+  rec_gate="$( [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .gate // empty' "$OUT_FILE" 2>/dev/null || true)"
+  run_gate="$rec_gate"
+  [[ "$(j ".chains[] | select(.chain_id == $cid) | .deploy_gate")" == "true" ]] || run_gate="$cfg_gate"
+  rt_gate="$( [[ -n "${BRIDGE_CFG:-}" && -f "$BRIDGE_CFG" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .gate // empty' "$BRIDGE_CFG" 2>/dev/null || true)"
+  prev_floor="$( { [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .deploy_block // empty' "$OUT_FILE"
+                   if [[ -n "$run_gate" && "${rt_gate,,}" == "${run_gate,,}" ]]; then
+                     jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .start_block // empty' "$BRIDGE_CFG"
+                   fi; } 2>/dev/null | grep -E '^[0-9]+$' | sort -n | head -1 )"
   if [[ -n "$prev_floor" && "$prev_floor" -gt 0 && "$prev_floor" -lt "${FLOOR[$cid]}" ]]; then FLOOR[$cid]="$prev_floor"; fi
 done
 
@@ -423,8 +437,21 @@ if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length'
       existing="$(jq -r --argjson c "$cid" '.swap_pools[]? | select(.chain_id == $c) | .pool // empty' "$OUT_FILE")"
     fi
     if [[ -n "$existing" ]]; then
-      pool="$existing"; from_block="$(jq -r "($pjson).from_block // 0" "$CONFIG")"
-      info "chain $cid reusing pool $pool"
+      pool="$existing"
+      # The pool's listings are replayed from this height in max_block_range
+      # chunks, so 0 on a live chain is a scan that never reaches the tip and a
+      # Swap view that stays empty. Keep whatever height is already on record
+      # for THIS pool (deploy config, previous record, runtime config) before
+      # falling back to 0.
+      from_block="$( { jq -r "($pjson).from_block // empty" "$CONFIG"
+                       [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" --arg p "${pool,,}" \
+                         '.swap_pools[]? | select(.chain_id == $c and (.pool | ascii_downcase) == $p) | .from_block // empty' "$OUT_FILE"
+                       [[ -n "${BRIDGE_CFG:-}" && -f "$BRIDGE_CFG" ]] && jq -r --argjson c "$cid" --arg p "${pool,,}" \
+                         '.graphql.swaps[]? | select(.chain_id == $c and (.pool | ascii_downcase) == $p) | .from_block // empty' "$BRIDGE_CFG"
+                     } 2>/dev/null | grep -E '^[1-9][0-9]*$' | sort -n | head -1 )"
+      from_block="${from_block:-0}"
+      [[ "$from_block" == "0" ]] && warn "chain $cid: reused pool $pool has no recorded from_block — set swap.pools[].from_block to its deploy height, or the Swap view scans from genesis"
+      info "chain $cid reusing pool $pool (listings from block $from_block)"
     else
       from_block="${FLOOR[$cid]}"
       pool="$(fc src/SwapPool.sol:SwapPool "${RPC[$cid]}" --constructor-args "$stable_tok" "$DEV_BPS")"
@@ -904,6 +931,14 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
               | map(select(.chain_id as $c | ($dep.swap_pools | map(.chain_id) | index($c)) == null)))
              + [ $dep.swap_pools[] | {chain_id, pool, from_block} ]
          | .graphql.swap = null
+         # The price keeper holds each pool at the price it was listed at: its
+         # per-chain targets come from the same listing this run just applied.
+         | .price_keeper.chain_prices =
+             ((.price_keeper.chain_prices // {})
+              + ($dep.swap_pools
+                 | map({key: (.chain_id | tostring),
+                        value: ([.tokens[]? | select(.price != null) | {key: .symbol, value: .price}] | from_entries)})
+                 | from_entries))
          | .chains = [ .chains[] as $c
              | ($dep.swap_pools[] | select(.chain_id == $c.chain_id)) as $sp
              | if $sp == null then $c else $c + {pool: $sp.pool} end ]

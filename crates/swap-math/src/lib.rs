@@ -21,6 +21,8 @@
 
 use uint::construct_uint;
 
+pub mod refresh;
+
 construct_uint! {
     /// 256-bit intermediate, because the Solidity pool computes in `uint256` and
     /// a `u128` product overflows at realistic inputs: a 1e19-unit amount times a

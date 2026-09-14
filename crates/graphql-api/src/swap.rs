@@ -96,6 +96,8 @@ pub struct Swaps {
     /// rate-limit the API into returning intermittent nulls while the frontend
     /// polls every 10s.
     cache: Arc<Mutex<BTreeMap<u64, TokenListState>>>,
+    /// Chains whose listing backfill is running in the background right now.
+    backfilling: Arc<Mutex<std::collections::BTreeSet<u64>>>,
 }
 
 /// A configured pool. The EVM side reads through alloy; the Solana side reads
@@ -125,12 +127,20 @@ struct TokenListState {
     scanned_to: Option<u64>,
 }
 
+impl TokenListState {
+    /// Currently listed tokens, in first-seen order.
+    fn listed(&self) -> Vec<Address> {
+        self.order.iter().copied().filter(|t| self.live.get(t).copied().unwrap_or(false)).collect()
+    }
+}
+
 impl Default for Swaps {
     fn default() -> Self {
         Self {
             pools: BTreeMap::new(),
             max_range: DEFAULT_MAX_BLOCK_RANGE,
             cache: Arc::new(Mutex::new(BTreeMap::new())),
+            backfilling: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         }
     }
 }
@@ -293,14 +303,111 @@ impl Swaps {
         let tip = provider.get_block_number().await?;
 
         // Resume where the last scan stopped; only the new blocks are fetched.
-        let mut state = {
-            // Recover from poisoning rather than propagating it: this is a
-            // read-through cache, so the worst a poisoned entry costs is a
-            // re-scan. Panicking here would turn one unrelated panic into a
-            // permanently broken Swap view for every later request.
-            let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            guard.get(&chain_id).cloned().unwrap_or_default()
-        };
+        // Recover from poisoning rather than propagating it: this is a
+        // read-through cache, so the worst a poisoned entry costs is a re-scan.
+        let state = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&chain_id).cloned();
+
+        // Once a listing is known, the rest of the backfill only exists to catch
+        // a later delisting — so it must never sit in front of a request. It
+        // used to: every `swapPool` call spent up to MAX_CHUNKS_PER_CALL x 2
+        // getLogs catching a reused pool up to the tip (13s on Monad testnet,
+        // ~1.1M blocks behind), which is longer than the UI's 10s poll. Each
+        // poll then superseded the previous one before it returned, and the Swap
+        // view showed "No pool on this chain" for good. Serve the cached
+        // listing now and advance the cursor in the background, one scan per
+        // chain at a time.
+        if let Some(state) = state.as_ref().filter(|s| s.scanned_to.is_some()) {
+            let listed = state.listed();
+            if !listed.is_empty() {
+                if state.scanned_to.is_some_and(|done| done < tip) {
+                    self.spawn_backfill(chain_id, provider.clone(), pool, max_range, tip);
+                }
+                return Ok(listed);
+            }
+        }
+
+        let mut state = state.unwrap_or_default();
+        let scan_err =
+            Self::scan_step(provider, pool, from_block, max_range, tip, &mut state).await;
+        let listed = state.listed();
+        self.store_state(chain_id, state);
+
+        // A truncated scan still yields a usable answer, and serving it beats
+        // serving nothing. Listings happen at deployment, so they land in the
+        // FIRST chunk — whereas catching up to the tip behind a 10-block cap can
+        // take hundreds of round trips, during which a strict error would blank
+        // the whole Swap view. The cost is bounded and one-directional: a token
+        // DELISTED in the not-yet-scanned tail keeps showing until the backfill
+        // reaches it. Only fail when the scan produced nothing at all.
+        if let Some(e) = scan_err {
+            if listed.is_empty() {
+                return Err(e);
+            }
+            tracing::warn!(
+                chain_id,
+                error = %e,
+                tokens = listed.len(),
+                "pool scan truncated; serving the tokens discovered so far"
+            );
+        }
+        Ok(listed)
+    }
+
+    /// Advance one chain's listing cursor off the request path. A no-op while a
+    /// backfill for that chain is already running.
+    fn spawn_backfill(
+        &self,
+        chain_id: u64,
+        provider: DynProvider,
+        pool: Address,
+        max_range: u64,
+        tip: u64,
+    ) {
+        {
+            let mut running = self.backfilling.lock().unwrap_or_else(|e| e.into_inner());
+            if !running.insert(chain_id) {
+                return;
+            }
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut state = this
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&chain_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(e) = Self::scan_step(&provider, pool, 0, max_range, tip, &mut state).await {
+                tracing::debug!(chain_id, error = %e, "pool listing backfill paused until the next request");
+            }
+            this.store_state(chain_id, state);
+            this.backfilling.lock().unwrap_or_else(|e| e.into_inner()).remove(&chain_id);
+        });
+    }
+
+    /// Write a scan result back, never moving a chain's cursor backwards (a
+    /// slower scan that started from an older snapshot must not undo a newer one).
+    fn store_state(&self, chain_id: u64, state: TokenListState) {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let newer = cache.get(&chain_id).is_none_or(|cur| state.scanned_to >= cur.scanned_to);
+        if newer {
+            cache.insert(chain_id, state);
+        }
+    }
+
+    /// Replay up to MAX_CHUNKS_PER_CALL chunks of listings onto `state`,
+    /// starting after its cursor (or at `from_block` if nothing was scanned).
+    /// Returns the error that stopped the scan early, if any; every chunk before
+    /// it is already applied.
+    async fn scan_step(
+        provider: &DynProvider,
+        pool: Address,
+        from_block: u64,
+        max_range: u64,
+        tip: u64,
+        state: &mut TokenListState,
+    ) -> Option<anyhow::Error> {
         let mut start = match state.scanned_to {
             Some(done) => done.saturating_add(1),
             None => from_block,
@@ -312,10 +419,8 @@ impl Swaps {
         // restarts from the deployment block and fails at the same place.
         // Bounded work PER CALL. Chasing the tip in one query is O(backlog):
         // 2600 blocks at a 10-block cap is 260 round trips, which re-triggers the
-        // rate limiting this cache exists to avoid — and makes a single UI poll
-        // take minutes. Spend a fixed budget instead and let successive polls
-        // advance the cursor; at this budget a caller catches up far faster than
-        // the chain produces blocks, so it converges while every query stays cheap.
+        // rate limiting this cache exists to avoid. Spend a fixed budget instead
+        // and let successive calls advance the cursor.
         const MAX_CHUNKS_PER_CALL: usize = 20;
         let mut chunks = 0usize;
 
@@ -362,34 +467,7 @@ impl Swaps {
             }
         }
         state.scanned_to = reached;
-
-        let listed: Vec<Address> = state
-            .order
-            .iter()
-            .copied()
-            .filter(|t| state.live.get(t).copied().unwrap_or(false))
-            .collect();
-        self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(chain_id, state);
-
-        // A truncated scan still yields a usable answer, and serving it beats
-        // serving nothing. Listings happen at deployment, so they land in the
-        // FIRST chunk — whereas catching up to the tip behind a 10-block cap can
-        // take hundreds of round trips, during which a strict error would blank
-        // the whole Swap view. The cost is bounded and one-directional: a token
-        // DELISTED in the not-yet-scanned tail keeps showing until the backfill
-        // reaches it. Only fail when the scan produced nothing at all.
-        if let Some(e) = scan_err {
-            if listed.is_empty() {
-                return Err(e);
-            }
-            tracing::warn!(
-                chain_id,
-                error = %e,
-                tokens = listed.len(),
-                "pool scan truncated; serving the tokens discovered so far"
-            );
-        }
-        Ok(listed)
+        scan_err
     }
 
     /// One chunk of the listed/delisted replay, appended to `events`.

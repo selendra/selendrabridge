@@ -8,7 +8,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --manifest-path crates/solana-relayer/Cargo.toml \
-      --bin solana-relayer --bin gate-admin
+      --bin solana-relayer --bin gate-admin --bin solana-price-keeper
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -19,6 +19,7 @@ RUN apt-get update \
 
 COPY --from=builder /build/crates/solana-relayer/target/release/solana-relayer /usr/local/bin/solana-relayer
 COPY --from=builder /build/crates/solana-relayer/target/release/gate-admin     /usr/local/bin/gate-admin
+COPY --from=builder /build/crates/solana-relayer/target/release/solana-price-keeper /usr/local/bin/solana-price-keeper
 
 ENV RUST_LOG=info
 USER bridge

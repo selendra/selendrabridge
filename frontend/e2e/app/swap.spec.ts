@@ -252,3 +252,30 @@ test("the pool's stable is labelled as such in the picker", async ({ page }) => 
   await expect(page.locator(".dd__item-sub").filter({ hasText: "stablecoin" })).toHaveCount(1);
   expect([STABLE_A, TOKEN_18]).toHaveLength(2); // fixtures referenced
 });
+
+test("a pool that answers slower than the poll interval still renders", async ({ page }) => {
+  // Live regression: the API took ~13s per swapPool against a reused Monad pool
+  // while the view polls every 10s. Each tick superseded the request before it
+  // returned, so no answer was ever applied and the view said "No pool on this
+  // chain" indefinitely — even though every single request succeeded.
+  test.setTimeout(60_000);
+  const { mockBackend } = await import("../fixtures/backend");
+  const { mockChainRpcs } = await import("../fixtures/app");
+  const { installWallet } = await import("../fixtures/wallet");
+  await mockBackend(page, {});
+  await mockChainRpcs(page);
+  await installWallet(page, { chainId: 1337, calls: CALLS, preAuthorized: true });
+  // Registered last, so it runs first: hold every swapPool query past a tick.
+  await page.route("**/graphql", async (route) => {
+    if ((route.request().postData() ?? "").includes("swapPool(")) {
+      await new Promise((r) => setTimeout(r, 12_000));
+    }
+    await route.fallback();
+  });
+  await page.goto("/");
+  await gotoView(page, "Swap");
+  await expect(page.locator(".summary__row").filter({ hasText: "Pool" })).toContainText(POOL_A.slice(0, 8), {
+    timeout: 40_000,
+  });
+  await expect(primaryButton(page)).not.toHaveText("No pool on this chain");
+});

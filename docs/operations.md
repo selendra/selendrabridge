@@ -10,7 +10,7 @@ Read [`architecture.md`](./architecture.md) first if you have not; this one assu
 
 ## 1. The processes
 
-Eight crates, five of them binaries.
+Nine crates, six of them binaries (plus `solana-price-keeper`, which lives in the separate `solana-relayer` project).
 
 | Binary | What it needs | What breaks without it |
 | --- | --- | --- |
@@ -19,11 +19,12 @@ Eight crates, five of them binaries.
 | `keeper` | target RPC, a funded key, the store | Nothing is ever submitted on-chain. Anyone can run one; it is permissionless. |
 | `indexer` | Postgres, RPC per chain | History, stuck detection, and **the entire refund lifecycle**. It writes `refund_status` for EVM gates; the delivering Solana relayer's observer (`SIG_STORE_INDEXER_TOKEN`) does the same for the Solana gate. |
 | `graphql-api` | the store (read scope only) | The frontend has no backend. Holds no database credential: history comes back through the sig-store. |
+| `price-keeper` / `solana-price-keeper` | pool RPC, each pool's `oracle` key | Every non-stable swap and quote. Pools refuse a price older than `maxPriceAge` (a day), so with no oracle they go dark a day after the last `setPrice`. |
 
 The dependency that catches people out is the refund one.
 A refund needs the indexer running, because the keeper's refund loop only ever sees candidates the store has already nominated, and the sweep that nominates them (`bridge_db::Db::sweep_refund_eligible`) is called from the indexer and nowhere else.
 
-`Dockerfile` builds all five binaries and `docker-compose.yml` deploys all of them, so the shipped stack advances refunds and serves the frontend on its own.
+`Dockerfile` builds all six binaries and `docker-compose.yml` deploys the first five (the generated stacks add the price keepers), so the shipped stack advances refunds and serves the frontend on its own.
 
 The processes coordinate only through the sig-store — there are no direct connections between them, and in particular validators have no peers. Section 5 covers spreading them across machines; `architecture.md` §4.7 covers why that topology is safe.
 Note that `graphql-api` is the one service with no `DATABASE_URL`: it reads the indexer's history over the sig-store's read scope, not from Postgres, so do not hand it a database URL when running it by hand either.
@@ -227,6 +228,45 @@ Three things to know when running one:
 - **A chain in both lists gets a startup warning.** The two loops share one account and can briefly contend on its nonce under load. It is self-healing, but for a busy bidirectional corridor run the two roles as separate processes, or give them separate accounts.
 
 Running more than one keeper is safe and is the normal way to get redundancy: each `try_*` re-reads on-chain state first, so the loser of a race sees `executed == true` and does nothing.
+
+---
+
+## 4a. Keeping pool prices fresh
+
+References: `crates/price-keeper`, `crates/solana-relayer/src/bin/solana-price-keeper.rs`, `swap_math::refresh`.
+
+`SwapPool` and the Solana swap program price swaps from an oracle-set figure and refuse it once it is older than the max age (`maxPriceAge` / `max_price_age`, a day by default). That guard is what stops a dead oracle from leaving a pool trading at yesterday's price — and it means a deployment with **no** oracle loses every non-stable swap a day after its last `setPrice`. The API then returns `swapQuote: null` and the UI shows "No quote available".
+
+The two price keepers are that oracle for **static** prices. Per token they:
+
+- re-assert the configured price `refresh_margin_secs` before it would expire (default 6 h before a 24 h age limit);
+- walk the on-chain price toward a changed target one capped step per cooldown (`maxPriceDeviationBps`, `minPriceUpdateInterval`), so no update can revert;
+- skip the stable/hub, which is pinned and never stale.
+
+```toml
+# price-keeper.toml (EVM)
+poll_interval_secs  = 600
+refresh_margin_secs = 21600
+[oracle]                           # SignerConfig; must equal each pool's oracle()
+private_key_env = "PRICE_ORACLE_KEY"
+[[pools]]
+chain_id = 11155111
+rpc      = "https://…"
+pool     = "0x…"
+[[pools.tokens]]
+symbol = "WRAP"
+address = "0x…"
+price  = "3180"                    # whole hub units
+```
+
+`solana-price-keeper.toml` has the same shape flattened to one pool: `rpc`, `program` (the swap program), `oracle_keypair`, and `[[tokens]]` with `mint` instead of `address`. `bridge-from-json.sh` generates both from the `price_keeper` block.
+
+What to know when running them:
+
+- **The key must be the pool's oracle.** Otherwise each tick logs `we are not this pool's oracle` at ERROR and the pool goes stale anyway. Give the oracle role its own low-value key with `setOracle`: it can move prices (within the caps), but not liquidity.
+- **Fund it on every pool chain.** A refresh is one `setPrice` per token per day.
+- **Static prices only.** Re-asserting a fixed figure defeats the staleness guard for a token with a real market. For those, feed real prices instead of running these.
+- **Stuck at "No quote available"?** Check the keeper logs for `price refreshed`, then `swap-admin show --mint <mint>` on Solana or `priceSetAt(token)` against `maxPriceAge()` on EVM.
 
 ---
 

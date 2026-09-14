@@ -233,16 +233,19 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   );
 
   // Prefill token/gate/router from the registry for the source chain. When the
-  // source chain changes, reset the token to that chain's primary (first listed)
-  // asset so the picker and the address field stay in sync; the user can still
-  // pick another from the dropdown or type a custom address.
+  // source chain changes, ALL THREE are re-targeted: each is an address on one
+  // specific chain. Keeping the previous chain's gate after a wallet switch
+  // (they used to be filled only while empty) makes the approve and the send
+  // target whatever lives at that address on the new chain — often nothing, so
+  // the "send" succeeds as a plain call, locks nothing, and still reports
+  // "Locked". The user can still type a custom address after the switch.
   useEffect(() => {
-    const primary = fromReg?.tokens?.[0]?.address ?? fromReg?.token ?? "";
+    if (!fromReg) return;
+    const primary = fromReg.tokens?.[0]?.address ?? fromReg.token ?? "";
     if (primary) setToken(primary);
-    if (fromReg?.gate && !gate) setGate(fromReg.gate);
-    if (fromReg?.router && !router) setRouter(fromReg.router);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromReg?.chainId]);
+    setGate(fromReg.gate ?? "");
+    setRouter(fromReg.router ?? "");
+  }, [fromReg?.chainId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Default receiver = the connected account.
   useEffect(() => {
@@ -430,8 +433,13 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
         "0x"
       );
       setTx({ kind: "pending", label: "Confirming send…", hash });
-      const r = await waitReceipt(wallet.request, hash);
+      const r = await waitReceiptFull(wallet.request, hash);
       if (!r.success) throw new Error("Send reverted on-chain");
+      // A successful receipt alone proves nothing: a call to an address with no
+      // code "succeeds" too. Only the gate's own Sent event means funds locked.
+      if (!extractSent(r.logs, gate)) {
+        throw new Error("The transaction succeeded but the Gate emitted no Sent event — nothing was locked. Check the Gate address.");
+      }
       setTx({ kind: "done", label: "Locked — validators will sign it", hash });
       setAmount("");
       await refreshOnchain();
