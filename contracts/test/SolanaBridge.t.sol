@@ -48,6 +48,7 @@ contract SolanaBridgeTest is Test {
         gate.setSupportedChain(1338, true);
 
         token = new TestToken("Test", "TST");
+        gate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         vm.prank(user);

@@ -32,6 +32,7 @@ const CALLS = {
   "70a08231": BAL.toString(16), // balanceOf
   dd62ed3e: (2n ** 255n).toString(16), // allowance: already approved
   "7a0ebc88": addrWord(GATE_A), // router.gate()
+  "4e3ff796": "1", // gate.bridgeUnit(token): already at bridge decimals
   // remoteRouter(uint256) -> dynamic bytes: offset, length, data
   a6b18e64: "raw:" + word(32) + word(20) + ROUTER_B.replace(/^0x/, "").padEnd(64, "0"),
 };

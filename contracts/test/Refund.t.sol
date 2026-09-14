@@ -65,6 +65,7 @@ contract RefundTest is Test {
         srcGate = deployTestGate(validators, 1);
         srcGate.setSupportedChain(CHAIN_DST, true);
         token = new TestToken("Test", "TST");
+        srcGate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         // The user locks funds bound for a chain that will never deliver.
@@ -82,6 +83,7 @@ contract RefundTest is Test {
         // and "no double spend" is a meaningful claim rather than a side effect
         // of an empty vault
         TestToken dstToken = new TestToken("Test", "TST");
+        dstGate.setBridgeDecimals(address(dstToken), 18);
         dstToken.mint(address(dstGate), 1_000 ether);
         dstGate.setLocalToken(debridgeId, address(dstToken));
 

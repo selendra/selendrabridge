@@ -45,6 +45,7 @@ contract ClaimTest is Test {
         gate = deployTestGate(validators, 1); // threshold 1 by default
 
         token = new TestToken("Test", "TST");
+        gate.setBridgeDecimals(address(token), 18);
         // pre-fund the gate with target-side liquidity
         token.mint(address(gate), 1_000 ether);
 

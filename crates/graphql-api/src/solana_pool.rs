@@ -381,6 +381,7 @@ pub struct GateSendContext {
     /// The registered vault for that asset — the program refuses any other.
     pub vault: String,
     pub decimals: u8,
+    pub bridge_decimals: u8,
     pub paused: bool,
 }
 
@@ -435,7 +436,9 @@ impl SolanaGate {
             anyhow::anyhow!("corridor to chain {chain_id_to} is not registered on this gate")
         })?;
 
-        let decimals = pool.mint_decimals(&b58(&asset.mint)).await.unwrap_or(0);
+        // The mint's decimals as the program recorded them at registration —
+        // the ones `send` actually converts with — rather than a second read.
+        let decimals = asset.local_decimals;
         Ok(GateSendContext {
             program_id: self.program.clone(),
             bridge_domain: format!("0x{}", hex_encode(&cfg.bridge_domain)),
@@ -444,6 +447,7 @@ impl SolanaGate {
             debridge_id: debridge_id_hex.to_string(),
             vault: b58(&asset.vault),
             decimals,
+            bridge_decimals: asset.bridge_decimals,
             paused: cfg.paused,
         })
     }

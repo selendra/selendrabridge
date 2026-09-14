@@ -26,9 +26,12 @@ import {GateDeployer} from "../src/GateDeployer.sol";
 /// the operator must — in this order, before provisioning any liquidity:
 ///   1. `setSupportedChain(chainId, true)` for every peer chain `send` may
 ///      target (M-3: an unlisted destination is refused, nothing is locked);
-///   2. `setLocalToken(debridgeId, localToken)` for every inbound corridor
+///   2. `setBridgeDecimals(localToken, d)` once per local token, with the
+///      asset's mesh-wide bridge decimals (instant while unsealed) — a corridor
+///      cannot be registered for a token without it;
+///   3. `setLocalToken(debridgeId, localToken)` for every inbound corridor
 ///      (instant while unsealed);
-///   3. `seal()` — irreversible. From then on every NEW corridor needs
+///   4. `seal()` — irreversible. From then on every NEW corridor needs
 ///      `scheduleGovernance(setLocalTokenActionId(...))` plus GOVERNANCE_DELAY,
 ///      which is what stops an owner key from draining the gate through a fake
 ///      corridor (H-1). An unsealed gate that holds funds is that drain waiting.

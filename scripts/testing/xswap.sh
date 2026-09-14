@@ -103,6 +103,11 @@ cast send "$ROUTER_B" "setRemoteRouter(uint256,bytes)" $CHAIN_A "$ROUTER_A" --rp
 PREFIX=$(printf '%064x' $CHAIN_A)
 DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${STABLE_A#0x}")
 echo "  debridgeId(stable A->B)=$DEBRIDGE_ID"
+# Bridge decimals must precede setLocalToken/send and seal (write-once, instant
+# only while unsealed). Identity: the DeployXSwap stable is 6-dec on both chains.
+# gate A sends stableA (via swapAndBridge); gate B maps + pays out stableB.
+cast send "$GATE_A" "setBridgeDecimals(address,uint8)" "$STABLE_A" 6 --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+cast send "$GATE_B" "setBridgeDecimals(address,uint8)" "$STABLE_B" 6 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_B" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$STABLE_B" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 # H-1: wiring done — seal both gates before funding, as production does.
 cast send "$GATE_A" "seal()" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -233,14 +234,45 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         the moment it is known to be dead.
     mapping(uint256 chainId => bool) public supportedChain;
 
+    /// @notice How a local token's amounts map onto the wire.
+    /// @dev    DECIMALS NORMALISATION. The same asset has different decimals on
+    ///         different chains — TST is 18 on the EVM chains and 6 as an SPL
+    ///         mint — so a raw amount cannot cross the bridge unchanged: 1 TST
+    ///         locked on an 18-decimal chain is 1e18 units, which a 6-decimal
+    ///         destination would pay out as a trillion TST.
+    ///
+    ///         So every transfer travels in the asset's BRIDGE DECIMALS: one value
+    ///         per asset, the same on every gate and the Solana program, and no
+    ///         larger than the asset's decimals on any chain in the mesh. `send`
+    ///         converts the locked local amount down to it (reverting if that is
+    ///         not exact), the submissionId and `Sent` commit to the converted
+    ///         amount, and `claim` / `refund` convert back up with the local
+    ///         token's own decimals. Scaling up is always exact, so no chain ever
+    ///         pays out more or less than was locked.
+    ///
+    ///         `localDecimals` is the token's `decimals()` cached at registration,
+    ///         so a transfer never depends on an external call that could change.
+    struct BridgeDecimals {
+        bool set;
+        uint8 bridgeDecimals;
+        uint8 localDecimals;
+    }
+
+    /// @notice Bridge-decimals registration per local token (see {BridgeDecimals}).
+    ///         WRITE-ONCE, and delayed after {seal}: see {setBridgeDecimals}.
+    mapping(address token => BridgeDecimals) public bridgeDecimalsOf;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
     ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
-    ///      `supportedChain` took one each: 49 -> 47. The gap still ends at
-    ///      slot 63, so the layout is upgrade-compatible with the live gates.)
-    uint256[47] private __gap;
+    ///      `supportedChain` took one each: 49 -> 47. `bridgeDecimalsOf` took
+    ///      one: 47 -> 46. The gap still ends at slot 63.)
+    uint256[46] private __gap;
 
+    /// @param amount the WIRE amount, in the asset's bridge decimals (see
+    ///        {BridgeDecimals}) — what the submissionId commits to, not the local
+    ///        amount locked.
     /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
     ///        (which commits to `debridgeId`, a one-way hash of it), so it is
     ///        emitted explicitly — the refund relayer needs the concrete address
@@ -288,6 +320,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     event ValidatorSet(address indexed validator, bool active);
     event ThresholdSet(uint256 threshold);
     event LocalTokenSet(bytes32 indexed debridgeId, address indexed localToken);
+    event BridgeDecimalsSet(address indexed token, uint8 bridgeDecimals, uint8 localDecimals);
     event GuardianSet(address indexed guardian);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
@@ -335,6 +368,20 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///      repointed at a different asset, because in-flight claims bind only the
     ///      `debridgeId` and would then release the new token.
     error LocalTokenAlreadySet(bytes32 debridgeId, address current);
+    /// @dev `setBridgeDecimals` is write-once: every in-flight transfer of the
+    ///      token was converted with the registered value.
+    error BridgeDecimalsAlreadySet(address token);
+    /// @dev the token has no bridge decimals, so its amounts cannot be converted
+    ///      to or from the wire. Also refused by `setLocalToken`, so no corridor
+    ///      can exist without them.
+    error BridgeDecimalsUnset(address token);
+    /// @dev bridge decimals must not exceed the token's own, and the scale
+    ///      between them must fit a uint256 power of ten
+    error InvalidBridgeDecimals(address token, uint8 bridgeDecimals, uint8 localDecimals);
+    /// @dev the amount carries precision below the asset's bridge decimals; it
+    ///      would not survive the conversion, so it is refused rather than
+    ///      silently truncated. `unit` is the smallest bridgeable step.
+    error InexactAmount(uint256 amount, uint256 unit);
     /// @dev a zero domain is refused because it is what an uninitialized proxy
     ///      would report, and a mesh that silently agreed on "unset" would be
     ///      exactly as replayable as having no domain at all.
@@ -502,6 +549,10 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         `debridgeId` (required by {setLocalToken} once {isSealed}).
     /// @dev    Commits to BOTH halves, so a matured approval for "debridgeId X
     ///         pays out token Y" cannot be spent to point X at anything else.
+    function setBridgeDecimalsActionId(address token, uint8 bridgeDecimals) public pure returns (bytes32) {
+        return keccak256(abi.encode("setBridgeDecimals", token, bridgeDecimals));
+    }
+
     function setLocalTokenActionId(bytes32 debridgeId, address localToken)
         public
         pure
@@ -627,8 +678,56 @@ contract Gate is Initializable, UUPSUpgradeable {
         address current = tokenOf[debridgeId];
         if (current != address(0)) revert LocalTokenAlreadySet(debridgeId, current);
         if (isSealed) _consumeGovernance(setLocalTokenActionId(debridgeId, localToken));
+        // A corridor whose token cannot convert amounts could lock funds that no
+        // claim can pay out. (A revert here also restores a consumed schedule.)
+        if (!bridgeDecimalsOf[localToken].set) revert BridgeDecimalsUnset(localToken);
         tokenOf[debridgeId] = localToken;
         emit LocalTokenSet(debridgeId, localToken);
+    }
+
+    /// @notice Register the bridge decimals of a local token (see {BridgeDecimals}).
+    /// @dev    Must precede {setLocalToken} for the token, and every gate in the
+    ///         mesh — and the Solana program — must register the SAME value for
+    ///         the same asset. It is part of the value an amount carries, so a
+    ///         mismatch pays out a power of ten too much or too little.
+    ///
+    ///         WRITE-ONCE: in-flight transfers were converted with it. DELAYED
+    ///         AFTER {seal} for the reason {setLocalToken} is: a lower value on
+    ///         a destination multiplies what every claim of the token releases.
+    function setBridgeDecimals(address token, uint8 bridgeDecimals) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        if (bridgeDecimalsOf[token].set) revert BridgeDecimalsAlreadySet(token);
+        uint8 localDecimals = IERC20Metadata(token).decimals();
+        // 10**77 is the largest power of ten a uint256 holds.
+        if (bridgeDecimals > localDecimals || localDecimals - bridgeDecimals > 77) {
+            revert InvalidBridgeDecimals(token, bridgeDecimals, localDecimals);
+        }
+        if (isSealed) _consumeGovernance(setBridgeDecimalsActionId(token, bridgeDecimals));
+        bridgeDecimalsOf[token] =
+            BridgeDecimals({set: true, bridgeDecimals: bridgeDecimals, localDecimals: localDecimals});
+        emit BridgeDecimalsSet(token, bridgeDecimals, localDecimals);
+    }
+
+    /// @notice The smallest local amount of `token` that crosses the bridge
+    ///         (`10 ** (localDecimals - bridgeDecimals)`); `send` amounts must be
+    ///         multiples of it.
+    function bridgeUnit(address token) public view returns (uint256) {
+        BridgeDecimals memory d = bridgeDecimalsOf[token];
+        if (!d.set) revert BridgeDecimalsUnset(token);
+        return 10 ** (d.localDecimals - d.bridgeDecimals);
+    }
+
+    /// @notice Convert a local amount of `token` to its wire (bridge-decimals)
+    ///         amount. Reverts {InexactAmount} when it does not convert exactly.
+    function toBridgeAmount(address token, uint256 localAmount) public view returns (uint256) {
+        uint256 unit = bridgeUnit(token);
+        if (localAmount % unit != 0) revert InexactAmount(localAmount, unit);
+        return localAmount / unit;
+    }
+
+    /// @notice Convert a wire (bridge-decimals) amount to a local amount of `token`.
+    function toLocalAmount(address token, uint256 bridgeAmount) public view returns (uint256) {
+        return bridgeAmount * bridgeUnit(token);
     }
 
     /// @notice End the setup phase. From here on every new corridor waits out
@@ -685,7 +784,9 @@ contract Gate is Initializable, UUPSUpgradeable {
 
     /// @notice Lock `amount` of `token` and emit a `Sent` event for validators.
     /// @param token      the ERC-20 to lock on this (source) chain
-    /// @param amount     amount to bridge
+    /// @param amount     LOCAL amount of `token` to lock. Must be a multiple of
+    ///                   {bridgeUnit}; the `Sent` event and the submissionId carry
+    ///                   it converted to the asset's bridge decimals.
     /// @param chainIdTo  destination chain id. Must be listed in {supportedChain}:
     ///                   a chain with no gate can neither claim nor cancel, so
     ///                   funds locked towards it would have no recovery path.
@@ -709,6 +810,9 @@ contract Gate is Initializable, UUPSUpgradeable {
     ) external whenNotPaused returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
         if (!supportedChain[chainIdTo]) revert UnsupportedChain(chainIdTo);
+        // Everything below — the id, the width cap, the event — is in the wire
+        // amount; only the token transfer uses the local one.
+        uint256 wireAmount = toBridgeAmount(token, amount);
         // The receiver is only ever hashed and emitted here (never dereferenced on
         // this chain), but we still pin its width to the destination address size:
         // 20 = EVM address, 32 = Solana/non-EVM account key. A wrong length means a
@@ -717,17 +821,16 @@ contract Gate is Initializable, UUPSUpgradeable {
         // Non-EVM leg: the Solana program's ClaimArgs/CancelArgs carry `amount`
         // as a u64 and recompute the submissionId from it, so an amount that does
         // not fit can be neither delivered nor cancelled — and without a cancel
-        // there is no refund. Refuse to lock it in the first place. Note that no
-        // decimals normalisation exists anywhere in this bridge; for an 18-dec
-        // token the cap is ~18.44 whole tokens, which is the point of the check.
-        if (receiver.length == 32 && amount > type(uint64).max) revert AmountTooWide(amount);
+        // there is no refund. Refuse to lock it in the first place. The cap
+        // applies to the WIRE amount, which is what the Solana program receives.
+        if (receiver.length == 32 && wireAmount > type(uint64).max) revert AmountTooWide(wireAmount);
 
         uint256 nonce = nonceTo[chainIdTo];
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, token);
         bytes memory nativeSender = abi.encodePacked(msg.sender);
 
         submissionId = _idFor(
-            debridgeId, amount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
+            debridgeId, wireAmount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
         );
 
         // Effects BEFORE the external transfer (checks-effects-interactions):
@@ -741,7 +844,7 @@ contract Gate is Initializable, UUPSUpgradeable {
         emit Sent(
             submissionId,
             debridgeId,
-            amount,
+            wireAmount,
             block.chainid,
             chainIdTo,
             receiver,
@@ -771,6 +874,8 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @notice Verify a threshold of validator signatures and release funds once.
     /// @dev    `signatures` MUST be sorted by recovered signer address, strictly
     ///         ascending. This both de-duplicates signers and bounds gas.
+    /// @param amount the WIRE amount from the source `Sent` event; the payout is
+    ///               {toLocalAmount} of it, emitted in `Claimed`
     /// @param nativeSender the packed source-chain sender; required to recompute
     ///                     the id when `autoParams` is non-empty (else ignored)
     function claim(
@@ -797,10 +902,13 @@ contract Gate is Initializable, UUPSUpgradeable {
         address localToken = tokenOf[debridgeId];
         if (localToken == address(0)) revert UnknownAsset(debridgeId);
         address to = _toAddress(receiver);
+        // `amount` is the wire amount the validators signed; pay it out in this
+        // token's own decimals.
+        uint256 localAmount = toLocalAmount(localToken, amount);
 
-        IERC20(localToken).safeTransfer(to, amount);
+        IERC20(localToken).safeTransfer(to, localAmount);
 
-        emit Claimed(submissionId, debridgeId, to, amount);
+        emit Claimed(submissionId, debridgeId, to, localAmount);
     }
 
     // ---------------------------------------------------------------------
@@ -921,9 +1029,12 @@ contract Gate is Initializable, UUPSUpgradeable {
         refunded[submissionId] = true;
         delete sentBy[submissionId];
 
-        IERC20(token).safeTransfer(sender, amount);
+        // `send` locked exactly `toBridgeAmount(token, local)`, and the
+        // registration is write-once, so this is exactly what was locked.
+        uint256 localAmount = toLocalAmount(token, amount);
+        IERC20(token).safeTransfer(sender, localAmount);
 
-        emit Refunded(submissionId, debridgeId, sender, amount);
+        emit Refunded(submissionId, debridgeId, sender, localAmount);
     }
 
     /// @notice Recompute a submissionId without executing (hash-equivalence tests).

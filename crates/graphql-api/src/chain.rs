@@ -167,6 +167,10 @@ pub struct TokenInfo {
     pub symbol: String,
     /// `0x`-prefixed ERC-20 address on this chain.
     pub address: String,
+    /// The asset's mesh-wide bridge decimals — what every transfer amount of it
+    /// is denominated in on the wire. Absent on registries predating the field.
+    #[serde(default)]
+    pub bridge_decimals: Option<u8>,
 }
 
 /// Load the chain registry from a JSON file (an array of [`ChainInfo`]).

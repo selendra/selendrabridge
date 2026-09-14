@@ -65,6 +65,7 @@ contract UpgradeTest is Test {
     function _destination(bytes32 domain, bytes32 debridgeId) internal returns (Gate g) {
         g = GateDeployer.deploy(validators, 1, domain);
         TestToken dstToken = new TestToken("Test", "TST");
+        g.setBridgeDecimals(address(dstToken), 18);
         dstToken.mint(address(g), 1_000 ether);
         g.setLocalToken(debridgeId, address(dstToken));
     }
@@ -82,6 +83,7 @@ contract UpgradeTest is Test {
         Gate srcGate = GateDeployer.deploy(validators, 1, DOMAIN_A);
         srcGate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
+        srcGate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         vm.startPrank(user);
@@ -131,6 +133,7 @@ contract UpgradeTest is Test {
         Gate srcGate = GateDeployer.deploy(validators, 1, DOMAIN_A);
         srcGate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
+        srcGate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         vm.startPrank(user);
@@ -202,6 +205,7 @@ contract UpgradeTest is Test {
         Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
         gate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
+        gate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         vm.startPrank(user);

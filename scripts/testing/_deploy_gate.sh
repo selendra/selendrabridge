@@ -42,7 +42,8 @@
 # so every gate lists all of them — override with GATE_PEER_CHAINS="a b c".
 # Gates are left UNSEALED: every suite registers its corridors after deploy, and
 # they are throwaway. `seal_gate rpc key gate` is there for the ones that want
-# to exercise the sealed path.
+# to exercise the sealed path. `set_bridge_decimals rpc key gate token` must run
+# for every token a gate will send or map, before setLocalToken / send / seal.
 
 _GATE_CONTRACTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../contracts" && pwd)"
 
@@ -84,6 +85,23 @@ deploy_gate() {  # rpc key validators threshold [domain] -> echoes the PROXY add
   done
 
   printf '%s' "$proxy"
+}
+
+# Bridge decimals: a gate refuses `setLocalToken(id, token)` and `send(token, …)`
+# with BridgeDecimalsUnset until the owner registers the token's bridge decimals.
+# The suites register the IDENTITY (bridgeDecimals = the token's own decimals), so
+# no amount, submissionId or assertion changes. Write-once, and instant only while
+# the gate is unsealed — so call this BEFORE setLocalToken / send / seal_gate.
+# Every gate in a mesh must register the same value for the same asset.
+set_bridge_decimals() {  # rpc key gate token [decimals] — defaults to token.decimals()
+  local rpc=$1 key=$2 gate=$3 token=$4 dec=${5:-}
+  if [[ -z "$dec" ]]; then
+    dec=$(cast call "$token" "decimals()(uint8)" --rpc-url "$rpc") \
+      || { echo "set_bridge_decimals: decimals() failed for $token on $rpc" >&2; return 1; }
+  fi
+  cast send "$gate" "setBridgeDecimals(address,uint8)" "$token" "$dec" \
+    --rpc-url "$rpc" --private-key "$key" >/dev/null \
+    || { echo "set_bridge_decimals: setBridgeDecimals($token,$dec) failed on $gate ($rpc)" >&2; return 1; }
 }
 
 seal_gate() {  # rpc key gate — irreversible; setLocalToken then needs scheduleGovernance + 48h

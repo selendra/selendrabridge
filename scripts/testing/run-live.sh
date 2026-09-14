@@ -86,6 +86,9 @@ GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1,$V2]" 2)
 
 echo "    TOKEN_SRC=$TOKEN_SRC  GATE_SRC=$GATE_SRC"
 echo "    TOKEN_DST=$TOKEN_DST  GATE_DST=$GATE_DST"
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$TOKEN_DST" 18
 
 echo "=== fund both chains for BIDIRECTIONAL bridging (A<->B) ==="
 # debridgeId = keccak(originChainId padded to 32 bytes || originToken). Each

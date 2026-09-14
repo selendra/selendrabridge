@@ -79,6 +79,15 @@ test("lists every submission with its route, amount, nonce and signature count",
   await expect(first.locator(".sig-count")).toContainText("2 / 2");
 });
 
+test("formats an amount in the bridge decimals the API reports, not the token's", async ({ page }) => {
+  // 2.5 at 6 bridge decimals. Formatted with the source token's 18 decimals it
+  // would read as 0.0000000000025.
+  await openExplorer(page, {
+    submissions: [{ ...submissions[0], amount: "2500000", bridgeDecimals: 6 }],
+  });
+  await expect(page.locator(".tbl__row").first().locator(".tbl__amount")).toHaveText("2.5");
+});
+
 test("renders the lifecycle status per row", async ({ page }) => {
   await openExplorer(page);
   await expect(page.locator(".tbl__row").first()).toContainText(/Ready/i);

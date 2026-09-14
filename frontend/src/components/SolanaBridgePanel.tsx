@@ -80,6 +80,10 @@ export function SolanaBridgePanel({ solanaChain, chains, wallet }: Props) {
 
   const decimals = ctx?.decimals ?? 0;
   const amountBase = ctx ? parseUnits(amount, decimals) : 0n;
+  // Amounts cross the bridge in the asset's bridge decimals; the program refuses
+  // a mint amount that isn't a whole multiple of the unit between the two.
+  const bridgeUnit = ctx && ctx.decimals >= ctx.bridgeDecimals ? 10n ** BigInt(ctx.decimals - ctx.bridgeDecimals) : null;
+  const inexact = bridgeUnit != null && amountBase > 0n && amountBase % bridgeUnit !== 0n;
 
   const [balance, setBalance] = useState<bigint | null>(null);
   const refreshBalance = useCallback(async () => {
@@ -125,6 +129,7 @@ export function SolanaBridgePanel({ solanaChain, chains, wallet }: Props) {
         chainIdTo: BigInt(toChainId),
         nonce: BigInt(ctx.nonce),
         amount: amountBase,
+        bridgeUnit: bridgeUnit ?? 1n,
         receiver: hexToBytes(receiver.trim()),
       });
 
@@ -185,6 +190,9 @@ export function SolanaBridgePanel({ solanaChain, chains, wallet }: Props) {
   else if (ctx.paused) button = { label: "Gate is paused", disabled: true };
   else if (!receiverOk) button = { label: "Enter the destination address", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
+  else if (bridgeUnit == null) button = { label: "Corridor misconfigured (bridge decimals)", disabled: true };
+  else if (inexact)
+    button = { label: `Too precise — this asset bridges at most ${ctx.bridgeDecimals} decimals`, disabled: true };
   else if (insufficient) button = { label: `Insufficient ${symbol}`, disabled: true };
   else button = { label: "Bridge from Solana", onClick: doSend };
   if (busy) button = { label: tx.label, disabled: true };

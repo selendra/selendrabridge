@@ -26,6 +26,7 @@ const SEL = {
   finalize: "c2c1fffb", // finalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes)
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
   gate: "7a0ebc88", // gate() — SwapRouter's immutable Gate
+  bridgeUnit: "4e3ff796", // bridgeUnit(address) — Gate
 } as const;
 
 function strip0x(h: string): string {
@@ -251,6 +252,17 @@ async function ethCall(req: Eip1193Request, to: string, data: string): Promise<s
 
 export async function readBalance(req: Eip1193Request, token: string, owner: string): Promise<bigint> {
   return hexToBigInt(await ethCall(req, token, "0x" + SEL.balanceOf + encAddress(owner)));
+}
+
+/**
+ * The Gate's bridge unit for `token`: `send` only accepts multiples of it
+ * (10^(tokenDecimals - bridgeDecimals)). Rejects when the gate has no bridge
+ * decimals registered for the token — it cannot be sent through that gate.
+ */
+export async function readBridgeUnit(req: Eip1193Request, gate: string, token: string): Promise<bigint> {
+  const unit = hexToBigInt(await ethCall(req, gate, "0x" + SEL.bridgeUnit + encAddress(token)));
+  if (unit <= 0n) throw new Error("gate reports no bridge unit for this token");
+  return unit;
 }
 
 export async function readAllowance(

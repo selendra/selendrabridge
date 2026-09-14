@@ -123,6 +123,8 @@ pub struct InitArgs {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct SendArgs {
     pub debridge_id: [u8; 32],
+    /// LOCAL amount to lock, in the mint's decimals. Must be a whole multiple of
+    /// the asset's bridge unit; the event and submissionId carry it converted.
     pub amount: u64,
     pub chain_id_to: u64,
     pub receiver: Vec<u8>,
@@ -132,6 +134,7 @@ pub struct SendArgs {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct ClaimArgs {
     pub debridge_id: [u8; 32],
+    /// WIRE amount (bridge decimals), exactly as the source `Sent` carried it.
     pub amount: u64,
     pub chain_id_from: u64,
     pub nonce: u64,
@@ -151,7 +154,11 @@ pub enum GateInstruction {
     /// C1: bind a `debridge_id` to the SPL `mint` + `vault` that may back it.
     /// Owner-gated. New variant appended last so existing discriminants (0..=4)
     /// stay byte-compatible with `bridge_solana::instruction::GateInstruction`.
-    RegisterAsset { debridge_id: [u8; 32] },
+    ///
+    /// `bridge_decimals` is the asset's mesh-wide bridge decimals (see
+    /// [`AssetConfig::bridge_decimals`]); it must equal what every EVM gate
+    /// registered with `setBridgeDecimals` for the same asset.
+    RegisterAsset { debridge_id: [u8; 32], bridge_decimals: u8 },
     /// H-3: owner-gated registration of a destination chain. `send` refuses any
     /// `chain_id_to` that has not been registered here.
     RegisterCorridor { chain_id_to: u64 },
@@ -469,6 +476,45 @@ pub struct AssetConfig {
     pub debridge_id: [u8; 32],
     pub mint: Pubkey,
     pub vault: Pubkey,
+    /// DECIMALS NORMALISATION — mirrors `Gate.BridgeDecimals`. Every transfer
+    /// travels in the asset's bridge decimals: one value per asset across the
+    /// whole mesh, no larger than its decimals on any chain. `send` converts the
+    /// locked amount down to it, `claim` scales it back up to this mint.
+    pub bridge_decimals: u8,
+    /// The mint's own decimals, read from the mint at registration (SPL mint
+    /// decimals are immutable), so `send`/`claim` need not carry the mint account.
+    pub local_decimals: u8,
+}
+
+/// Borsh size of an [`AssetConfig`]: 32 * 3 + 1 + 1.
+const ASSET_CONFIG_LEN: usize = 32 * 3 + 2;
+
+/// `10^(local - bridge)`: the smallest local amount that crosses the bridge.
+/// `None` when the pair is invalid (bridge above local, or a scale past u64).
+fn bridge_unit(local_decimals: u8, bridge_decimals: u8) -> Option<u64> {
+    let exp = local_decimals.checked_sub(bridge_decimals)?;
+    10u64.checked_pow(exp as u32)
+}
+
+impl AssetConfig {
+    fn unit(&self) -> Result<u64, ProgramError> {
+        bridge_unit(self.local_decimals, self.bridge_decimals)
+            .ok_or_else(|| GateError::InvalidBridgeDecimals.into())
+    }
+
+    /// Local (mint) amount -> wire amount. Exact or [`GateError::InexactAmount`].
+    fn to_wire(&self, local: u64) -> Result<u64, ProgramError> {
+        let unit = self.unit()?;
+        if local % unit != 0 {
+            return Err(GateError::InexactAmount.into());
+        }
+        Ok(local / unit)
+    }
+
+    /// Wire amount -> local (mint) amount.
+    fn to_local(&self, wire: u64) -> Result<u64, ProgramError> {
+        wire.checked_mul(self.unit()?).ok_or_else(|| GateError::AmountOverflow.into())
+    }
 }
 
 /// Source-side proof that THIS gate locked funds for a submissionId, and where
@@ -610,6 +656,8 @@ fn asset_write_allowed(
     if existing.mint == incoming.mint
         && existing.vault == incoming.vault
         && existing.debridge_id == incoming.debridge_id
+        && existing.bridge_decimals == incoming.bridge_decimals
+        && existing.local_decimals == incoming.local_decimals
     {
         return Ok(false);
     }
@@ -976,6 +1024,19 @@ pub enum GateError {
     /// `Custom(21)`. Mirrors `Gate.sol`'s `ZeroValidator`.
     #[error("validator address must be non-zero")]
     ZeroValidator,
+    /// Decimals normalisation: the amount carries precision below the asset's
+    /// bridge decimals, so it would not survive the conversion to the wire.
+    /// Refused rather than truncated. `Custom(22)`. Mirrors `Gate.InexactAmount`.
+    #[error("amount is not a whole multiple of the asset's bridge unit")]
+    InexactAmount,
+    /// `register_asset` was given bridge decimals above the mint's own, or a
+    /// scale whose power of ten does not fit a u64. `Custom(23)`.
+    #[error("bridge decimals must not exceed the mint's decimals (scale <= 10^19)")]
+    InvalidBridgeDecimals,
+    /// A wire amount scaled to this mint's decimals does not fit a u64 — the
+    /// claim cannot be paid in this mint. `Custom(24)`.
+    #[error("amount overflows u64 at this mint's decimals")]
+    AmountOverflow,
 }
 
 /// Pure init-time validator-set rule (host-testable; `init` itself cannot run
@@ -1169,8 +1230,8 @@ pub fn process_instruction(
         GateInstruction::SetThreshold { threshold } => {
             process_set_threshold(program_id, accounts, threshold)
         }
-        GateInstruction::RegisterAsset { debridge_id } => {
-            process_register_asset(program_id, accounts, debridge_id)
+        GateInstruction::RegisterAsset { debridge_id, bridge_decimals } => {
+            process_register_asset(program_id, accounts, debridge_id, bridge_decimals)
         }
         GateInstruction::RegisterCorridor { chain_id_to } => {
             process_register_corridor(program_id, accounts, chain_id_to)
@@ -1692,13 +1753,16 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     let (vault_mint, _vault_owner) = spl_mint_and_owner(vault, token_program.key)?;
     let (user_mint, _user_owner) = spl_mint_and_owner(user_token, token_program.key)?;
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &user_mint)?;
+    // `args.amount` is what the user locks, in the mint's decimals; the id, the
+    // event and every other gate see it in the asset's bridge decimals.
+    let wire_amount = asset.to_wire(args.amount)?;
 
     let nonce = cfg.nonce(args.chain_id_to);
     let native_sender = payer.key.to_bytes();
     let id = submission_id(
         &cfg.bridge_domain,
         &args.debridge_id,
-        args.amount,
+        wire_amount,
         cfg.chain_id,
         args.chain_id_to,
         nonce,
@@ -1730,6 +1794,7 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
             sender: *payer.key,
             source_token: *user_token.key,
             mint: asset.mint,
+            // LOCAL amount: what `refund` returns, from our record.
             amount: args.amount,
             // M-4 / M-13: the on-chain age proof a refund attester reads.
             locked_at: solana_program::clock::Clock::get()?.unix_timestamp,
@@ -1738,7 +1803,7 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
 
     // Emit the Sent event as structured program data for the validator's source,
     // carrying the registered mint as the locked asset identity (H5).
-    emit_sent(&id, &args, cfg.chain_id, nonce, &native_sender, &asset.mint.to_bytes());
+    emit_sent(&id, &args, wire_amount, cfg.chain_id, nonce, &native_sender, &asset.mint.to_bytes());
 
     // Lock: user -> vault (SPL CPI).
     let transfer = spl_token::instruction::transfer(
@@ -1825,6 +1890,8 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     }
 
     verify_threshold(&cfg, &id, &args.signatures)?;
+    // The validators signed the WIRE amount; pay it out in this mint's decimals.
+    let local_amount = asset.to_local(args.amount)?;
 
     // Create the executed marker (effects before interaction).
     create_marker(
@@ -1851,7 +1918,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
         receiver_token.key,
         vault_authority.key,
         &[],
-        args.amount,
+        local_amount,
     )?;
     invoke_signed(
         &transfer,
@@ -1956,6 +2023,7 @@ fn process_register_asset(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     debridge_id: [u8; 32],
+    bridge_decimals: u8,
 ) -> ProgramResult {
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
@@ -1978,8 +2046,12 @@ fn process_register_asset(
         msg!("register: mint is not owned by the SPL token program");
         return Err(ProgramError::IllegalOwner);
     }
-    spl_token::state::Mint::unpack(&mint.data.borrow())
+    let mint_state = spl_token::state::Mint::unpack(&mint.data.borrow())
         .map_err(|_| ProgramError::InvalidAccountData)?;
+    if bridge_unit(mint_state.decimals, bridge_decimals).is_none() {
+        msg!("register: bridge decimals {} invalid for a {}-decimal mint", bridge_decimals, mint_state.decimals);
+        return Err(GateError::InvalidBridgeDecimals.into());
+    }
 
     // The vault must hold this mint and be controlled by the canonical
     // vault-authority PDA (only then can `claim`'s invoke_signed release it).
@@ -2012,8 +2084,14 @@ fn process_register_asset(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let record = AssetConfig { debridge_id, mint: *mint.key, vault: *vault.key };
-    let space: usize = 1 + 32 + 32 + 32; // borsh: debridge_id + mint + vault (+slack)
+    let record = AssetConfig {
+        debridge_id,
+        mint: *mint.key,
+        vault: *vault.key,
+        bridge_decimals,
+        local_decimals: mint_state.decimals,
+    };
+    let space: usize = ASSET_CONFIG_LEN;
     if asset_ai.data_is_empty() {
         // M-5 (round 4): a `debridge_id` is public in advance, so an attacker
         // could pre-fund every plausible asset PDA and `create_account` would
@@ -2124,6 +2202,7 @@ fn emit_lifecycle(
 fn emit_sent(
     id: &[u8; 32],
     args: &SendArgs,
+    wire_amount: u64,
     chain_id_from: u64,
     nonce: u64,
     native_sender: &[u8],
@@ -2134,7 +2213,7 @@ fn emit_sent(
         submission_id: *id,
         debridge_id: args.debridge_id,
         mint: *mint,
-        amount: args.amount,
+        amount: wire_amount,
         chain_id_from,
         chain_id_to: args.chain_id_to,
         nonce,
@@ -2231,7 +2310,7 @@ mod c1_tests {
     fn asset_binding_blocks_wrong_vault_or_mint() {
         let mint = Pubkey::new_unique();
         let vault = Pubkey::new_unique();
-        let asset = AssetConfig { debridge_id: [1; 32], mint, vault };
+        let asset = AssetConfig { debridge_id: [1; 32], mint, vault, bridge_decimals: 6, local_decimals: 6 };
         let spl = spl_token::id();
 
         // Honest release: registered vault, registered mint on both sides.
@@ -2281,6 +2360,8 @@ mod c1_tests {
             debridge_id,
             mint: Pubkey::new_unique(),
             vault: Pubkey::new_unique(),
+            bridge_decimals: 6,
+            local_decimals: 6,
         };
 
         // The attack: same debridge_id, attacker's mint + vault.
@@ -2288,6 +2369,8 @@ mod c1_tests {
             debridge_id,
             mint: Pubkey::new_unique(),
             vault: Pubkey::new_unique(),
+            bridge_decimals: 6,
+            local_decimals: 6,
         };
         assert_eq!(
             asset_write_allowed(&live, &repoint),
@@ -2319,6 +2402,8 @@ mod c1_tests {
             debridge_id: [0x11; 32],
             mint: Pubkey::new_unique(),
             vault: Pubkey::new_unique(),
+            bridge_decimals: 6,
+            local_decimals: 6,
         };
         assert_eq!(asset_write_allowed(&AssetConfig::default(), &incoming), Ok(true));
     }
@@ -2332,8 +2417,18 @@ mod c1_tests {
             debridge_id: [0x11; 32],
             mint: Pubkey::new_unique(),
             vault: Pubkey::new_unique(),
+            bridge_decimals: 6,
+            local_decimals: 6,
         };
         assert_eq!(asset_write_allowed(&a, &a.clone()), Ok(false));
+        // Decimals are part of the binding: re-registering with different
+        // bridge decimals is a repoint, not a no-op.
+        let mut other_dec = a.clone();
+        other_dec.bridge_decimals = 9;
+        assert_eq!(
+            asset_write_allowed(&a, &other_dec),
+            Err(GateError::AssetAlreadyRegistered.into())
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2838,4 +2933,26 @@ mod c1_tests {
             Err(ProgramError::InvalidArgument)
         );
     }
+
+    /// Decimals normalisation on the Solana side: send converts DOWN exactly (or
+    /// refuses), claim scales UP, and the unit never overflows silently.
+    #[test]
+    fn asset_amounts_convert_between_mint_and_bridge_decimals() {
+        let tst = AssetConfig { bridge_decimals: 6, local_decimals: 6, ..Default::default() };
+        assert_eq!(tst.to_wire(1_500_000), Ok(1_500_000), "a mint AT bridge decimals is 1:1");
+        assert_eq!(tst.to_local(1_500_000), Ok(1_500_000));
+
+        let wrap = AssetConfig { bridge_decimals: 6, local_decimals: 9, ..Default::default() };
+        assert_eq!(wrap.to_wire(2_250_000_000), Ok(2_250_000));
+        assert_eq!(wrap.to_local(2_250_000), Ok(2_250_000_000));
+        assert_eq!(wrap.to_wire(2_250_000_001), Err(GateError::InexactAmount.into()));
+        assert_eq!(wrap.to_wire(999), Err(GateError::InexactAmount.into()), "below one unit");
+        assert_eq!(wrap.to_local(u64::MAX), Err(GateError::AmountOverflow.into()));
+
+        assert_eq!(bridge_unit(9, 6), Some(1_000));
+        assert_eq!(bridge_unit(6, 9), None, "bridge decimals above the mint's");
+        assert_eq!(bridge_unit(19, 0), Some(10_000_000_000_000_000_000));
+        assert_eq!(bridge_unit(20, 0), None, "10^20 does not fit a u64");
+    }
+
 }

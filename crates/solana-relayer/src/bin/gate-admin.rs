@@ -19,7 +19,9 @@
 //!          --bridge-domain <0x…32 bytes>
 //!          [--max-validators N] [--max-corridors N] [--guardian <pubkey>]
 //!     register-corridor --chain-id-to N
-//!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey>
+//!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey> --bridge-decimals N
+//!                    (N = the asset's mesh-wide bridge decimals; the SAME value every
+//!                    EVM gate registered with setBridgeDecimals)
 //!     set-threshold --threshold N            (a DECREASE needs a matured schedule)
 //!     set-validator --validator 0x.. --active <bool>
 //!                                            (an ADDITION needs a matured schedule)
@@ -315,10 +317,16 @@ fn main() -> anyhow::Result<()> {
             let debridge_id = hex32(&args.req("--debridge-id")?)?;
             let mint = Pubkey::from_str(&args.req("--mint")?)?;
             let vault = Pubkey::from_str(&args.req("--vault")?)?;
+            // Required, never defaulted: a wrong value scales every transfer of
+            // the asset by a power of ten, and the binding is write-once.
+            let bridge_decimals: u8 = args
+                .req("--bridge-decimals")?
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--bridge-decimals: {e}"))?;
             let (asset_pda, _) =
                 Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
             (
-                GateInstruction::RegisterAsset { debridge_id }.to_bytes(),
+                GateInstruction::RegisterAsset { debridge_id, bridge_decimals }.to_bytes(),
                 vec![
                     AccountMeta::new_readonly(config_pda, false),
                     AccountMeta::new(payer.pubkey(), true),
@@ -431,24 +439,40 @@ fn main() -> anyhow::Result<()> {
             // it only enters via `keccak(nativeSender)` in the auto tail, exactly
             // as `BridgeHash.sol` defines it. Using the with-auto form here would
             // produce an id the gate never derives.
+            let (asset_pda, _) =
+                Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
+            let asset_acct = rpc.get_account(&asset_pda)?;
+            let asset: bridge_solana::account::AssetAccount =
+                bridge_solana::account::decode(&asset_acct.data)
+                    .ok_or_else(|| anyhow::anyhow!("asset account is malformed"))?;
+            let vault = Pubkey::new_from_array(asset.vault);
+            // `--amount` is in the mint's decimals; the program hashes it in the
+            // asset's bridge decimals, so the id must be built from that.
+            let unit = asset
+                .bridge_unit()
+                .ok_or_else(|| anyhow::anyhow!("asset has invalid bridge decimals"))?;
+            anyhow::ensure!(
+                amount % unit == 0,
+                "--amount {amount} is not a multiple of the bridge unit {unit} \
+                 ({} mint decimals, {} bridge decimals)",
+                asset.local_decimals,
+                asset.bridge_decimals
+            );
+            let wire_amount = amount / unit;
+
             let id = bridge_solana::hash::submission_id(
                 &bridge_domain,
                 &debridge_id,
-                &bridge_solana::hash::amount_word(amount as u128),
+                &bridge_solana::hash::amount_word(wire_amount as u128),
                 chain_id,
                 chain_id_to,
                 nonce,
                 &receiver,
             );
-
-            let (asset_pda, _) =
-                Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
             let (sent_pda, _) = Pubkey::find_program_address(&[b"sent", &id], &program_id);
-            let asset_acct = rpc.get_account(&asset_pda)?;
-            anyhow::ensure!(asset_acct.data.len() >= 96, "asset account is malformed");
-            let vault = Pubkey::new_from_array(asset_acct.data[64..96].try_into()?);
 
             println!("submissionId : 0x{}", hex::encode(id));
+            println!("amount       : {amount} (mint units) = {wire_amount} on the wire");
             println!("nonce        : {nonce}  corridor {chain_id} -> {chain_id_to}");
             println!("vault        : {vault}");
 

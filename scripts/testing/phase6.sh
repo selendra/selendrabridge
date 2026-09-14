@@ -84,6 +84,8 @@ TOKEN=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-
 # Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
 GATE=$(deploy_gate "$SRC_RPC" "$KEY0" "[$VALIDATOR]" 1)
 echo "  token=$TOKEN gate=$GATE"
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE" "$TOKEN" 18
 
 cast send "$TOKEN" "mint(address,uint256)" $ACC0 $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN" "approve(address,uint256)" "$GATE" $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

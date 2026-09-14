@@ -81,6 +81,8 @@ submissionId = keccak256(abi.encodePacked(
 Note the field order: `chainIdFrom` and `chainIdTo` come *before* `amount`, which is not the order the arguments appear in any function signature.
 Follow `BridgeHash.packedSubmission`, not intuition.
 
+`amount` here is the **wire amount**, in the asset's *bridge decimals* — never a local token amount. See §2.3.
+
 **Transfer id, with an execution payload.**
 The seven-field packed base above, with five more fields appended before hashing:
 
@@ -124,6 +126,25 @@ This is enforced on-chain and tested.
 
 ---
 
+### 2.3 Amounts: bridge decimals
+
+One asset has different decimals on different chains: TST is 18 on the EVM testnets and 6 as an SPL mint. A raw amount therefore cannot cross unchanged — 1 TST locked at 18 decimals is `1e18` units, which a 6-decimal destination would pay out as a trillion TST.
+
+So every asset has ONE **bridge decimals** value `D`, the same on every gate and on the Solana program, and no larger than the asset's decimals on any chain in the mesh. With `unit = 10^(localDecimals − D)`:
+
+| step | chain | amount |
+| --- | --- | --- |
+| `send(token, local)` | source | locks `local`; reverts `InexactAmount` unless `local % unit == 0` |
+| `Sent.amount`, submissionId, signatures, store, keeper | everywhere | `wire = local / unit` |
+| `claim(…, wire, …)` | destination | pays `wire × unit_dest` |
+| `refund(…, wire, …)` | source | returns `wire × unit_source` = exactly what was locked |
+
+Scaling up is always exact because `D` is the minimum, so no chain pays out more or less than was locked, and there is no rounding anywhere. Exact-or-revert is deliberate: a send never silently drops dust. `SwapRouter.swapAndBridge`, which bridges a pool output it cannot choose, rounds down to a whole unit and returns the remainder to the caller.
+
+`D` is registered per local token: `Gate.setBridgeDecimals(token, D)` (write-once; delayed by `GOVERNANCE_DELAY` once sealed, like a corridor, because a lower `D` on a destination multiplies every claim) and `RegisterAsset { debridge_id, bridge_decimals }` on Solana. `setLocalToken` refuses a token without it, so no corridor can exist that cannot convert. The deploy script derives `D` as the minimum on-chain decimals across the asset's deployments and mint, unless `assets[].bridge_decimals` pins it.
+
+The `u64` cap for Solana receivers (`AmountTooWide`) applies to the wire amount. Consumers that display amounts (the API's `bridgeDecimals`, the explorer) must format `amount` with `D`, not with a token's decimals.
+
 ## 3. Contracts
 
 All in `contracts/src/`, Solidity 0.8.24, built with `via_ir = true` and the optimizer on.
@@ -153,9 +174,11 @@ One `Gate` per chain. It is both the source and the destination; the role depend
 | `supportedChain[chainId]` | source | Destinations `send` accepts (M-3). Unlisted ⇒ `UnsupportedChain`; nothing is locked towards a chain with no gate. Instant and reversible; `claim`/`cancel`/`refund` never consult it. |
 | `isSealed` | both | Ends the setup phase (H-1). Until `seal()`, the owner registers corridors instantly; after it, every new `setLocalToken` needs `scheduleGovernance(setLocalTokenActionId(id, token))` + `GOVERNANCE_DELAY`, so a stolen owner key cannot point a corridor at a worthless token and drain the pot. Irreversible. |
 
-`send` additionally reverts `AmountTooWide` when the receiver is 32 bytes (a Solana account) and `amount > 2^64-1`: the Solana gate's claim and cancel carry a `u64`, so a wider transfer could be neither delivered nor refunded (H-3). The frontend mirrors the check.
+| `bridgeDecimalsOf[token]` | both | The token's bridge decimals and cached `decimals()` (§2.3). Write-once; delayed after seal. `send`, `claim`, `refund` and `setLocalToken` all require it. |
 
-Wiring order for every gate, before it is funded: `setSupportedChain` for each peer → `setLocalToken` for each inbound corridor → `seal()`. Both launchers do this and verify it.
+`send` additionally reverts `AmountTooWide` when the receiver is 32 bytes (a Solana account) and the WIRE amount exceeds `2^64-1`: the Solana gate's claim and cancel carry a `u64`, so a wider transfer could be neither delivered nor refunded (H-3). The frontend mirrors the check.
+
+Wiring order for every gate, before it is funded: `setSupportedChain` for each peer → `setBridgeDecimals` for each local token → `setLocalToken` for each inbound corridor → `seal()`. Both launchers do this and verify it.
 
 The `executed` / `cancelled` split is a sharp edge worth internalising.
 `executed` means "spent", not "delivered".

@@ -69,6 +69,9 @@ TOKEN_B=$(deploy_one "$B_RPC" B-token TOKEN); GATE_B=$(deploy_one "$B_RPC" B-gat
 TOKEN_C=$(deploy_one "$C_RPC" C-token TOKEN); GATE_C=$(deploy_one "$C_RPC" C-gate GATE)
 
 PRE_B=$(printf '%064x' $B_CHAIN); DEBRIDGE_B=$(cast keccak "0x${PRE_B}${TOKEN_B#0x}")
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$A_RPC" "$KEY0" "$GATE_A" "$TOKEN_A" 18
+set_bridge_decimals "$B_RPC" "$KEY0" "$GATE_B" "$TOKEN_B" 18
 cast send "$TOKEN_B" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $B_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_B" "approve(address,uint256)" "$GATE_B" $AMOUNT --rpc-url $B_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_A" "mint(address,uint256)" "$GATE_A" $AMOUNT --rpc-url $A_RPC --private-key $KEY0 >/dev/null

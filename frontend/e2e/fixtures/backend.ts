@@ -163,6 +163,7 @@ export async function mockBackend(page: Page, options: BackendOptions = {}): Pro
                 debridgeId: "0x4b7347216b2c2ce2879cf0086a2bd0ad84a4df90c1d0d1e665041ba0bc157454",
                 vault: "33A9xPRuLjv8NBrp5XjjdU22yfXdNx6vGczW9XY3bpgb",
                 decimals: 6,
+                bridgeDecimals: 6,
                 paused: false,
               }
             : o.solanaGateContext,

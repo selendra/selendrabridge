@@ -49,6 +49,7 @@ contract CorridorGovernanceTest is Test {
         gate.setSupportedChain(CHAIN_TO, true);
 
         usdc = new TestToken("USD Coin", "USDC");
+        gate.setBridgeDecimals(address(usdc), 18);
         debridgeId = BridgeHash.getDebridgeId(CHAIN_A, fakeSourceAsset);
     }
 

@@ -76,6 +76,9 @@ TOKEN_SRC=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --priv
 GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1,$V2]" "$THRESHOLD")
 TOKEN_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
 GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1,$V2]" "$THRESHOLD")
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$TOKEN_DST" 18
 
 PREFIX=$(printf '%064x' $SRC_CHAIN); DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${TOKEN_SRC#0x}")
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 900000000000000000000 --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

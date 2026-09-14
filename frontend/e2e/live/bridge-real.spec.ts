@@ -19,8 +19,8 @@ import {
  * spends testnet gas, so it never runs by accident.
  *
  * Chains are picked from the registry by env (LIVE_SRC / LIVE_DST, default the
- * first two EVM chains); amounts are raw base units because the bridge carries
- * no decimals normalisation between chains.
+ * first two EVM chains). Amounts are whole tokens: the bridge normalises
+ * decimals, so 1 TST locked at 18 decimals arrives as 1 TST at 6 on Solana.
  */
 
 const API = process.env.LIVE_API ?? "http://127.0.0.1:5173";
@@ -162,8 +162,8 @@ test("EVM → Solana: a transfer sent from the UI lands in the SPL token account
 
   const before = (await splBalance(env!.solanaRpc!, account!)) ?? 0n;
   await openBridge(page, src.chainId);
-  // 1_000_000 raw = 0.000000000001 of an 18-dec token = 1 whole 6-dec SPL token.
-  await bridgeFromEvm(page, sol!, "0.000000000001", account!);
+  // 1 TST locked at 18 decimals must arrive as 1 TST at the mint's 6.
+  await bridgeFromEvm(page, sol!, "1", account!);
 
   const after = await waitFor(`SPL balance of ${account} to rise`, async () => {
     const b = await splBalance(env!.solanaRpc!, account!);
@@ -193,7 +193,8 @@ test("Solana → EVM: a send built in the browser arrives on the EVM chain", asy
     const b = await erc20Balance(env!.rpcs[String(dst.chainId)], tst(dst), receiver);
     return b > 0n ? b : null;
   });
-  expect(arrived).toBe(1_000_000n);
+  // 1 TST at the mint's 6 decimals arrives as 1 TST at the EVM token's 18.
+  expect(arrived).toBe(10n ** 18n);
 });
 
 test("same-chain swap: a swap sent from the UI pays out the quoted token", async ({ page }) => {

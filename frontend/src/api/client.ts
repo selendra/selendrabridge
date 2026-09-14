@@ -66,7 +66,7 @@ export async function health(): Promise<boolean> {
 
 export function fetchChains(): Promise<Chain[]> {
   return gql<{ chains: Chain[] }>(
-    `{ chains { chainId name rpcUrl gate token tokens { symbol address } router } }`,
+    `{ chains { chainId name rpcUrl gate token tokens { symbol address bridgeDecimals } router } }`,
   ).then((d) => d.chains);
 }
 
@@ -80,7 +80,7 @@ export function fetchSubmissions(filter?: SubmissionFilter): Promise<Submission[
   return gql<{ submissions: Submission[] }>(
     `query Subs($filter: SubmissionFilter) {
        submissions(filter: $filter) {
-         submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver
+         submissionId debridgeId amount bridgeDecimals chainIdFrom chainIdTo nonce receiver
          nativeSender signatureCount meetsThreshold status
          signatures { signer }
        }
@@ -93,7 +93,7 @@ export function fetchSubmission(submissionId: string): Promise<Submission | null
   return gql<{ submission: Submission | null }>(
     `query Sub($id: String!) {
        submission(submissionId: $id) {
-         submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver
+         submissionId debridgeId amount bridgeDecimals chainIdFrom chainIdTo nonce receiver
          nativeSender autoParams signatureCount meetsThreshold status
          signatures { signer signature }
        }
@@ -108,7 +108,7 @@ export function fetchHistory(filter?: HistoryFilter): Promise<HistoryEntry[]> {
   return gql<{ history: HistoryEntry[] }>(
     `query Hist($filter: HistoryFilter) {
        history(filter: $filter) {
-         submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver
+         submissionId debridgeId amount bridgeDecimals chainIdFrom chainIdTo nonce receiver
          status claimTx signatureCount createdAt updatedAt
          stuck refundStatus refundTx cancelTx token
          cancelSignatureCount refundSignatureCount
@@ -169,7 +169,10 @@ export interface SolanaGateContext {
   nonce: number;
   debridgeId: string;
   vault: string;
+  /** The mint's decimals — what the user types the amount in. */
   decimals: number;
+  /** The asset's bridge decimals; amounts must be multiples of 10^(decimals - bridgeDecimals). */
+  bridgeDecimals: number;
   paused: boolean;
 }
 
@@ -185,7 +188,7 @@ export async function fetchSolanaGateContext(
        solanaGateContext(chainId: ${intLiteral("chainId", chainId)}, symbol: $sym, chainIdTo: ${intLiteral(
          "chainIdTo",
          chainIdTo
-       )}) { programId bridgeDomain chainId nonce debridgeId vault decimals paused }
+       )}) { programId bridgeDomain chainId nonce debridgeId vault decimals bridgeDecimals paused }
      }`,
     { sym: symbol }
   ).then((d) => d.solanaGateContext);

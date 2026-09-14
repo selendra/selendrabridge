@@ -119,6 +119,7 @@ test("the submissionId the browser computes matches the shared implementation", 
     chainIdTo: BigInt(gfx.chainIdTo),
     nonce: BigInt(gfx.nonce),
     amount: BigInt(gfx.amount),
+    bridgeUnit: BigInt(gfx.bridgeUnit),
     receiver: hexToBytes(gfx.receiver),
   });
   expect(id).toBe(gfx.submissionId);
@@ -136,6 +137,7 @@ test("the gate send transaction is byte-identical to the SDK's", async () => {
     chainIdTo: BigInt(gfx.chainIdTo),
     nonce: BigInt(gfx.nonce),
     amount: BigInt(gfx.amount),
+    bridgeUnit: BigInt(gfx.bridgeUnit),
     receiver: hexToBytes(gfx.receiver),
   });
   expect(hex(instruction.data)).toBe(gfx.instructionData);

@@ -91,7 +91,7 @@ export function SubmissionDetail({ submissionId, chains, wallet, onClose }: Prop
               {refund && refund.refundStatus !== "none" && <RefundBadge refundStatus={refund.refundStatus} />}
             </div>
 
-            <Row label="Amount">{formatUnits(data.amount, decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
+            <Row label="Amount">{formatUnits(data.amount, data.bridgeDecimals ?? decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
             {refund && refund.refundStatus !== "none" && (
               <>
                 <Row label="Refund status">

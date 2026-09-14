@@ -630,7 +630,8 @@ if [[ "$SOLANA_ON" == "true" ]]; then
     | . + [{ chain_id: $c[0].solana.chain_id, name: $c[0].solana.name,
              rpc_url: $c[0].solana.rpc, gate: $prog,
              token: ($c[0].solana.tokens[0].mint // null),
-             tokens: [$c[0].solana.tokens[] | select(.mint != null) | {symbol, address: .mint}],
+             tokens: [$c[0].solana.tokens[] | select(.mint != null)
+                      | {symbol, address: .mint, bridge_decimals: (.bridge_decimals // null)}],
              router: null }
            + (if $pub != "" then {public_rpc_url: $pub} else {} end)
            + (if $sp != "" then {swap_pool: $sp} else {} end)]' \

@@ -107,6 +107,12 @@ PRE_C=$(printf '%064x' $C_CHAIN); DEBRIDGE_C=$(cast keccak "0x${PRE_C}${TOKEN_C#
 echo "  debridgeId(B-asset)=$DEBRIDGE_B"
 echo "  debridgeId(C-asset)=$DEBRIDGE_C"
 
+echo "=== bridge decimals (identity, 18) on A, B, C ==="
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$A_RPC" "$KEY0" "$GATE_A" "$TOKEN_A" 18
+set_bridge_decimals "$B_RPC" "$KEY0" "$GATE_B" "$TOKEN_B" 18
+set_bridge_decimals "$C_RPC" "$KEY0" "$GATE_C" "$TOKEN_C" 18
+
 echo "=== source setup on B and C (mint+approve) ==="
 cast send "$TOKEN_B" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $B_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_B" "approve(address,uint256)" "$GATE_B" $AMOUNT --rpc-url $B_RPC --private-key $KEY0 >/dev/null

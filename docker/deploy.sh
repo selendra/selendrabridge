@@ -47,6 +47,10 @@ done
 
 DEBRIDGE_ID=$(cast keccak "0x$(printf '%064x' $SRC_CHAIN)${EXPECT_TOKEN#0x}")
 echo "=== wiring ==="
+# Bridge decimals must precede setLocalToken (dst) and send (src). Identity:
+# TestToken is 18-dec. Plain txs after both deploys, so the baked addresses hold.
+cast send "$EXPECT_GATE" "setBridgeDecimals(address,uint8)" "$EXPECT_TOKEN" 18 --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+cast send "$EXPECT_GATE" "setBridgeDecimals(address,uint8)" "$EXPECT_TOKEN" 18 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 # source: give the sender funds + approve the gate
 cast send "$EXPECT_TOKEN" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$EXPECT_TOKEN" "approve(address,uint256)" "$EXPECT_GATE" $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

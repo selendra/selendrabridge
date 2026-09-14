@@ -13,6 +13,7 @@ import {
   extractSent,
   readAllowance,
   readBalance,
+  readBridgeUnit,
   readDecimals,
   readRemoteRouter,
   readRouterGate,
@@ -174,6 +175,10 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   const [decimals, setDecimals] = useState(18);
   const [balance, setBalance] = useState<bigint | null>(null);
   const [allowance, setAllowance] = useState<bigint | null>(null);
+  // The gate's bridge unit for the token: `send` accepts only multiples of it,
+  // because amounts cross the bridge in the asset's bridge decimals. `null` =
+  // unknown, or the gate has no bridge decimals for this token at all.
+  const [bridgeUnit, setBridgeUnit] = useState<bigint | null>(null);
 
   // --- cross-chain swap ("swap on arrival") — merged into the same flow -----
   const [crossSwap, setCrossSwap] = useState(false);
@@ -273,7 +278,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // "no trustworthy read yet" and blocks the submit button — never fall back to
   // a stale value, and never to a guessed 18.
   const [readFor, setReadFor] = useState<string | null>(null);
-  const readKey = `${fromChainId ?? "?"}:${token.toLowerCase()}:${spender.toLowerCase()}`;
+  const readKey = `${fromChainId ?? "?"}:${token.toLowerCase()}:${spender.toLowerCase()}:${gate.toLowerCase()}`;
   const onchainStale = readFor !== readKey;
 
   // On-chain reads (decimals/balance/allowance) against the connected chain.
@@ -289,22 +294,26 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     setReadFor(null);
     setBalance(null);
     setAllowance(null);
+    setBridgeUnit(null);
     try {
       const dec = await readDecimals(wallet.request, token).catch(() => 18);
       setDecimals(Number.isFinite(dec) && dec > 0 && dec <= 36 ? dec : 18);
-      const [b, a] = await Promise.all([
+      const [b, a, unit] = await Promise.all([
         readBalance(wallet.request, token, wallet.address),
         spenderOk ? readAllowance(wallet.request, token, wallet.address, spender) : Promise.resolve(0n),
+        // A revert here means the gate cannot convert this token's amounts.
+        gateOk ? readBridgeUnit(wallet.request, gate, token).catch(() => null) : Promise.resolve(null),
       ]);
       setBalance(b);
       setAllowance(a);
+      setBridgeUnit(unit);
       setReadFor(readKey);
     } catch {
       setBalance(null);
       setAllowance(null);
       setReadFor(null);
     }
-  }, [wallet.address, wallet.request, token, spender, tokenOk, spenderOk, readKey]);
+  }, [wallet.address, wallet.request, token, spender, tokenOk, spenderOk, gate, gateOk, readKey]);
 
   useEffect(() => {
     refreshOnchain();
@@ -318,7 +327,13 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // Gate reverts AmountTooWide above 2^64-1, and anything that slipped past it
   // would be locked forever. Same check here, so the button says why.
   const solanaReceiver = receiverOk && !isAddress(receiver) && isSolanaAccount(receiver);
-  const amountTooWide = solanaReceiver && amountBase > U64_MAX;
+  // The u64 cap binds the WIRE amount (bridge decimals), which is what Solana receives.
+  const amountTooWide = solanaReceiver && (bridgeUnit ? amountBase / bridgeUnit : amountBase) > U64_MAX;
+  // Direct sends must be whole bridge units; the gate reverts anything finer.
+  // (Swap-and-bridge rounds the pool output itself and returns the dust.)
+  const bridgeDecimalsOfToken = bridgeUnit != null ? decimals - (bridgeUnit.toString().length - 1) : null;
+  const inexact = !crossSwap && bridgeUnit != null && amountBase > 0n && amountBase % bridgeUnit !== 0n;
+  const maxSendable = balance != null && bridgeUnit != null && !crossSwap ? balance - (balance % bridgeUnit) : balance;
   const busy = tx.kind === "pending";
 
   // --- cross-chain swap: quote both legs (source swap, destination swap) ----
@@ -607,7 +622,11 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // previous one — refuse to encode an amount with it rather than guess.
   else if (onchainStale) button = { label: "Reading token…", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
-  else if (amountTooWide) button = { label: "Amount too large for a Solana receiver (max 2^64-1 base units)", disabled: true };
+  else if (!crossSwap && bridgeUnit == null)
+    button = { label: "This token isn't bridgeable through this Gate", disabled: true };
+  else if (inexact)
+    button = { label: `Too precise — this asset bridges at most ${bridgeDecimalsOfToken} decimals`, disabled: true };
+  else if (amountTooWide) button = { label: "Amount too large for a Solana receiver", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
   else if (crossSwap && !corridorOk) button = { label: "Corridor not configured", disabled: true };
   else if (crossSwap && destExceedsLock) button = { label: "Exceeds destination pool lock", disabled: true };
@@ -767,13 +786,13 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
         <div className="field">
           <span className="field__label">
             Amount
-            {balance != null && (
+            {maxSendable != null && (
               <button
                 type="button"
                 className="field__max"
-                onClick={() => setAmount(formatUnitsRaw(balance, decimals))}
+                onClick={() => setAmount(formatUnitsRaw(maxSendable, decimals))}
               >
-                Max {formatUnits(balance, decimals)}
+                Max {formatUnits(maxSendable, decimals)}
               </button>
             )}
           </span>

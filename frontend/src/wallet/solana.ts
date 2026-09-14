@@ -368,13 +368,24 @@ export async function buildGateSendInstruction(args: {
   solanaChainId: bigint;
   chainIdTo: bigint;
   nonce: bigint;
+  /** MINT amount to lock (the mint's decimals) — what the instruction carries. */
   amount: bigint;
+  /**
+   * `10^(mintDecimals - bridgeDecimals)`. The program hashes `amount / bridgeUnit`
+   * (the asset's bridge-decimals amount every other chain sees), so the id — and
+   * the `sent` PDA it seeds — must be built from that, not from `amount`.
+   */
+  bridgeUnit: bigint;
   receiver: Uint8Array;
 }): Promise<{ instruction: Instruction; submissionId: string }> {
+  if (args.bridgeUnit <= 0n) throw new Error("bridge unit must be positive");
+  if (args.amount % args.bridgeUnit !== 0n) {
+    throw new Error(`amount must be a whole multiple of ${args.bridgeUnit} (the asset's bridge unit)`);
+  }
   const id = submissionId({
     bridgeDomain: args.bridgeDomain,
     debridgeId: args.debridgeId,
-    amount: args.amount,
+    amount: args.amount / args.bridgeUnit,
     chainIdFrom: args.solanaChainId,
     chainIdTo: args.chainIdTo,
     nonce: args.nonce,

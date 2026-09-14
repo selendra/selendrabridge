@@ -91,6 +91,38 @@ test("hands the wallet a gate send carrying the typed receiver", async ({ page }
   }
 });
 
+test("a mint bridged at fewer decimals refuses precision below its bridge unit", async ({ page }) => {
+  // A 9-decimal mint bridged at 6 decimals.
+  await installSolanaWallet(page);
+  await startApp(page, {
+    backend: {
+      chains: CHAINS,
+      solanaGateContext: {
+        programId: GATE,
+        bridgeDomain: "0x619244a655e7383c05da63e9d66080952fcfe4fc48b40c61f566996006848055",
+        chainId: 7565164,
+        nonce: 3,
+        debridgeId: "0x4b7347216b2c2ce2879cf0086a2bd0ad84a4df90c1d0d1e665041ba0bc157454",
+        vault: VAULT,
+        decimals: 9,
+        bridgeDecimals: 6,
+        paused: false,
+      },
+    },
+    wallet: null,
+  });
+  await gotoView(page, "Bridge");
+  await page.getByRole("tab", { name: /From Solana/ }).click();
+  await primaryButton(page).click();
+  await page.getByLabel("Receiver").fill(RECEIVER);
+  await page.getByLabel("Amount").fill("2.0000001");
+  await expect(primaryButton(page)).toHaveText("Too precise — this asset bridges at most 6 decimals", {
+    timeout: 10_000,
+  });
+  await page.getByLabel("Amount").fill("2.000001");
+  await expect(primaryButton(page)).toHaveText("Bridge from Solana");
+});
+
 test("says the transfer is locked and awaiting validators, not delivered", async ({ page }) => {
   await openSolanaBridge(page);
   await primaryButton(page).click();

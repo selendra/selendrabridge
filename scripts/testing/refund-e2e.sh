@@ -137,6 +137,11 @@ if [[ "${OTHER_TOKEN,,}" == "${TOKEN_SRC,,}" ]]; then
   exit 1
 fi
 
+# Bridge decimals on the SOURCE token only (send needs it); identity, TestToken is
+# 18-dec. OTHER_TOKEN stays unregistered: refund() rejects it on TokenMismatch
+# before any conversion. The destination stays deliberately unregistered.
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+
 echo "=== locking funds on the source ==="
 cast send "$TOKEN_SRC" "mint(address,uint256)" "$ACC0" "$AMOUNT" \
   --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

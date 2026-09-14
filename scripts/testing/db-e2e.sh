@@ -117,6 +117,14 @@ echo "  dst: good=$TOKEN_GOOD_DST bad=$TOKEN_BAD_DST gate=$GATE_DST"
 DID_GOOD=$(debridge_id $SRC_CHAIN $TOKEN_GOOD)
 DID_BAD=$(debridge_id $SRC_CHAIN $TOKEN_BAD)
 
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+for t in "$TOKEN_GOOD" "$TOKEN_BAD"; do
+  set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$t" 18
+done
+for t in "$TOKEN_GOOD_DST" "$TOKEN_BAD_DST"; do
+  set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$t" 18
+done
+
 # Source: give acc0 spendable balance; approve the gate. Bad token is sent twice
 # (once while blocked, once after it's allowlisted) so fund 3x to be safe.
 FUND=3000000000000000000000   # 3000e18

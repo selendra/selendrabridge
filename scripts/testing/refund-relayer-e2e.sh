@@ -117,6 +117,9 @@ GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1]" 1)
 GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1]" 1)
 echo "  src: token=$TOKEN_SRC gate=$GATE_SRC"
 echo "  dst: gate=$GATE_DST  (UNFUNDED, UNREGISTERED — every claim reverts)"
+# Bridge decimals on the SOURCE only (send needs it); identity, TestToken is 18-dec.
+# The destination stays deliberately unregistered, as above.
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
 
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

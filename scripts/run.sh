@@ -356,6 +356,24 @@ peers_of() {  # $1 array index -> every chain id this gate may `send` to
   for j in "${!CID[@]}"; do [[ "$j" == "$i" ]] || echo "${CID[$j]}"; done
   for x in "${EXTRA_SUPPORTED_CHAINS[@]:-}"; do [[ -n "$x" ]] && echo "$x"; done
 }
+# Register a token's bridge decimals on a gate (decimals normalisation). Every
+# transfer travels in ONE per-asset decimals value that every gate must agree
+# on; `send` and `setLocalToken` both revert for a token without it. Write-once:
+# an existing, matching registration is skipped; a different one is fatal.
+ensure_bridge_decimals() {  # gate rpc token bridgeDecimals label
+  local gate="$1" rpc="$2" tok="$3" want="$4" label="$5" isset cur
+  read -r isset cur _ <<<"$(cast call "$gate" "bridgeDecimalsOf(address)(bool,uint8,uint8)" "$tok" --rpc-url "$rpc" 2>/dev/null | tr '\n' ' ')"
+  if [[ "$isset" == "true" ]]; then
+    [[ "$cur" == "$want" ]] || die "$label: gate $gate has bridge decimals $cur, the mesh needs $want (write-once — redeploy the gate)"
+    return
+  fi
+  gate_sealed "$gate" "$rpc" && die "$label: gate $gate is SEALED — bridge decimals now need governance:
+    cast send $gate 'scheduleGovernance(bytes32)' \$(cast call $gate 'setBridgeDecimalsActionId(address,uint8)(bytes32)' $tok $want --rpc-url $rpc) --rpc-url $rpc --private-key <owner>
+    # wait GOVERNANCE_DELAY, then: cast send $gate 'setBridgeDecimals(address,uint8)' $tok $want ..."
+  csend "$gate" "setBridgeDecimals(address,uint8)" "$tok" "$want" --rpc-url "$rpc" --private-key "$DEPLOYER_KEY"
+  info "$label: bridge decimals $want"
+}
+
 # Register an inbound corridor. setLocalToken is WRITE-ONCE (finding M-5): a
 # registered corridor cannot be repointed, because in-flight claims bind only the
 # debridgeId and would then release the new asset — so an existing mapping is
@@ -398,8 +416,21 @@ if [[ "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_TOKENS" == "true" ]]; then
   for sym in "${ASYMS[@]}"; do
     read -ra chs <<<"${ACHAINS[$sym]}"
     (( ${#chs[@]} >= 2 )) || { info "$sym is on <2 chains — spendable only, not bridgeable"; }
+    # The asset's bridge decimals: BRIDGE_DECIMALS_<SYM> if set, else the lowest
+    # decimals it has on any chain here (so every claim scales up exactly). A
+    # corridor to a chain outside CHAINS (e.g. a 6-decimal SPL mint) must be
+    # covered by setting BRIDGE_DECIMALS_<SYM> to that lower value.
+    bd_var="BRIDGE_DECIMALS_${sym}"; bdec="${!bd_var:-}"
+    if [[ -z "$bdec" ]]; then
+      for cid in "${chs[@]}"; do
+        d=$(cast call "${ATOKEN[$sym|$cid]}" "decimals()(uint8)" --rpc-url "${CRPC[${CIDX[$cid]}]}" | awk '{print $1}')
+        [[ -z "$bdec" ]] || (( d < bdec )) && bdec="$d"
+      done
+    fi
+    info "$sym bridges at $bdec decimals"
     for cid in "${chs[@]}"; do
       i=${CIDX[$cid]}; tok="${ATOKEN[$sym|$cid]}"
+      ensure_bridge_decimals "${CGATE[$i]}" "${CRPC[$i]}" "$tok" "$bdec" "$sym on chain $cid"
       # account0 spendable + gate payout liquidity of this token on this chain
       csend "$tok" "mint(address,uint256)" "$DEPLOYER_ADDR"  "$MINT" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
       csend "$tok" "mint(address,uint256)" "${CGATE[$i]}"    "$MINT" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
@@ -445,6 +476,8 @@ if [[ -n "${EXTRA_LOCAL_TOKENS+x}" && ${#EXTRA_LOCAL_TOKENS[@]} -gt 0 ]]; then
     [[ -n "${CIDX[$xcid]:-}" ]] || die "EXTRA_LOCAL_TOKENS names chain $xcid, which is not in CHAINS"
     [[ "$xdid" =~ ^0x[0-9a-fA-F]{64}$ ]] || die "EXTRA_LOCAL_TOKENS debridgeId must be 0x + 64 hex: '$xdid'"
     i=${CIDX[$xcid]}
+    [[ "$(cast call "${CGATE[$i]}" "bridgeDecimalsOf(address)(bool,uint8,uint8)" "$xtok" --rpc-url "${CRPC[$i]}" 2>/dev/null | head -1)" == "true" ]] \
+      || die "EXTRA_LOCAL_TOKENS: $xtok has no bridge decimals on chain $xcid's gate — it must be an asset this mesh wires (set BRIDGE_DECIMALS_<SYM> for its lowest-decimals chain)"
     register_corridor "${CGATE[$i]}" "${CRPC[$i]}" "$xdid" "$xtok" "chain $xcid: ${xdid:0:12}…"
   done
 fi

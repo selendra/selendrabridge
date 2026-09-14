@@ -89,6 +89,9 @@ echo "  dst: token=$TOKEN_DST gate=$GATE_DST"
 PREFIX=$(printf '%064x' $SRC_CHAIN)
 DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${TOKEN_SRC#0x}")
 
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$TOKEN_DST" 18
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" $TWICE --rpc-url $DST_RPC --private-key $KEY0 >/dev/null

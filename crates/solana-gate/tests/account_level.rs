@@ -742,7 +742,7 @@ fn the_host_mirror_encodes_every_instruction_the_program_decodes() {
     let cases: Vec<(host::GateInstruction, &str)> = vec![
         (host::GateInstruction::SetValidator { validator: [7u8; 20], active: true }, "SetValidator"),
         (host::GateInstruction::SetThreshold { threshold: 2 }, "SetThreshold"),
-        (host::GateInstruction::RegisterAsset { debridge_id: [9u8; 32] }, "RegisterAsset"),
+        (host::GateInstruction::RegisterAsset { debridge_id: [9u8; 32], bridge_decimals: 6 }, "RegisterAsset"),
         (host::GateInstruction::RegisterCorridor { chain_id_to: 1337 }, "RegisterCorridor"),
         (host::GateInstruction::Pause, "Pause"),
         (host::GateInstruction::Unpause, "Unpause"),
@@ -1113,11 +1113,15 @@ fn refunded_pda(id: &[u8; 32]) -> Pubkey {
 }
 
 fn mint_account() -> Account {
+    mint_account_with_decimals(6)
+}
+
+fn mint_account_with_decimals(decimals: u8) -> Account {
     let mut data = vec![0u8; spl_token::state::Mint::LEN];
     spl_token::state::Mint {
         mint_authority: COption::None,
         supply: 1_000_000,
-        decimals: 6,
+        decimals,
         is_initialized: true,
         freeze_authority: COption::None,
     }
@@ -1170,6 +1174,18 @@ async fn setup_with_asset(
     vault_balance: u64,
     user_balance: u64,
 ) -> AssetFixture {
+    setup_with_asset_decimals(validators, threshold, vault_balance, user_balance, 6, 6).await
+}
+
+/// [`setup_with_asset`] for a mint of `local_decimals` bridged at `bridge_decimals`.
+async fn setup_with_asset_decimals(
+    validators: Vec<[u8; 20]>,
+    threshold: u32,
+    vault_balance: u64,
+    user_balance: u64,
+    local_decimals: u8,
+    bridge_decimals: u8,
+) -> AssetFixture {
     let owner = Keypair::new();
     let mint = Pubkey::new_unique();
     let vault = Pubkey::new_unique();
@@ -1214,8 +1230,8 @@ async fn setup_with_asset(
     );
 
     // The asset registry entry governance would have created.
-    let asset = solana_gate::AssetConfig { debridge_id, mint, vault };
-    let mut asset_data = vec![0u8; 1 + 32 + 32 + 32];
+    let asset = solana_gate::AssetConfig { debridge_id, mint, vault, bridge_decimals, local_decimals };
+    let mut asset_data = vec![0u8; 32 + 32 + 32 + 2];
     asset.serialize(&mut &mut asset_data[..]).unwrap();
     pt.add_account(
         asset_pda(&debridge_id),
@@ -1228,7 +1244,7 @@ async fn setup_with_asset(
         },
     );
 
-    pt.add_account(mint, mint_account());
+    pt.add_account(mint, mint_account_with_decimals(local_decimals));
     pt.add_account(
         vault,
         token_account(mint, vault_authority(), vault_balance, COption::None, COption::None),
@@ -1594,7 +1610,7 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
 
         let mut ctx = pt.start_with_context().await;
         let instruction = ix(
-            GateInstruction::RegisterAsset { debridge_id },
+            GateInstruction::RegisterAsset { debridge_id, bridge_decimals: 6 },
             vec![
                 AccountMeta::new_readonly(config_pda(), false),
                 AccountMeta::new(owner.pubkey(), true),
@@ -1689,7 +1705,7 @@ async fn a_registered_asset_cannot_be_repointed() {
 
     let register = |mint: Pubkey, vault: Pubkey| {
         ix(
-            GateInstruction::RegisterAsset { debridge_id },
+            GateInstruction::RegisterAsset { debridge_id, bridge_decimals: 6 },
             vec![
                 AccountMeta::new_readonly(config_pda(), false),
                 AccountMeta::new(owner.pubkey(), true),
@@ -1790,7 +1806,7 @@ async fn register_asset_succeeds_when_the_pda_was_pre_funded_by_a_griefer() {
 
     let mut ctx = pt.start_with_context().await;
     let instruction = ix(
-        GateInstruction::RegisterAsset { debridge_id },
+        GateInstruction::RegisterAsset { debridge_id, bridge_decimals: 6 },
         vec![
             AccountMeta::new_readonly(config_pda(), false),
             AccountMeta::new(owner.pubkey(), true),
@@ -1910,4 +1926,165 @@ async fn an_array_within_the_validator_count_still_reaches_verification() {
             "{len} signatures must pass the length cap and fail on verification instead: {err:?}"
         );
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Decimals normalisation, through the real handlers.
+//
+// A 9-decimal mint bridged at 6 bridge decimals: `send` locks the mint amount but
+// hashes (and emits) it in bridge units, `refund` returns exactly what was
+// locked, and `claim` of a bridge amount pays it out at 9 decimals. Before this,
+// the raw amount crossed unchanged, so 1 TST from an 18-decimal EVM chain was
+// claimable here as 10^12 TST.
+// ---------------------------------------------------------------------------
+
+const INEXACT_AMOUNT: u32 = 22;
+
+fn send_ix(fx: &AssetFixture, signer: Pubkey, amount: u64, receiver: &[u8], id: &[u8; 32]) -> Instruction {
+    ix(
+        GateInstruction::Send(SendArgs {
+            debridge_id: fx.debridge_id,
+            amount,
+            chain_id_to: DEST_CHAIN,
+            receiver: receiver.to_vec(),
+            auto: None,
+        }),
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(signer, true),
+            AccountMeta::new(fx.user_token, false),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(sent_pda(id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn send_hashes_bridge_units_and_refund_returns_the_mint_amount() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx = setup_with_asset_decimals(
+        vec![v1.address, v2.address, v3.address],
+        2,
+        0,
+        3_000_000_000, // 3.0 at 9 decimals
+        9,
+        6,
+    )
+    .await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+    let receiver = vec![0xEEu8; 20];
+
+    // 2.25 tokens = 2_250_000_000 mint units = 2_250_000 bridge units. The sent
+    // PDA is seeded by the id, so a program still hashing mint units would fail
+    // this instruction with InvalidSeeds.
+    let local = 2_250_000_000u64;
+    let id = send_submission_id(&fx.debridge_id, 2_250_000, &receiver, 0);
+    let send = send_ix(&fx, owner.pubkey(), local, &receiver, &id);
+    exec(&mut fx.ctx, send, &[&owner])
+        .await
+        .expect("send must hash the bridge amount");
+
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 750_000_000, "the MINT amount is locked");
+    let sent = fx.ctx.banks_client.get_account(sent_pda(&id)).await.unwrap().unwrap();
+    let record = solana_gate::SentRecord::deserialize(&mut &sent.data[..]).unwrap();
+    assert_eq!(record.amount, local, "the record keeps the mint amount for refund");
+
+    let refund = ix(
+        GateInstruction::Refund(solana_gate::RefundArgs {
+            debridge_id: fx.debridge_id,
+            amount: 2_250_000, // the id's (bridge) amount
+            chain_id_to: DEST_CHAIN,
+            nonce: 0,
+            receiver: receiver.clone(),
+            auto: None,
+            native_sender: owner.pubkey().to_bytes().to_vec(),
+            signatures: quorum(&[&v1, &v2], &refund_digest(&id)),
+        }),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(sent_pda(&id), false),
+            AccountMeta::new(refunded_pda(&id), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new(fx.user_token, false),
+            AccountMeta::new_readonly(vault_authority(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    exec(&mut fx.ctx, refund, &[&owner]).await.expect("refund");
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 3_000_000_000, "made whole in mint units");
+}
+
+#[tokio::test]
+async fn send_refuses_precision_below_the_bridge_unit() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx =
+        setup_with_asset_decimals(vec![v1.address, v2.address, v3.address], 2, 0, 3_000_000_000, 9, 6).await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+    let receiver = vec![0xEEu8; 20];
+
+    // One mint unit past a whole bridge unit: not representable on the wire.
+    let id = send_submission_id(&fx.debridge_id, 2_250_000, &receiver, 0);
+    let send = send_ix(&fx, owner.pubkey(), 2_250_000_001, &receiver, &id);
+    let err = exec(&mut fx.ctx, send, &[&owner])
+        .await
+        .expect_err("an inexact amount must be refused");
+    assert!(is_custom(&err, INEXACT_AMOUNT), "expected InexactAmount, got {err:?}");
+    let user = fx.ctx.banks_client.get_account(fx.user_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&user), 3_000_000_000, "nothing locked");
+}
+
+#[tokio::test]
+async fn claim_pays_a_bridge_amount_out_in_mint_units() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx =
+        setup_with_asset_decimals(vec![v1.address, v2.address, v3.address], 2, 5_000_000_000, 0, 9, 6).await;
+    let receiver_token = Pubkey::new_unique();
+    fx.ctx.set_account(
+        &receiver_token,
+        &token_account(fx.mint, Pubkey::new_unique(), 0, COption::None, COption::None).into(),
+    );
+
+    // 1.5 tokens from an EVM chain: 1_500_000 bridge units on the wire.
+    let args = solana_gate::ClaimArgs {
+        debridge_id: fx.debridge_id,
+        amount: 1_500_000,
+        chain_id_from: DEST_CHAIN,
+        nonce: 0,
+        receiver: receiver_token.to_bytes().to_vec(),
+        auto: None,
+        native_sender: vec![0x11; 20],
+        signatures: vec![],
+    };
+    let id = claim_submission_id(&args);
+    let sigs = quorum(&[&v1, &v2], &id);
+    let claim = ix(
+        GateInstruction::Claim(solana_gate::ClaimArgs { signatures: sigs, ..args }),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(executed_pda(&id), false),
+            AccountMeta::new(fx.owner.pubkey(), true),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new(receiver_token, false),
+            AccountMeta::new_readonly(vault_authority(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+    exec(&mut fx.ctx, claim, &[&owner]).await.expect("claim");
+
+    let recv = fx.ctx.banks_client.get_account(receiver_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&recv), 1_500_000_000, "1.5 tokens at 9 decimals");
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&vault), 3_500_000_000);
 }

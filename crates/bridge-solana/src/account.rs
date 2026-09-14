@@ -50,6 +50,18 @@ pub struct AssetAccount {
     pub debridge_id: [u8; 32],
     pub mint: Key,
     pub vault: Key,
+    /// The asset's mesh-wide bridge decimals: every transfer amount travels in
+    /// these (see `solana_gate::AssetConfig`).
+    pub bridge_decimals: u8,
+    /// The mint's own decimals, cached at registration.
+    pub local_decimals: u8,
+}
+
+impl AssetAccount {
+    /// `10^(local - bridge)`: the smallest mint amount that crosses the bridge.
+    pub fn bridge_unit(&self) -> Option<u64> {
+        10u64.checked_pow(self.local_decimals.checked_sub(self.bridge_decimals)? as u32)
+    }
 }
 
 /// Decode an account whose trailing bytes are rent padding.

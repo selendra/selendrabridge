@@ -87,7 +87,8 @@ configure)
   AUTH=$(vault_authority); need "vault authority" "$AUTH"
   echo "  vault authority PDA : $AUTH"
   # 6 decimals, matching the previous generation's mirrored asset.
-  MINT=$(spl-token create-token --decimals 6 --url "$SOLANA_RPC" --fee-payer "$PAYER" \
+  MINT_DECIMALS=6
+  MINT=$(spl-token create-token --decimals "$MINT_DECIMALS" --url "$SOLANA_RPC" --fee-payer "$PAYER" \
            --mint-authority "$PAYER_PUB" | sed -n 's/^Address: *//p' | head -1)
   need "mint" "$MINT"; echo "  mint                : $MINT"
   # Owned by the PDA, with no delegate and no close authority — process_register_asset
@@ -99,7 +100,13 @@ configure)
   echo "  minted 1,000,000 units of claim liquidity"
 
   say "register asset (debridgeId $DID)"
-  admin register-asset --debridge-id "$DID" --mint "$MINT" --vault "$VAULT"
+  # --bridge-decimals is the asset's MESH-WIDE bridge decimals. It cannot exceed
+  # the mint's own decimals, so it is the SPL mint's 6 here — and every gate in the
+  # mesh must register the SAME value for this asset (each EVM gate's
+  # setBridgeDecimals(TST, 6), e.g. BRIDGE_DECIMALS_TST=6 for run.sh), or a claim
+  # pays out a power of ten too much or too little. Write-once on every gate.
+  admin register-asset --debridge-id "$DID" --mint "$MINT" --vault "$VAULT" \
+    --bridge-decimals "$MINT_DECIMALS"
 
   say "register the RETURN path on the EVM side"
   # Without this, Solana->EVM is one-way-broken and nothing says so loudly.
@@ -112,6 +119,10 @@ configure)
   #
   # The debridgeId is Sepolia's own, because that is the asset identity the
   # Solana gate has registered and will emit on `send`.
+  #
+  # setLocalToken reverts BridgeDecimalsUnset unless the Sepolia gate already has
+  # setBridgeDecimals for $TOKEN_TST_11155111 — run.sh registers it when it wires
+  # TST, and the value must equal the --bridge-decimals given to the Solana gate.
   bash -c 'source scripts/gen5.config.local >/dev/null 2>&1
     source "'"$RUN_DIR"'/addresses.env"
     rpc(){ local w=$1 e c n r; for e in "${CHAINS[@]}"; do IFS="|" read -r c n r _ <<<"$e"; [ "${c// /}" = "$w" ] && { printf "%s" "${r// /}"; return; }; done; }

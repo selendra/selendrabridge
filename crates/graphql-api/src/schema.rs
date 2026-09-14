@@ -121,6 +121,10 @@ pub struct Token {
     pub symbol: String,
     /// `0x`-prefixed ERC-20 address on this chain.
     pub address: String,
+    /// The decimals transfer amounts of this asset are expressed in (the
+    /// `amount` of a submission or history row), NOT this token's own decimals.
+    /// Null when the registry does not say.
+    pub bridge_decimals: Option<u8>,
 }
 
 impl From<ChainInfo> for Chain {
@@ -135,7 +139,7 @@ impl From<ChainInfo> for Chain {
             tokens: c
                 .tokens
                 .into_iter()
-                .map(|t| Token { symbol: t.symbol, address: t.address })
+                .map(|t| Token { symbol: t.symbol, address: t.address, bridge_decimals: t.bridge_decimals })
                 .collect(),
             router: c.router,
         }
@@ -190,6 +194,10 @@ pub struct SolanaGateContext {
     pub vault: String,
     /// The mint's decimals, for amount entry.
     pub decimals: u8,
+    /// The asset's bridge decimals: the entered amount must be a whole multiple
+    /// of `10^(decimals - bridgeDecimals)`, and the submissionId hashes the amount
+    /// divided by that.
+    pub bridge_decimals: u8,
     /// True when the gate's circuit breaker is tripped — a `send` would revert.
     pub paused: bool,
 }
@@ -335,6 +343,13 @@ impl Submission {
 
 #[ComplexObject]
 impl Submission {
+    /// The decimals `amount` is expressed in: the asset's bridge decimals, the
+    /// same on every chain. Format `amount` with THIS, never with a local
+    /// token's decimals. Null when the registry cannot resolve `debridgeId`.
+    async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        state(ctx).bridge_decimals_of(&self.debridge_id)
+    }
+
     /// On-chain `executed(submissionId)` on the destination gate. `null` when the
     /// API has no `--gate` configured for `chainIdTo` (or the RPC call failed).
     #[graphql(complexity = "CHAIN_READ_COST")]
@@ -411,6 +426,24 @@ fn state<'c>(ctx: &Context<'c>) -> &'c ApiState {
     ctx.data_unchecked::<ApiState>()
 }
 
+impl ApiState {
+    /// The bridge decimals a transfer's `amount` is denominated in, resolved
+    /// from its `debridgeId` — `keccak(chainId, token)` of an EVM asset in the
+    /// registry. A Solana-origin transfer carries such a (peer) id too, so this
+    /// covers both VMs. `None` when no registry token derives that id.
+    pub fn bridge_decimals_of(&self, debridge_id: &str) -> Option<u8> {
+        let want = debridge_id.trim().to_ascii_lowercase();
+        self.registry.iter().find_map(|c| {
+            c.tokens.iter().find_map(|t| {
+                let dec = t.bridge_decimals?;
+                let addr: alloy_primitives::Address = t.address.parse().ok()?;
+                let id = bridge_core::debridge_id(alloy_primitives::U256::from(c.chain_id), addr);
+                (format!("{id:#x}") == want).then_some(dec)
+            })
+        })
+    }
+}
+
 
 
 /// The swap intent (and destination outcome, once known) of a
@@ -451,6 +484,7 @@ impl From<SwapBridgeInfo> for SwapIntent {
 /// validator signature — unlike `submissions`/`submission` (signature-store
 /// view), this is where a stuck/failed transfer is visible.
 #[derive(SimpleObject)]
+#[graphql(complex)]
 pub struct HistoryEntry {
     pub submission_id: String,
     pub debridge_id: String,
@@ -482,6 +516,14 @@ pub struct HistoryEntry {
     pub refund_signature_count: u64,
     /// Set when this transfer originated from `SwapRouter.swapAndBridge`.
     pub swap_intent: Option<SwapIntent>,
+}
+
+#[ComplexObject]
+impl HistoryEntry {
+    /// The decimals `amount` is expressed in — see `Submission.bridgeDecimals`.
+    async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        state(ctx).bridge_decimals_of(&self.debridge_id)
+    }
 }
 
 impl From<SubmissionHistory> for HistoryEntry {
@@ -729,6 +771,7 @@ impl Query {
                 debridge_id: c.debridge_id,
                 vault: c.vault,
                 decimals: c.decimals,
+                bridge_decimals: c.bridge_decimals,
                 paused: c.paused,
             };
             if mapped == Some(true) {

@@ -75,7 +75,7 @@ pub enum GateInstruction {
     /// C1: bind a `debridge_id` to the SPL mint + vault that may back it
     /// (owner-gated on-chain). Appended last so discriminants 0..=4 stay stable
     /// and byte-compatible with the deployable program's enum.
-    RegisterAsset { debridge_id: [u8; 32] },
+    RegisterAsset { debridge_id: [u8; 32], bridge_decimals: u8 },
     /// H-3: owner-gated registration of a destination chain. `send` refuses any
     /// `chain_id_to` not registered here, which is what bounds the corridor
     /// vector an attacker could previously grow until the config no longer fit

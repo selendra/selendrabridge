@@ -211,7 +211,7 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
                       </span>
                     </td>
                     <td className="tbl__amount">
-                      {formatUnits(sub.amount, decimalsByChain[sub.chainIdFrom] ?? 18)}
+                      {formatUnits(sub.amount, sub.bridgeDecimals ?? decimalsByChain[sub.chainIdFrom] ?? 18)}
                     </td>
                     <td className="tbl__num">{sub.nonce}</td>
                     <td className="tbl__num">

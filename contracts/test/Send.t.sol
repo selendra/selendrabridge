@@ -62,6 +62,7 @@ contract SendTest is Test {
         gate.setSupportedChain(9999, true);
 
         token = new TestToken("Test", "TST");
+        gate.setBridgeDecimals(address(token), 18);
         token.mint(user, 1_000 ether);
 
         vm.prank(user);
@@ -147,6 +148,7 @@ contract SendTest is Test {
         // so a destination claim would release 100 from shared liquidity — a
         // shortfall drain. The exact-transfer check must reject it.
         FeeToken fee = new FeeToken(100); // 1%
+        gate.setBridgeDecimals(address(fee), 18);
         fee.mint(user, 1_000 ether);
         vm.prank(user);
         fee.approve(address(gate), type(uint256).max);

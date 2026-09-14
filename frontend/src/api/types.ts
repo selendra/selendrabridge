@@ -5,6 +5,8 @@ export type SubmissionStatus = "PENDING" | "READY" | "EXECUTED" | "CANCELLED" | 
 export interface TokenRef {
   symbol: string;
   address: string;
+  /** The asset's mesh-wide bridge decimals; null when the registry doesn't say. */
+  bridgeDecimals?: number | null;
 }
 
 export interface Chain {
@@ -28,7 +30,11 @@ export interface SignatureRef {
 export interface Submission {
   submissionId: string;
   debridgeId?: string;
-  amount: string; // uint256 as decimal string (wei)
+  /** Wire amount: in the asset's BRIDGE decimals (`bridgeDecimals`), not the
+   *  source token's own decimals. */
+  amount: string;
+  /** Decimals `amount` is expressed in; null when the API cannot resolve the asset. */
+  bridgeDecimals?: number | null;
   chainIdFrom: number;
   chainIdTo: number;
   nonce: number;
@@ -106,7 +112,9 @@ export interface SwapIntent {
 export interface HistoryEntry {
   submissionId: string;
   debridgeId: string;
+  /** Wire amount, in `bridgeDecimals` (see {@link Submission.amount}). */
   amount: string;
+  bridgeDecimals?: number | null;
   chainIdFrom: number;
   chainIdTo: number;
   nonce: number;

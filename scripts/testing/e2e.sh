@@ -109,6 +109,11 @@ PREFIX=$(printf '%064x' $SRC_CHAIN)
 DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${TOKEN_SRC#0x}")
 echo "  debridgeId=$DEBRIDGE_ID"
 
+echo "=== bridge decimals (identity, 18) on both gates ==="
+# Bridge decimals must precede setLocalToken/send; identity (TestToken is 18-dec).
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$TOKEN_DST" 18
+
 echo "=== source setup: mint + approve ==="
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

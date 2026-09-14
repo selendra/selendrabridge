@@ -231,6 +231,18 @@ Running more than one keeper is safe and is the normal way to get redundancy: ea
 
 ---
 
+## 3a. Asset decimals across chains
+
+Transfers are denominated in each asset's **bridge decimals** (`docs/architecture.md` §2.3), not in any chain's token decimals. What that means operationally:
+
+- **Every gate and the Solana program must register the same value per asset.** `deploy-from-json.sh` does this (`registering <SYM> bridge decimals`), before corridors and before `seal()`. A mismatch pays out a power of ten too much or too little, so check `bridgeDecimalsOf(token)` on each gate and `gate-admin show` on Solana when adding a chain.
+- **The value can only be the minimum across the mesh.** Adding a chain where the asset has FEWER decimals than the current bridge decimals needs a new generation: registrations are write-once, and lowering the value on existing gates would re-denominate in-flight transfers.
+- **Amounts in the store, indexer, keeper and API are wire amounts.** Format them with `bridgeDecimals` (returned on submissions, history rows and registry tokens).
+- **`send` refuses dust.** An amount that is not a whole multiple of `10^(tokenDecimals − bridgeDecimals)` reverts `InexactAmount` (Solana: `Custom(22)`). The UI rounds its Max button and names the limit.
+- **`gate-admin register-asset` requires `--bridge-decimals`**, and `gate-admin send --amount` is in the mint's decimals.
+
+---
+
 ## 4a. Keeping pool prices fresh
 
 References: `crates/price-keeper`, `crates/solana-relayer/src/bin/solana-price-keeper.rs`, `swap_math::refresh`.

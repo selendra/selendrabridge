@@ -11,7 +11,8 @@ import { GATE_A, GATE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
  */
 
 const BAL = 1000n * 10n ** 18n;
-const DEC_18 = { "313ce567": "12", "70a08231": BAL.toString(16), "dd62ed3e": "0" };
+// bridgeUnit(token) = 1: the token is already at its bridge decimals.
+const DEC_18 = { "313ce567": "12", "70a08231": BAL.toString(16), "dd62ed3e": "0", "4e3ff796": "1" };
 const APPROVED = { ...DEC_18, dd62ed3e: (2n ** 255n).toString(16) };
 
 const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
@@ -210,6 +211,40 @@ test.describe("approve → bridge", () => {
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
     await primaryButton(page).click();
     await expect(page.locator(".txbar--error")).toContainText("Rejected in wallet", { timeout: 15_000 });
+  });
+});
+
+test.describe("bridge decimals", () => {
+  // An 18-decimal token bridged at 6 decimals: the gate's unit is 10^12.
+  const UNIT_1E12 = { ...APPROVED, "4e3ff796": (10n ** 12n).toString(16) };
+
+  test("refuses precision the bridge cannot carry, before any transaction", async ({ page }) => {
+    await openBridge(page, UNIT_1E12);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1.0000001");
+    await expect(primaryButton(page)).toHaveText("Too precise — this asset bridges at most 6 decimals");
+    await expect(primaryButton(page)).toBeDisabled();
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
+
+  test("accepts an amount that is a whole number of bridge units", async ({ page }) => {
+    await openBridge(page, UNIT_1E12);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1.000001");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+  });
+
+  test("Max rounds the balance down to a whole bridge unit", async ({ page }) => {
+    const dusty = 1000n * 10n ** 18n + 123n; // 1000 TST and 123 wei of dust
+    await openBridge(page, { ...UNIT_1E12, "70a08231": dusty.toString(16) });
+    await page.getByRole("button", { name: /^Max/ }).click();
+    await expect(page.locator(".field").filter({ hasText: "Amount" }).locator("input")).toHaveValue("1000");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+  });
+
+  test("says so when the gate cannot bridge the token at all", async ({ page }) => {
+    // bridgeUnit(token) reverting reads back as 0 from the mock.
+    await openBridge(page, { ...APPROVED, "4e3ff796": "0" });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("This token isn't bridgeable through this Gate");
   });
 });
 

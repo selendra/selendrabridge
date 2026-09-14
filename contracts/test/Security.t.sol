@@ -64,6 +64,7 @@ contract SecurityTest is Test {
         gate = deployTestGate(_validators(3), 2);
         gate.setSupportedChain(CHAIN_TO, true);
         token = new TestToken("Test", "TST");
+        gate.setBridgeDecimals(address(token), 18);
     }
 
     // ---- C1: threshold bounds ----
@@ -130,6 +131,7 @@ contract SecurityTest is Test {
     // plain sequential nonces are covered by test_Send_NonceIncrementsPerTarget.
     function test_Send_ReentrantTokenIsRejected() public {
         ReentrantToken rt = new ReentrantToken();
+        gate.setBridgeDecimals(address(rt), 18);
         rt.mint(attacker, 10 ether);
         rt.arm(gate, CHAIN_TO);
 

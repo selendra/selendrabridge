@@ -109,6 +109,7 @@ contract SwapRouterTest is Test {
         gateA = deployTestGate(vals, 1);
         gateA.setSupportedChain(CHAIN_B, true);
         usdA = new MockToken("USD A", "USDa", 6);
+        gateA.setBridgeDecimals(address(usdA), 6);
         weth = new MockToken("Wrapped Ether", "WETH", 18);
         poolA = new SwapPool(address(usdA), DEVIATION_BPS);
         poolA.listToken(address(weth), WETH_PRICE);
@@ -121,6 +122,7 @@ contract SwapRouterTest is Test {
         gateB = deployTestGate(vals, 1);
         gateB.setSupportedChain(CHAIN_A, true);
         usdB = new MockToken("USD B", "USDb", 6);
+        gateB.setBridgeDecimals(address(usdB), 6);
         tt = new MockToken("Test Token", "TT", 18);
         poolB = new SwapPool(address(usdB), DEVIATION_BPS);
         poolB.listToken(address(tt), TT_PRICE);

@@ -342,7 +342,14 @@ contract SwapRouter is ReentrancyGuard {
             IERC20(tokenIn).forceApprove(address(pool), amountIn);
             stableOut = pool.swap(tokenIn, stable, amountIn, minStableOut, address(this));
         }
+        // The gate only bridges whole multiples of the stable's bridge unit (see
+        // Gate.BridgeDecimals), and a pool output is almost never one. Bridge the
+        // convertible part and hand the remainder straight back to the caller,
+        // rather than reverting a swap the user already priced.
+        uint256 dust = stableOut % gate.bridgeUnit(stable);
+        stableOut -= dust;
         if (stableOut == 0) revert ZeroAmount();
+        if (dust != 0) IERC20(stable).safeTransfer(msg.sender, dust);
 
         // The destination intent rides in autoParams.data, which the Gate binds
         // into the submissionId (so the validators sign over it). fallbackAddress
@@ -439,6 +446,9 @@ contract SwapRouter is ReentrancyGuard {
         // and the delivered asset must be the stable we know how to route.
         if (_toAddress(receiver) != address(this)) revert NotForThisRouter();
         if (gate.tokenOf(debridgeId) != stable) revert UnexpectedAsset();
+        // `amount` is the wire amount the id commits to; what the claim actually
+        // released to this router is the stable's local amount.
+        amount = gate.toLocalAmount(stable, amount);
 
         (address finalToken, address finalReceiver, uint256 finalMinOut) =
             _decodeIntent(autoParams);

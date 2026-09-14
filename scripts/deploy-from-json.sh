@@ -217,7 +217,7 @@ for cid in "${CHAIN_IDS[@]}"; do
   prev_floor="$( { [[ -f "$OUT_FILE" ]] && jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .deploy_block // empty' "$OUT_FILE"
                    if [[ -n "$run_gate" && "${rt_gate,,}" == "${run_gate,,}" ]]; then
                      jq -r --argjson c "$cid" '.chains[]? | select(.chain_id == $c) | .start_block // empty' "$BRIDGE_CFG"
-                   fi; } 2>/dev/null | grep -E '^[0-9]+$' | sort -n | head -1 )"
+                   fi; } 2>/dev/null | grep -E '^[0-9]+$' | sort -n | head -1 || true)"
   if [[ -n "$prev_floor" && "$prev_floor" -gt 0 && "$prev_floor" -lt "${FLOOR[$cid]}" ]]; then FLOOR[$cid]="$prev_floor"; fi
 done
 
@@ -315,6 +315,49 @@ if (( ${#SYMS[@]} )); then
   done
 fi
 
+# --- bridge decimals (decimals normalisation) --------------------------------
+#
+# The same asset has different decimals per chain (TST: 18 on the EVM chains, 6
+# as an SPL mint), so every transfer travels in ONE per-asset "bridge decimals"
+# value that every gate and the Solana program register: `send` converts the
+# local amount down to it (exact or revert), `claim` scales back up. It must be
+# no larger than the asset's decimals on ANY chain in the mesh — scaling up is
+# then always exact — and identical everywhere, or claims pay out a power of ten
+# too much or too little. `assets[].bridge_decimals` pins it; unset, it is the
+# minimum decimals found on-chain across the asset's deployments and mints.
+declare -A BRIDGE_DEC
+spl_mint_decimals() {  # mint rpc -> decimals (empty when unreadable)
+  command -v spl-token >/dev/null 2>&1 || export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+  spl-token display "$1" -u "$2" 2>/dev/null | sed -n 's/^ *Decimals: *//p' | head -1
+}
+for sym in "${SYMS[@]:-}"; do
+  [[ -z "${sym:-}" ]] && continue
+  lowest=""; seen=""
+  for cid in ${ASSET_CHAINS[$sym]:-}; do
+    d="$(cast call "${TOKEN[$sym|$cid]}" 'decimals()(uint8)' --rpc-url "${RPC[$cid]}" 2>/dev/null | awk '{print $1}')"
+    [[ "$d" =~ ^[0-9]+$ ]] || die "$sym on chain $cid: decimals() unreadable at ${TOKEN[$sym|$cid]}"
+    seen+=" $cid:$d"; { [[ -z "$lowest" ]] || (( d < lowest )); } && lowest="$d"
+  done
+  if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
+    mint="$(jr ".solana.assets[]? | select(.symbol == \"$sym\") | .mint")"
+    if [[ -n "$mint" ]]; then
+      d="$(spl_mint_decimals "$mint" "$(j '.solana.rpc')")"
+      [[ "$d" =~ ^[0-9]+$ ]] || die "$sym: Solana mint $mint decimals unreadable"
+      seen+=" solana:$d"; { [[ -z "$lowest" ]] || (( d < lowest )); } && lowest="$d"
+    fi
+  fi
+  [[ -n "$lowest" ]] || continue
+  pinned="$(jr ".assets[] | select(.symbol == \"$sym\") | .bridge_decimals")"
+  if [[ -n "$pinned" ]]; then
+    [[ "$pinned" =~ ^[0-9]+$ ]] || die "assets[$sym].bridge_decimals must be an integer"
+    (( pinned <= lowest )) || die "assets[$sym].bridge_decimals = $pinned exceeds the lowest decimals in the mesh ($lowest:$seen) — claims there could not pay out exactly"
+    BRIDGE_DEC[$sym]="$pinned"
+  else
+    BRIDGE_DEC[$sym]="$lowest"
+  fi
+  info "$sym bridges at ${BRIDGE_DEC[$sym]} decimals (decimals:$seen)"
+done
+
 # --- gate wiring (audit round 4: M-3 supportedChain, H-1 seal) --------------
 #
 # The deployer is the gate's owner until the multisig calls acceptOwnership()
@@ -373,6 +416,36 @@ for cid in "${CHAIN_IDS[@]}"; do
       warn "chain $cid: not the gate owner — setSupportedChain($peer) written to governance_calls"
     fi
   done
+done
+
+# --- bridge decimals on every gate (write-once; must precede setLocalToken) --
+register_bridge_decimals() {  # chain_id sym
+  local cid="$1" sym="$2" tok="${TOKEN[$2|$1]}" want="${BRIDGE_DEC[$2]}" cur isset curdec data aid
+  cur="$(cast call "${GATE[$cid]}" 'bridgeDecimalsOf(address)(bool,uint8,uint8)' "$tok" --rpc-url "${RPC[$cid]}" 2>/dev/null | tr '\n' ' ')"
+  read -r isset curdec _ <<<"$cur"
+  if [[ "$isset" == "true" ]]; then
+    [[ "$curdec" == "$want" ]] || die "chain $cid gate already has $sym at bridge decimals $curdec, this mesh needs $want — it is write-once; deploy a new gate"
+    info "chain $cid: $sym bridge decimals already $curdec"; return
+  fi
+  data="$(cast calldata 'setBridgeDecimals(address,uint8)' "$tok" "$want")"
+  if gate_owned_by_us "${GATE[$cid]}" "${RPC[$cid]}" && ! gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
+    csend "${GATE[$cid]}" 'setBridgeDecimals(address,uint8)' "$tok" "$want" --rpc-url "${RPC[$cid]}"
+    info "chain $cid: $sym bridge decimals = $want"
+  else
+    if gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
+      aid="$(cast call "${GATE[$cid]}" 'setBridgeDecimalsActionId(address,uint8)(bytes32)' "$tok" "$want" --rpc-url "${RPC[$cid]}")"
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleGovernance(bytes32)' "$aid")" "1/2 schedule: $sym bridge decimals $want (sealed gate)"
+      gov_call "$cid" "${GATE[$cid]}" "$data" "2/2 $sym bridge decimals $want — BEFORE its corridors"
+    else
+      gov_call "$cid" "${GATE[$cid]}" "$data" "$sym bridge decimals $want — BEFORE its corridors"
+    fi
+    warn "chain $cid: setBridgeDecimals($sym) NOT sent — written to governance_calls"
+  fi
+}
+for sym in "${SYMS[@]:-}"; do
+  [[ -z "${sym:-}" || -z "${BRIDGE_DEC[$sym]:-}" ]] && continue
+  say "registering $sym bridge decimals (${BRIDGE_DEC[$sym]})"
+  for cid in ${ASSET_CHAINS[$sym]:-}; do register_bridge_decimals "$cid" "$sym"; done
 done
 
 # --- corridors: setLocalToken (write-once, owner-only) ----------------------
@@ -448,7 +521,7 @@ if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length'
                          '.swap_pools[]? | select(.chain_id == $c and (.pool | ascii_downcase) == $p) | .from_block // empty' "$OUT_FILE"
                        [[ -n "${BRIDGE_CFG:-}" && -f "$BRIDGE_CFG" ]] && jq -r --argjson c "$cid" --arg p "${pool,,}" \
                          '.graphql.swaps[]? | select(.chain_id == $c and (.pool | ascii_downcase) == $p) | .from_block // empty' "$BRIDGE_CFG"
-                     } 2>/dev/null | grep -E '^[1-9][0-9]*$' | sort -n | head -1 )"
+                     } 2>/dev/null | grep -E '^[1-9][0-9]*$' | sort -n | head -1 || true)"
       from_block="${from_block:-0}"
       [[ "$from_block" == "0" ]] && warn "chain $cid: reused pool $pool has no recorded from_block — set swap.pools[].from_block to its deploy height, or the Swap view scans from genesis"
       info "chain $cid reusing pool $pool (listings from block $from_block)"
@@ -694,7 +767,8 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
         jq -e --argjson c "$cid" 'index($c) != null' <<<"$from" >/dev/null || continue
       fi
       did="$(debridge_id "$cid" "${TOKEN[$sym|$cid]}")"
-      ga_retry register-asset --debridge-id "$did" --mint "$mint" --vault "$vault" >/dev/null \
+      ga_retry register-asset --debridge-id "$did" --mint "$mint" --vault "$vault" \
+        --bridge-decimals "${BRIDGE_DEC[$sym]:?no bridge decimals for $sym}" >/dev/null \
         || die "register-asset $sym (from chain $cid) failed"
       info "asset   : $sym from chain $cid -> mint $mint"
       ids="$(jq -c --arg d "$did" --argjson c "$cid" '. + [{from_chain: $c, debridge_id: $d}]' <<<"$ids")"
@@ -703,7 +777,8 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     # is then registered on the EVM gates the same way any inbound corridor is.
     native_did="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .debridge_id")"
     if [[ -n "$native_did" ]]; then
-      ga_retry register-asset --debridge-id "$native_did" --mint "$mint" --vault "$vault" >/dev/null \
+      ga_retry register-asset --debridge-id "$native_did" --mint "$mint" --vault "$vault" \
+        --bridge-decimals "${BRIDGE_DEC[$sym]:?no bridge decimals for $sym}" >/dev/null \
         || die "register-asset $sym (solana-native id) failed"
       for cid in ${ASSET_CHAINS[$sym]:-}; do
         register_corridor "$cid" "$native_did" "${TOKEN[$sym|$cid]}" "register $sym inbound from Solana"
@@ -711,7 +786,8 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       ids="$(jq -c --arg d "$native_did" '. + [{from_chain: "solana", debridge_id: $d}]' <<<"$ids")"
     fi
     SOL_ASSETS="$(jq -c --arg s "$sym" --arg m "$mint" --arg v "$vault" --argjson ids "$ids" \
-      '. + [{symbol: $s, mint: $m, vault: $v, registrations: $ids}]' <<<"$SOL_ASSETS")"
+      --argjson bd "${BRIDGE_DEC[$sym]:-null}" \
+      '. + [{symbol: $s, mint: $m, vault: $v, bridge_decimals: $bd, registrations: $ids}]' <<<"$SOL_ASSETS")"
   done
 
   # --- the Solana swap pool (a SEPARATE program from the gate) ---------------
@@ -887,8 +963,10 @@ jq -n --arg name "$NAME" --arg profile "$PROFILE" --arg domain "$BRIDGE_DOMAIN" 
       --argjson vals "$(printf '%s\n' "${VALIDATORS[@]}" | jq -R . | jq -s .)" \
       --argjson th "$THRESHOLD" --argjson chains "$chains_json" --argjson swap "$SWAP_JSON" \
       --argjson gov "$CORRIDOR_CALLS" --argjson solana "$SOLANA_JSON" --argjson pools "$SWAP_POOLS" \
+      --argjson bdec "$(for k in "${!BRIDGE_DEC[@]}"; do printf '%s\t%s\n' "$k" "${BRIDGE_DEC[$k]}"; done \
+                        | jq -R 'split("\t") | {(.[0]): (.[1] | tonumber)}' | jq -s 'add // {}')" \
   '{name:$name, profile:$profile, deployed_at:$at, deployer:$deployer, bridge_domain:$domain,
-    validators:$vals, threshold:$th, chains:$chains, swap:$swap, swap_pools:$pools,
+    validators:$vals, threshold:$th, bridge_decimals:$bdec, chains:$chains, swap:$swap, swap_pools:$pools,
     solana:$solana, governance_calls:$gov}' > "$OUT_FILE"
 
 # --- patch the runtime config ----------------------------------------------
@@ -904,12 +982,15 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
         | if $x == null then $c else
             $c + { gate: $x.gate,
                    start_block: $x.deploy_block,
-                   tokens: ($x.tokens | to_entries | map({symbol: .key, address: .value})) }
+                   tokens: ($x.tokens | to_entries
+                            | map({symbol: .key, address: .value,
+                                   bridge_decimals: ($dep.bridge_decimals[.key] // null)})) }
           end ]
     | if $dep.solana != null
       then .solana = ((.solana // {}) + { enabled: true, chain_id: $dep.solana.chain_id,
                                           rpc: $dep.solana.rpc, program_id: $dep.solana.program_id })
-         | .solana.tokens = [ $dep.solana.assets[] | {symbol, mint} ]
+         | .solana.tokens = [ $dep.solana.assets[]
+                              | {symbol, mint, bridge_decimals: ($dep.bridge_decimals[.symbol] // null)} ]
          # The Solana pool is served through the same `graphql.swaps` list as the
          # EVM ones; the API tells the two apart by the address form (base58 vs
          # 0x), so nothing else in the config has to say which VM it is.
