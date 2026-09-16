@@ -3,20 +3,24 @@ import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowRight, Glyph, Help } from "./icons";
 import { chainViz, formatUnits, formatUnitsRaw, isAddress, isSolanaAccount, parseUnits, shortHex, receiverProblem } from "../data/format";
-import { fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
+import { fetchSolanaGateContext, fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
 import { useDebounced, usePoll } from "../api/hooks";
+import { debridgeId } from "../wallet/keccak";
 import {
   U64_MAX,
+  bridgeDecimalsFromUnit,
   encodeAutoParamsTo,
   encodeSwapIntent,
   errMsg,
   extractSent,
   readAllowance,
   readBalance,
+  readBridgeDecimalsFor,
   readBridgeUnit,
   readDecimals,
   readRemoteRouter,
   readRouterGate,
+  rpcRequest,
   sendApprove,
   sendBridge,
   sendFinalize,
@@ -179,6 +183,17 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // because amounts cross the bridge in the asset's bridge decimals. `null` =
   // unknown, or the gate has no bridge decimals for this token at all.
   const [bridgeUnit, setBridgeUnit] = useState<bigint | null>(null);
+  // H-2: the scale the DESTINATION gate would pay this asset out in. The
+  // submissionId does not commit to it — the source gate divides by ITS
+  // registered scale and the destination multiplies by ITS OWN — so two gates
+  // that disagree by one digit mis-pay every claim of the asset by a power of
+  // ten, permissionlessly and uncorrectably (both registrations are write-once).
+  // Nothing on-chain or in the attestation core can detect it, so the browser
+  // reads both ends and refuses to build a transfer they disagree about.
+  // `null` = UNKNOWN, which blocks the send exactly like a mismatch does: this
+  // is a fund-safety check, not a convenience.
+  const [destBridgeDecimals, setDestBridgeDecimals] = useState<number | null>(null);
+  const [destReadFor, setDestReadFor] = useState<string | null>(null);
 
   // --- cross-chain swap ("swap on arrival") — merged into the same flow -----
   const [crossSwap, setCrossSwap] = useState(false);
@@ -319,6 +334,59 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     refreshOnchain();
   }, [refreshOnchain]);
 
+  // H-2: which (source chain, token, destination gate) the destination scale was
+  // read for. Same discipline as `readFor` above, and for the same reason: this
+  // read is slower than typing, so a result that lands after the user has picked
+  // another token or destination must not be attributed to the new pair — that
+  // would be a mismatch check passing on numbers from a different corridor.
+  const destScaleKey = `${fromChainId ?? "?"}:${token.toLowerCase()}:${toChainId ?? "?"}:${(
+    toReg?.gate ?? ""
+  ).toLowerCase()}`;
+  const destScaleStale = destReadFor !== destScaleKey;
+
+  useEffect(() => {
+    let alive = true;
+    // Invalidate first: until the read lands we know nothing about the far end,
+    // and "nothing" must not be allowed to look like agreement.
+    setDestReadFor(null);
+    setDestBridgeDecimals(null);
+    if (!tokenOk || fromChainId == null || toChainId == null || !toReg) return;
+
+    const read = async (): Promise<number | null> => {
+      // EVM -> Solana: the destination gate is a Solana program, not an EVM
+      // contract, so it cannot be eth_called. The API resolves the asset on that
+      // gate and reports its registered scale (graphql-api `solanaGateContext`).
+      // Resolution there is by SYMBOL, so a token the registry doesn't list has
+      // no way to be identified — UNKNOWN, which fails closed.
+      if (isNonEvmChain(toReg)) {
+        const symbol = fromReg?.tokens?.find((t) => eqAddr(t.address, token))?.symbol;
+        if (!symbol) return null;
+        const ctx = await fetchSolanaGateContext(toReg.chainId, symbol, fromChainId).catch(() => null);
+        return ctx ? ctx.bridgeDecimals : null;
+      }
+      // EVM -> EVM: ask the destination gate itself. It has to go through the
+      // registry's RPC, not the wallet — the wallet is connected to the SOURCE
+      // chain, where that address is a different contract or none at all.
+      if (!toReg.gate || !toReg.rpcUrl) return null;
+      return readBridgeDecimalsFor(
+        rpcRequest(toReg.rpcUrl),
+        toReg.gate,
+        debridgeId(BigInt(fromChainId), token)
+      );
+    };
+
+    read()
+      .catch(() => null) // a throw is UNKNOWN, not "fine" — the button refuses on null
+      .then((d) => {
+        if (!alive) return;
+        setDestBridgeDecimals(d);
+        setDestReadFor(destScaleKey);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [destScaleKey, tokenOk, token, fromChainId, toChainId, toReg, fromReg]);
+
   // Only meaningful once the reads match the selected token (see `onchainStale`).
   const amountBase = tokenOk && !onchainStale ? parseUnits(amount, decimals) : 0n;
   const needsApprove = allowance != null && amountBase > 0n && spenderOk && allowance < amountBase;
@@ -331,8 +399,21 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   const amountTooWide = solanaReceiver && (bridgeUnit ? amountBase / bridgeUnit : amountBase) > U64_MAX;
   // Direct sends must be whole bridge units; the gate reverts anything finer.
   // (Swap-and-bridge rounds the pool output itself and returns the dust.)
-  const bridgeDecimalsOfToken = bridgeUnit != null ? decimals - (bridgeUnit.toString().length - 1) : null;
+  const bridgeDecimalsOfToken = bridgeUnit != null ? bridgeDecimalsFromUnit(decimals, bridgeUnit) : null;
   const inexact = !crossSwap && bridgeUnit != null && amountBase > 0n && amountBase % bridgeUnit !== 0n;
+  // H-2: the two ends must agree on the scale, or every claim of this asset is
+  // off by a power of ten. Direct sends only — "swap on arrival" bridges the
+  // POOL'S STABLE, not `token`, so the source read above does not describe the
+  // asset that actually crosses (the same reason `inexact` skips that mode).
+  const scaleKnown = !crossSwap && !destScaleStale && !onchainStale && destBridgeDecimals != null && bridgeDecimalsOfToken != null;
+  const scaleMismatch = scaleKnown && destBridgeDecimals !== bridgeDecimalsOfToken;
+  // Which way it would go wrong, for the warning: the destination multiplies by
+  // 10^(localDecimals - ITS bridgeDecimals), so a destination registered one
+  // digit SHORT of the source pays out ten times too much.
+  const scaleSkew =
+    scaleMismatch && bridgeDecimalsOfToken != null && destBridgeDecimals != null
+      ? bridgeDecimalsOfToken - destBridgeDecimals
+      : 0;
   const maxSendable = balance != null && bridgeUnit != null && !crossSwap ? balance - (balance % bridgeUnit) : balance;
   const busy = tx.kind === "pending";
 
@@ -624,6 +705,14 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
   else if (!crossSwap && bridgeUnit == null)
     button = { label: "This token isn't bridgeable through this Gate", disabled: true };
+  // H-2, and it fails closed: an unread or unreadable destination scale blocks
+  // the send just as a mismatch does. A transfer signed against a scale nobody
+  // checked is the whole finding.
+  else if (!crossSwap && destScaleStale) button = { label: "Checking destination decimals…", disabled: true };
+  else if (!crossSwap && destBridgeDecimals == null)
+    button = { label: `Can't confirm how ${toName} scales this asset`, disabled: true };
+  else if (scaleMismatch)
+    button = { label: "Bridge decimals mismatch — refusing to send", disabled: true };
   else if (inexact)
     button = { label: `Too precise — this asset bridges at most ${bridgeDecimalsOfToken} decimals`, disabled: true };
   else if (amountTooWide) button = { label: "Amount too large for a Solana receiver", disabled: true };
@@ -882,6 +971,22 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
           complete finalize(), which would make these checks re-evaluate against
           a stale/nonsensical pairing (e.g. "corridor from the destination back
           to itself"). Hide them until the flow returns to idle. */}
+      {/* H-2: say what disagrees, and that it cannot be fixed after the fact —
+          a user who only sees a disabled button will try another wallet. */}
+      {stage === "idle" && scaleMismatch && (
+        <div className="notice notice--warn" data-testid="bridge-decimals-mismatch">
+          {fromName} bridges this asset at {bridgeDecimalsOfToken} decimals, but {toName}'s Gate is registered at{" "}
+          {destBridgeDecimals}. The transfer id does not commit to that scale, so a claim on {toName} would pay out{" "}
+          10<sup>{Math.abs(scaleSkew)}</sup> times too {scaleSkew > 0 ? "much" : "little"} and nothing on-chain would
+          catch it. Both registrations are write-once — report this to the operator instead of sending.
+        </div>
+      )}
+      {stage === "idle" && !crossSwap && !destScaleStale && destBridgeDecimals == null && bridgeUnit != null && (
+        <div className="notice notice--warn" data-testid="bridge-decimals-unknown">
+          Couldn't read the bridge decimals {toName}'s Gate has registered for this asset, so there is no way to tell
+          whether it would pay out the right amount. Refusing to send is deliberate.
+        </div>
+      )}
       {stage === "idle" && crossSwap && destExceedsLock && finalTokenInfo && (
         <div className="notice notice--warn">
           Output ({formatUnits(finalQuoteBase, finalTokenInfo.decimals)} {finalTokenInfo.symbol}) exceeds the

@@ -15,6 +15,7 @@ mod api;
 mod config;
 mod provider;
 mod refund;
+mod scale;
 mod state;
 
 use std::collections::BTreeMap;
@@ -112,11 +113,33 @@ async fn main() -> anyhow::Result<()> {
         info!("no [refund] block — this validator will not attest cancels or refunds");
     }
 
+    // H-2: every scan loop needs to read the peer gates to confirm they agree on
+    // an asset's scale before signing. Resolved once here so a misconfiguration
+    // is a startup error rather than a per-transfer surprise.
+    let scale_peers: Vec<(u64, String, Vec<String>)> = cfg
+        .scale_destinations()
+        .iter()
+        .map(|d| Ok((d.chain_id, d.gate.clone(), d.endpoints()?)))
+        .collect::<anyhow::Result<_>>()?;
+    if scale_peers.is_empty() {
+        warn!(
+            "no [[destinations]] (and no [refund.destinations]) — this validator cannot \
+             verify that a peer gate agrees on an asset's bridge decimals, so it will \
+             sign NOTHING. Add each peer's chain_id/gate/rpcs (audit 2026-09-16, H-2)."
+        );
+    } else {
+        info!(peers = ?scale_peers.iter().map(|(c, _, _)| *c).collect::<Vec<_>>(),
+              "bridge-decimals cross-check active for these destination chains");
+    }
+
     for source in cfg.sources {
         let signer = signer.clone();
         let sink = sink.clone();
         let runtime = runtimes.get(&source.chain_id).unwrap().clone();
-        tasks.spawn(async move { scan_source(source, signer, signer_addr, sink, runtime).await });
+        let peers = scale_peers.clone();
+        tasks.spawn(async move {
+            scan_source(source, signer, signer_addr, sink, runtime, peers).await
+        });
     }
 
     // Isolate a dead source loop so one bad chain can't stop the validator from
@@ -139,6 +162,7 @@ async fn scan_source(
     signer_addr: Address,
     sink: Arc<StoreBackend>,
     runtime: Arc<Mutex<Runtime>>,
+    scale_peers: Vec<(u64, String, Vec<String>)>,
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
@@ -161,6 +185,37 @@ async fn scan_source(
             }
         }
     };
+
+    // H-2: connect the peer gates this loop will cross-check against. Same retry
+    // posture as the source connection — a peer that is momentarily down must not
+    // kill the loop, and `connect_checked` verifies the chain id so a
+    // wrong-chain endpoint cannot answer for a peer it is not.
+    let scale_guard = {
+        let mut dests = Vec::new();
+        for (chain_id, gate_str, urls) in &scale_peers {
+            let gate_addr: Address = gate_str
+                .parse()
+                .with_context(|| format!("bad gate address for destination {chain_id}"))?;
+            let provider = loop {
+                match provider::connect_checked(urls, *chain_id).await {
+                    Ok(p) => break p,
+                    Err(e) => {
+                        warn!(chain_id, error = %e,
+                              "connecting destination RPC for the bridge-decimals check failed; retrying");
+                        tokio::time::sleep(retry).await;
+                    }
+                }
+            };
+            dests.push(scale::Destination { chain_id: *chain_id, gate: gate_addr, provider });
+        }
+        scale::ScaleGuard::new(dests)
+    };
+    if scale_guard.is_empty() {
+        warn!(
+            chain_id = source.chain_id,
+            "no verifiable destinations: this source will withhold every signature (H-2)"
+        );
+    }
 
     // The deployment generation, read FROM THE GATE rather than from config.
     //
@@ -335,8 +390,19 @@ async fn scan_source(
             let mut paused = false;
             let mut batch_failed = false;
             for log in &logs {
-                match handle_log(&signer, signer_addr, &sink, &runtime, log, allowlist.as_ref(), bridge_domain)
-                    .await
+                match handle_log(
+                    &signer,
+                    signer_addr,
+                    &sink,
+                    &runtime,
+                    log,
+                    allowlist.as_ref(),
+                    bridge_domain,
+                    &scale_guard,
+                    &failover.active_provider(),
+                    gate,
+                )
+                .await
                 {
                     Ok(true) => {} // processed
                     Ok(false) => {
@@ -404,6 +470,9 @@ async fn handle_log(
     log: &alloy::rpc::types::Log,
     allowlist: Option<&Allowlist>,
     bridge_domain: B256,
+    scale: &scale::ScaleGuard,
+    source_provider: &alloy::providers::DynProvider,
+    source_gate: Address,
 ) -> anyhow::Result<bool> {
     let decoded = Gate::Sent::decode_log(&log.inner).context("decode Sent")?;
     let ev = &decoded.data;
@@ -478,6 +547,44 @@ async fn handle_log(
                 chain_from,
                 chain_to,
                 "BLOCKED by allowlist — withholding signature (nonce advanced)"
+            );
+            runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
+            return Ok(true);
+        }
+    }
+
+    // H-2: the submissionId does not commit to the scale the amount is in, so a
+    // destination registered one digit off pays a power of ten wrong on an
+    // ORDINARY transfer. `claim` is permissionless, so withholding the signature
+    // is the only thing that still stops it — see `scale`. Fails CLOSED: an
+    // unverifiable far end is exactly the dangerous case. The nonce is consumed
+    // either way (the transfer really happened), so the sequence stays intact.
+    match scale.verdict(source_provider, source_gate, ev.token, chain_to, ev.debridgeId).await {
+        scale::Verdict::Agree(_) => {}
+        scale::Verdict::Mismatch { source, destination } => {
+            warn!(
+                submission_id = %emitted_id,
+                debridge_id = %ev.debridgeId,
+                chain_from,
+                chain_to,
+                source_bridge_decimals = source,
+                destination_bridge_decimals = destination,
+                "BRIDGE DECIMALS MISMATCH — the two gates disagree about this asset's \
+                 scale, so a claim would pay out a power of ten wrong. Withholding \
+                 signature (nonce advanced). Both registrations are write-once: fixing \
+                 this needs a gate upgrade or a new mesh generation."
+            );
+            runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
+            return Ok(true);
+        }
+        scale::Verdict::Unknown(why) => {
+            warn!(
+                submission_id = %emitted_id,
+                debridge_id = %ev.debridgeId,
+                chain_to,
+                reason = why,
+                "cannot verify the destination's bridge decimals — withholding signature \
+                 (nonce advanced)"
             );
             runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
             return Ok(true);

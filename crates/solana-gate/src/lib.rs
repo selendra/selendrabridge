@@ -489,6 +489,39 @@ pub struct AssetConfig {
 /// Borsh size of an [`AssetConfig`]: 32 * 3 + 1 + 1.
 const ASSET_CONFIG_LEN: usize = 32 * 3 + 2;
 
+/// The pre-decimals body: `debridge_id + mint + vault`, no decimals fields.
+const LEGACY_ASSET_CONFIG_LEN: usize = 32 * 3;
+
+/// Spare bytes allocated beyond [`ASSET_CONFIG_LEN`] (audit 2026-09-16, M-3).
+///
+/// The decimals fields grew the body from 96 to 98 bytes inside an account that
+/// had been allocated `1 + 32*3 = 97`, so on an in-place program upgrade every
+/// asset registered by the old program became undecodable — `send`, `claim` AND
+/// `refund` all dead, with the vault unreachable and no `realloc` anywhere to
+/// repair it. Slack here means the NEXT field costs nothing; `decode_asset_config`
+/// handles the accounts already out there.
+const ASSET_CONFIG_SLACK: usize = 32;
+
+/// Decode an `["asset", id]` body, accepting the pre-decimals layout.
+///
+/// A legacy record decodes with both decimals `0`, and `bridge_unit(0, 0) == 1`
+/// — which is exactly the semantics those transfers were created under, when no
+/// conversion existed. So this is correct, not merely safe.
+///
+/// Borsh's `deserialize` (unlike `try_from_slice`) ignores trailing bytes, so an
+/// account with slack reads fine.
+fn decode_asset_config(data: &[u8]) -> Result<AssetConfig, ProgramError> {
+    if data.len() == LEGACY_ASSET_CONFIG_LEN || data.len() == LEGACY_ASSET_CONFIG_LEN + 1 {
+        let mut cur = &data[..LEGACY_ASSET_CONFIG_LEN];
+        let debridge_id = <[u8; 32]>::deserialize(&mut cur)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let mint = Pubkey::deserialize(&mut cur).map_err(|_| ProgramError::InvalidAccountData)?;
+        let vault = Pubkey::deserialize(&mut cur).map_err(|_| ProgramError::InvalidAccountData)?;
+        return Ok(AssetConfig { debridge_id, mint, vault, bridge_decimals: 0, local_decimals: 0 });
+    }
+    AssetConfig::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)
+}
+
 /// `10^(local - bridge)`: the smallest local amount that crosses the bridge.
 /// `None` when the pair is invalid (bridge above local, or a scale past u64).
 fn bridge_unit(local_decimals: u8, bridge_decimals: u8) -> Option<u64> {
@@ -604,8 +637,7 @@ fn load_asset(
     asset_ai: &AccountInfo,
 ) -> Result<AssetConfig, ProgramError> {
     verify_asset_account(asset_ai.key, asset_ai.owner, debridge_id, program_id)?;
-    let asset = AssetConfig::deserialize(&mut &asset_ai.data.borrow()[..])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let asset = decode_asset_config(&asset_ai.data.borrow())?;
     if &asset.debridge_id != debridge_id {
         // A bound-but-mismatched record can only mean seed confusion; reject.
         return Err(ProgramError::InvalidSeeds);
@@ -2091,7 +2123,7 @@ fn process_register_asset(
         bridge_decimals,
         local_decimals: mint_state.decimals,
     };
-    let space: usize = ASSET_CONFIG_LEN;
+    let space: usize = ASSET_CONFIG_LEN + ASSET_CONFIG_SLACK;
     if asset_ai.data_is_empty() {
         // M-5 (round 4): a `debridge_id` is public in advance, so an attacker
         // could pre-fund every plausible asset PDA and `create_account` would
@@ -2122,8 +2154,7 @@ fn process_register_asset(
         // Registering a NEW corridor stays an ordinary owner action; changing a
         // live one must not exist. Route a different asset through a fresh
         // debridge_id instead.
-        let existing = AssetConfig::deserialize(&mut &asset_ai.data.borrow()[..])
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let existing = decode_asset_config(&asset_ai.data.borrow())?;
         if !asset_write_allowed(&existing, &record)? {
             msg!("asset already registered with these exact values; no-op");
             return Ok(());
@@ -2859,6 +2890,58 @@ mod c1_tests {
         assert_ne!(add_validator_action_id(&[0u8; 20]), lower_threshold_action_id(0));
         // Deterministic, so off-chain tooling can derive the same id.
         assert_eq!(a, add_validator_action_id(&[0xAA; 20]));
+    }
+
+    /// Audit 2026-09-16, M-3. An `["asset", id]` record written by the
+    /// pre-decimals program is 96 bytes in a 97-byte account. Growing the struct
+    /// to 98 made every one of them undecodable, which killed `send`, `claim` AND
+    /// `refund` for that asset on an in-place upgrade — the vault unreachable,
+    /// with no `realloc` to repair it.
+    ///
+    /// The legacy body decodes with both decimals `0`, and `bridge_unit(0,0) == 1`
+    /// — the exact semantics those transfers were made under.
+    #[test]
+    fn a_legacy_asset_record_decodes_at_an_identity_scale() {
+        let asset = AssetConfig {
+            debridge_id: [7; 32],
+            mint: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            bridge_decimals: 6,
+            local_decimals: 9,
+        };
+        let full = borsh::to_vec(&asset).unwrap();
+        assert_eq!(full.len(), ASSET_CONFIG_LEN);
+
+        // Exactly what the old program wrote, and the same body in its 97-byte
+        // account (borsh left the trailing byte untouched).
+        for legacy in [&full[..LEGACY_ASSET_CONFIG_LEN], &full[..LEGACY_ASSET_CONFIG_LEN + 1]] {
+            let decoded = decode_asset_config(legacy).expect("legacy layout decodes");
+            assert_eq!(decoded.debridge_id, asset.debridge_id);
+            assert_eq!(decoded.mint, asset.mint);
+            assert_eq!(decoded.vault, asset.vault);
+            assert_eq!(decoded.unit().unwrap(), 1, "legacy assets bridged 1:1");
+        }
+
+        // The current layout still decodes, and so does one with rent slack.
+        let mut padded = full.clone();
+        padded.extend_from_slice(&[0u8; ASSET_CONFIG_SLACK]);
+        for body in [full.as_slice(), padded.as_slice()] {
+            let decoded = decode_asset_config(body).expect("current layout decodes");
+            assert_eq!(decoded.mint, asset.mint);
+            assert_eq!(decoded.vault, asset.vault);
+            assert_eq!(decoded.bridge_decimals, 6);
+            assert_eq!(decoded.local_decimals, 9);
+            assert_eq!(decoded.unit().unwrap(), 1_000);
+        }
+    }
+
+    /// New accounts carry slack, so the next field added costs no migration.
+    #[test]
+    fn a_fresh_asset_account_is_allocated_with_slack() {
+        assert!(
+            ASSET_CONFIG_LEN + ASSET_CONFIG_SLACK > ASSET_CONFIG_LEN,
+            "an exactly-sized account is what caused M-3"
+        );
     }
 
     /// A `["sent", id]` record written before `locked_at` existed must still

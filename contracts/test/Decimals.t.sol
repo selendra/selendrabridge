@@ -267,6 +267,80 @@ contract DecimalsTest is Test {
         gate18.setBridgeDecimals(address(t), 6);
         assertEq(gate18.bridgeUnit(address(t)), 1e12);
     }
+
+    // ------------------------------------------------------------------
+    // H-2 (audit 2026-09-16): the scale is not in the submissionId
+    // ------------------------------------------------------------------
+
+    /// `bridgeDecimalsFor` answers "what scale would THIS gate pay `debridgeId`
+    /// out at", in one call, from the id off-chain actually holds. Validators
+    /// compare the two ends with it and refuse to sign a mismatch — the only
+    /// place it can still be stopped, because `claim` is permissionless.
+    function test_BridgeDecimalsFor_ResolvesThroughTheCorridor() public view {
+        bytes32 did = BridgeHash.getDebridgeId(CHAIN_18, address(tst18));
+        (bool set, uint8 bd, uint8 ld, address local) = gate6.bridgeDecimalsFor(did);
+        assertTrue(set);
+        assertEq(bd, BRIDGE_DEC);
+        assertEq(ld, 6, "the payout token's own decimals");
+        assertEq(local, address(tst6));
+
+        // Same asset, the 9-decimal chain: same wire scale, different local one.
+        (, uint8 bd9, uint8 ld9, address local9) = gate9.bridgeDecimalsFor(did);
+        assertEq(bd9, BRIDGE_DEC, "the mesh agrees on the wire scale");
+        assertEq(ld9, 9);
+        assertEq(local9, address(tst9));
+    }
+
+    /// It must not revert on an unregistered corridor: a caller has to tell "no
+    /// corridor here" apart from "corridor at scale 0", and a reverting probe
+    /// would make a validator's check fail for the wrong reason.
+    function test_BridgeDecimalsFor_UnknownCorridorIsNotARevert() public view {
+        (bool set, uint8 bd, uint8 ld, address local) =
+            gate6.bridgeDecimalsFor(keccak256("no such corridor"));
+        assertFalse(set);
+        assertEq(bd, 0);
+        assertEq(ld, 0);
+        assertEq(local, address(0));
+    }
+
+    /// THE FINDING ITSELF. A destination registered one digit off pays a power of
+    /// ten too much on an ORDINARY user's transfer — no attacker input anywhere,
+    /// and the submissionId is byte-identical either way, which is exactly why
+    /// nothing on-chain catches it.
+    function test_AMisregisteredDestinationOverpaysByAPowerOfTen() public {
+        uint256 badChain = CHAIN_9 + 1;
+        address[] memory vals = new address[](1);
+        vals[0] = vm.addr(v1pk);
+
+        vm.chainId(badChain);
+        Gate bad = deployTestGate(vals, 1);
+        DecToken tstBad = new DecToken("TST", 9);
+        bad.setBridgeDecimals(address(tstBad), 3); // <-- the typo; the mesh uses 6
+        bytes32 did = BridgeHash.getDebridgeId(CHAIN_18, address(tst18));
+        bad.setLocalToken(did, address(tstBad));
+        tstBad.mint(address(bad), 1_000_000e9);
+
+        vm.chainId(CHAIN_18);
+        gate18.setSupportedChain(badChain, true);
+        bytes32 id = _send18(1e18, badChain); // the user sends exactly 1 TST
+
+        vm.chainId(badChain);
+        bad.claim(did, 1_000_000, CHAIN_18, 0, receiver, "", "", _sign(id));
+
+        // 1 TST locked, 1,000 TST released. Each gate behaved exactly as
+        // configured — only the two ends DISAGREEING is wrong, and neither can
+        // see the other.
+        assertEq(tstBad.balanceOf(receiverAddr), 1_000e9, "overpaid by 10^3");
+
+        // The discrepancy is visible in one call from each side, which is what
+        // the off-chain refusal is built on.
+        (, uint8 srcBd,,) = gate6.bridgeDecimalsFor(did); // a correctly wired peer
+        (, uint8 dstBd,,) = bad.bridgeDecimalsFor(did);
+        assertEq(srcBd, BRIDGE_DEC);
+        assertEq(dstBd, 3);
+        assertTrue(srcBd != dstBd, "a validator comparing these refuses to sign");
+    }
+
 }
 
 /// @notice The cross-chain swap carries a pool output, which almost never lands

@@ -23,6 +23,20 @@ use crate::allow::Allowlist;
 use crate::remote::RemoteStore;
 use crate::store::{self, SigKind, SignerSig, SubmissionRecord};
 
+/// Page size for walking [`StoreBackend::refund_candidates`].
+///
+/// Small enough that one page stays far inside `RemoteStore`'s response cap even
+/// if every row carries the maximum signature set, so a refund loop can always
+/// make progress no matter how large the queue has grown.
+pub const REFUND_PAGE: u64 = 500;
+
+/// Stop walking after this many pages in one tick.
+///
+/// A queue longer than `REFUND_PAGE * MAX_REFUND_PAGES` is a symptom, not a
+/// workload: the loop covers what it can this tick and resumes next tick rather
+/// than spending unbounded time and RPC budget before its first attestation.
+pub const MAX_REFUND_PAGES: u64 = 20;
+
 pub enum StoreBackend {
     /// File-per-id directory. The lock serializes the read-modify-write inside
     /// `store::upsert_signature`, so two concurrent upserts for one id cannot
@@ -143,14 +157,33 @@ impl StoreBackend {
         }
     }
 
-    /// Submissions a refund loop should examine.
+    /// One page of the submissions a refund loop should examine.
     ///
     /// In file mode there is no server-side lifecycle, so every stored record is
-    /// offered and the caller's own on-chain checks do all the filtering.
-    pub async fn refund_candidates(&self) -> anyhow::Result<Vec<SubmissionRecord>> {
+    /// offered and the caller's own on-chain checks do all the filtering; the
+    /// page is applied client-side so both modes present the same interface.
+    ///
+    /// Callers must WALK the pages (see [`REFUND_PAGE`]): the queue is unbounded
+    /// and served by a component the design treats as untrusted, so a single
+    /// unpaged fetch can be made to exceed the response cap forever (audit
+    /// 2026-09-16, H-6).
+    pub async fn refund_candidates(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<Vec<SubmissionRecord>> {
         match self {
-            StoreBackend::File { dir, .. } => Ok(store::load_all(dir)?),
-            StoreBackend::Remote(remote) => Ok(remote.refund_candidates().await?),
+            StoreBackend::File { dir, .. } => {
+                let all = store::load_all(dir)?;
+                Ok(all
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect())
+            }
+            StoreBackend::Remote(remote) => {
+                Ok(remote.refund_candidates(limit, offset).await?)
+            }
         }
     }
 

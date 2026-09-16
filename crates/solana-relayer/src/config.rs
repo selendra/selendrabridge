@@ -26,6 +26,30 @@ pub struct Config {
     /// reports are authoritative, so it must never run on some other credential.
     #[serde(default)]
     pub observer: ObserverConfig,
+    /// EVM peer gates the SCANNER cross-checks before signing, for the H-2
+    /// bridge-decimals agreement (audit 2026-09-16).
+    ///
+    /// Separate from `[refund]` on purpose: an operator may legitimately run a
+    /// relayer that signs but never attests refunds, and that relayer still must
+    /// not sign a transfer whose destination disagrees about the asset's scale.
+    /// Left empty, it falls back to `refund.evm`, which is the same shape — so a
+    /// deployment that already attests refunds gets the check for free.
+    #[serde(default)]
+    pub evm_destinations: Vec<EvmReader>,
+}
+
+impl Config {
+    /// EVM gates usable for the H-2 scale check: the dedicated list when given,
+    /// else the refund attester's readers.
+    pub fn scale_readers(&self) -> &[EvmReader] {
+        if !self.evm_destinations.is_empty() {
+            return &self.evm_destinations;
+        }
+        match self.refund.as_ref() {
+            Some(r) => &r.evm,
+            None => &[],
+        }
+    }
 }
 
 /// Tuning for the observer loop that reports Solana terminal markers to the

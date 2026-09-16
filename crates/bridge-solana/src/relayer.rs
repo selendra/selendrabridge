@@ -316,6 +316,8 @@ pub enum SentRecordError {
     Retired,
     #[error("record disagrees with the event on {field}")]
     Mismatch { field: &'static str },
+    #[error("bridge unit must be non-zero; the asset's decimals are unusable")]
+    BadBridgeUnit,
 }
 
 /// Decode a `["sent", submissionId]` account and check it corroborates `event`.
@@ -327,10 +329,23 @@ pub enum SentRecordError {
 ///
 /// `owner_is_program` and `data` come from a plain `getAccountInfo` on the PDA the
 /// caller derived; keeping the I/O out makes the rule testable.
+///
+/// DECIMALS. The record and the event express the amount in DIFFERENT units:
+/// `process_send` writes the LOCAL (mint-decimals) amount into the record — it is
+/// what `refund` pays back — and emits the WIRE (bridge-decimals) amount, which is
+/// what the submissionId hashes and what every other chain sees. So they are
+/// compared through the asset's `bridge_unit` (`10^(local-bridge)`, from the
+/// `["asset", debridge_id]` account); they are equal only for an asset whose mint
+/// already sits at its bridge decimals. Comparing them directly rejected every
+/// decimals-normalised transfer as a forgery.
 pub fn verify_sent_record(
     account: Option<(bool, &[u8])>,
     event: &SentEvent,
+    bridge_unit: u64,
 ) -> Result<SentRecord, SentRecordError> {
+    if bridge_unit == 0 {
+        return Err(SentRecordError::BadBridgeUnit);
+    }
     let Some((owner_is_program, data)) = account else {
         return Err(SentRecordError::Missing);
     };
@@ -356,7 +371,14 @@ pub fn verify_sent_record(
     if record.debridge_id != event.debridge_id {
         return Err(SentRecordError::Mismatch { field: "debridge_id" });
     }
-    if record.amount != event.amount {
+    // wire -> local. An overflow here cannot describe a genuine record (the
+    // program derived the wire amount by dividing a u64 local amount by the same
+    // unit), so it is a mismatch, not an error.
+    let expected_local = event
+        .amount
+        .checked_mul(bridge_unit)
+        .ok_or(SentRecordError::Mismatch { field: "amount" })?;
+    if record.amount != expected_local {
         return Err(SentRecordError::Mismatch { field: "amount" });
     }
     if record.mint != event.mint {
@@ -703,7 +725,16 @@ mod tests {
     // The ["sent", id] origin proof — the authoritative anti-forgery check
     // -----------------------------------------------------------------
 
+    /// An event and the record the program would have written beside it, for an
+    /// asset whose mint already sits at its bridge decimals (`bridge_unit == 1`),
+    /// so the two amounts coincide.
     fn event_and_record() -> (SentEvent, SentRecord) {
+        event_and_record_at_unit(1)
+    }
+
+    /// The same pair for an asset that IS decimals-normalised: the record carries
+    /// the local amount, the event the wire amount, and they differ by `unit`.
+    fn event_and_record_at_unit(unit: u64) -> (SentEvent, SentRecord) {
         let mint = [0x55u8; 32];
         let event = SentEvent::from_sent(&sample_sent(None), mint);
         let record = SentRecord {
@@ -711,7 +742,7 @@ mod tests {
             sender: [0x77; 32],
             source_token: [0x88; 32],
             mint,
-            amount: event.amount,
+            amount: event.amount * unit,
             locked_at: 1_700_000_000,
         };
         (event, record)
@@ -722,7 +753,64 @@ mod tests {
         let (event, record) = event_and_record();
         let data = borsh::to_vec(&record).unwrap();
         assert_eq!(data.len(), SENT_RECORD_LEN, "layout must match the program's");
-        assert_eq!(verify_sent_record(Some((true, &data)), &event).unwrap(), record);
+        assert_eq!(verify_sent_record(Some((true, &data)), &event, 1).unwrap(), record);
+    }
+
+    /// Round 5, H-1. `process_send` stores the LOCAL amount in the record and
+    /// emits the WIRE amount, so for any asset whose mint decimals exceed its
+    /// bridge decimals the two differ by `bridge_unit`. Comparing them directly
+    /// rejected every such transfer as a forgery — and because the scanner then
+    /// advanced its cursor without writing a store row, the funds were left locked
+    /// in the vault with no refund candidate and no automated recovery.
+    ///
+    /// The codebase's own documented case: a 9-decimal mint bridged at 6.
+    #[test]
+    fn a_decimals_normalised_record_corroborates_its_event() {
+        const UNIT: u64 = 1_000; // 10^(9-6)
+        let (event, record) = event_and_record_at_unit(UNIT);
+        let data = borsh::to_vec(&record).unwrap();
+        assert_ne!(
+            record.amount, event.amount,
+            "fixture must exercise a real scale, else it cannot catch the bug"
+        );
+        assert_eq!(verify_sent_record(Some((true, &data)), &event, UNIT).unwrap(), record);
+    }
+
+    /// The same record read with the WRONG scale is still a mismatch: the check
+    /// must bind the amount, not merely rescale until something fits.
+    #[test]
+    fn the_wrong_bridge_unit_does_not_corroborate() {
+        let (event, record) = event_and_record_at_unit(1_000);
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &event, 100),
+            Err(SentRecordError::Mismatch { field: "amount" })
+        );
+    }
+
+    /// A wire amount that overflows u64 when scaled cannot describe a record the
+    /// program wrote (it derived the wire amount by dividing a u64 by the same
+    /// unit), so it is a mismatch rather than a panic.
+    #[test]
+    fn an_overflowing_scale_is_a_mismatch_not_a_panic() {
+        let (mut event, record) = event_and_record_at_unit(1);
+        event.amount = u64::MAX;
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &event, 1_000),
+            Err(SentRecordError::Mismatch { field: "amount" })
+        );
+    }
+
+    /// A zero unit would make every amount compare equal to zero; refuse it.
+    #[test]
+    fn a_zero_bridge_unit_is_refused() {
+        let (event, record) = event_and_record();
+        let data = borsh::to_vec(&record).unwrap();
+        assert_eq!(
+            verify_sent_record(Some((true, &data)), &event, 0),
+            Err(SentRecordError::BadBridgeUnit)
+        );
     }
 
     /// The forged-event case: an attacker's log names a real corridor and a huge
@@ -731,9 +819,9 @@ mod tests {
     #[test]
     fn a_forged_event_has_no_origin_proof() {
         let (event, _) = event_and_record();
-        assert_eq!(verify_sent_record(None, &event), Err(SentRecordError::Missing));
+        assert_eq!(verify_sent_record(None, &event, 1), Err(SentRecordError::Missing));
         assert_eq!(
-            verify_sent_record(Some((true, &[])), &event),
+            verify_sent_record(Some((true, &[])), &event, 1),
             Err(SentRecordError::Missing)
         );
     }
@@ -745,7 +833,7 @@ mod tests {
         let (event, record) = event_and_record();
         let data = borsh::to_vec(&record).unwrap();
         assert_eq!(
-            verify_sent_record(Some((false, &data)), &event),
+            verify_sent_record(Some((false, &data)), &event, 1),
             Err(SentRecordError::NotProgramOwned)
         );
     }
@@ -758,7 +846,7 @@ mod tests {
         event.amount = record.amount + 1_000_000;
         let data = borsh::to_vec(&record).unwrap();
         assert_eq!(
-            verify_sent_record(Some((true, &data)), &event),
+            verify_sent_record(Some((true, &data)), &event, 1),
             Err(SentRecordError::Mismatch { field: "amount" })
         );
     }
@@ -772,14 +860,14 @@ mod tests {
         let mut wrong_corridor = event.clone();
         wrong_corridor.debridge_id = [0xAB; 32];
         assert_eq!(
-            verify_sent_record(Some((true, &data)), &wrong_corridor),
+            verify_sent_record(Some((true, &data)), &wrong_corridor, 1),
             Err(SentRecordError::Mismatch { field: "debridge_id" })
         );
 
         let mut wrong_mint = event.clone();
         wrong_mint.mint = [0xCD; 32];
         assert_eq!(
-            verify_sent_record(Some((true, &data)), &wrong_mint),
+            verify_sent_record(Some((true, &data)), &wrong_mint, 1),
             Err(SentRecordError::Mismatch { field: "mint" })
         );
     }
@@ -793,7 +881,7 @@ mod tests {
         event.debridge_id = [0u8; 32];
         event.amount = 0;
         assert_eq!(
-            verify_sent_record(Some((true, &zeroed)), &event),
+            verify_sent_record(Some((true, &zeroed)), &event, 1),
             Err(SentRecordError::Retired)
         );
     }
@@ -805,7 +893,7 @@ mod tests {
         let (event, record) = event_and_record();
         let full = borsh::to_vec(&record).unwrap();
         let legacy = &full[..LEGACY_SENT_RECORD_LEN];
-        let got = verify_sent_record(Some((true, legacy)), &event).expect("legacy decodes");
+        let got = verify_sent_record(Some((true, legacy)), &event, 1).expect("legacy decodes");
         assert_eq!(got.amount, record.amount);
         assert_eq!(got.locked_at, 0);
         assert_eq!(decode_sent_record(&full).unwrap().locked_at, record.locked_at);
@@ -817,7 +905,7 @@ mod tests {
         let (event, _) = event_and_record();
         let short = vec![0u8; SENT_RECORD_LEN - 1];
         assert_eq!(
-            verify_sent_record(Some((true, &short)), &event),
+            verify_sent_record(Some((true, &short)), &event, 1),
             Err(SentRecordError::BadLength(SENT_RECORD_LEN - 1))
         );
     }

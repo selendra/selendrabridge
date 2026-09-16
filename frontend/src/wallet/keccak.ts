@@ -112,6 +112,27 @@ export function bytesToHex(b: Uint8Array): string {
   return "0x" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * The asset id: `keccak256(abi.encodePacked(nativeChainId, nativeToken))` —
+ * byte-identical to `BridgeHash.getDebridgeId` and `bridge_core::debridge_id`.
+ *
+ * `encodePacked`, not `encode`: a 32-byte chain id followed by the RAW 20-byte
+ * token, so the preimage is 52 bytes, not 64. A padded token would hash to an id
+ * no gate has ever registered.
+ *
+ * The id is derived from the asset's NATIVE (source) chain and token — the same
+ * id on both ends of a corridor, which is what makes it the right key to ask a
+ * destination gate what scale it will pay that asset out in (H-2).
+ */
+export function debridgeId(nativeChainId: bigint, nativeToken: string): string {
+  const token = hexToBytes(nativeToken);
+  if (token.length !== 20) throw new Error(`bad token address: ${nativeToken}`);
+  const packed = new Uint8Array(52);
+  packed.set(word32(nativeChainId), 0);
+  packed.set(token, 32);
+  return bytesToHex(keccak256(packed));
+}
+
 /** deBridge's prefix for a transfer id, as `BridgeHash.SUBMISSION_PREFIX`. */
 const SUBMISSION_PREFIX = 1n;
 

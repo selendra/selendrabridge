@@ -38,7 +38,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::Context;
 use bridge_core::abi::Gate;
-use bridge_core::backend::StoreBackend;
+use bridge_core::backend::{StoreBackend, MAX_REFUND_PAGES, REFUND_PAGE};
 use bridge_core::signer::encode_signature;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use tracing::{info, warn};
@@ -177,6 +177,26 @@ enum Decision {
     Skip(&'static str),
 }
 
+/// Has this validator already attested BOTH domains for this candidate?
+///
+/// If so [`decide`] returns some `Skip` for every possible chain state — with
+/// both flags set, `AttestRefund` is guarded by `already_attested_refund` and
+/// `AttestCancel` by `already_attested_cancel`, which is tested before
+/// `aged_out` — so reading the two chains first can only confirm what is already
+/// known. Skipping early is exactly equivalent and saves the 8-30 RPC calls
+/// `handle_candidate` would spend to reach the same answer, on every tick, for
+/// as long as the row stays in the queue (audit 2026-09-16, H-6).
+///
+/// Uses the store's `signer` labels, like [`decide`]'s own inputs: the sig-store
+/// verifies a signature against its claimed signer on write, and a store hostile
+/// enough to forge the label already controls this loop's liveness by choosing
+/// the candidate list. It is a cost filter, never a safety boundary.
+fn fully_attested_by_us(rec: &SubmissionRecord, signer_addr: Address) -> bool {
+    let me = format!("{signer_addr:#x}");
+    let mine = |sigs: &[SignerSig]| sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&me));
+    mine(&rec.cancel_signatures) && mine(&rec.refund_signatures)
+}
+
 /// Decide from on-chain facts alone. Split out from the I/O so the safety rules
 /// are unit-testable.
 ///
@@ -307,16 +327,47 @@ pub async fn run(
     );
 
     loop {
-        let candidates = match sink.refund_candidates().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "fetching refund candidates failed; retrying");
-                tokio::time::sleep(retry).await;
-                continue;
+        // Walk the queue a page at a time (audit 2026-09-16, H-6). Unpaged, a
+        // queue grown past the client's response cap returned an error on every
+        // tick forever, so no refund could ever be attested again.
+        let mut candidates: Vec<SubmissionRecord> = Vec::new();
+        let mut failed = false;
+        for p in 0..MAX_REFUND_PAGES {
+            match sink.refund_candidates(REFUND_PAGE, p * REFUND_PAGE).await {
+                Ok(page) => {
+                    let short = (page.len() as u64) < REFUND_PAGE;
+                    candidates.extend(page);
+                    if short {
+                        break;
+                    }
+                    if p + 1 == MAX_REFUND_PAGES {
+                        warn!(
+                            pages = MAX_REFUND_PAGES,
+                            page_size = REFUND_PAGE,
+                            "refund queue exceeds one tick's walk; covering the rest next tick"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, page = p, "fetching refund candidates failed; retrying");
+                    failed = true;
+                    break;
+                }
             }
-        };
+        }
+        if failed {
+            tokio::time::sleep(retry).await;
+            continue;
+        }
 
         for rec in candidates {
+            // Cheap-skip before the 8-30 on-chain reads `handle_candidate` makes:
+            // a candidate this validator has already attested in both domains has
+            // nothing left for it to do, and re-deciding it costs the same RPC
+            // budget as a fresh one.
+            if fully_attested_by_us(&rec, signer_addr) {
+                continue;
+            }
             if let Err(e) = handle_candidate(
                 &rec,
                 &source_readers,
@@ -518,6 +569,72 @@ mod tests {
         let burned = DestinationState { executed: true, cancelled: true };
         let ghost = SourceState { sent_by: Address::ZERO, refunded: false };
         assert!(matches!(decide(Some(&ghost), &burned, AGED, false, false), Decision::Skip(_)));
+    }
+
+    /// Round 5, H-6. `handle_candidate` now skips a candidate this validator has
+    /// attested in BOTH domains without reading either chain. That is only sound
+    /// if `decide` could never have asked for work in that state — so assert it
+    /// over every combination of chain facts, including the ones that cannot
+    /// co-occur. If a future branch returns an `Attest*` with both flags set,
+    /// this fails and the pre-filter must be revisited.
+    #[test]
+    fn both_attested_always_skips_whatever_the_chains_say() {
+        for executed in [false, true] {
+            for cancelled in [false, true] {
+                for aged in [false, true] {
+                    for refunded in [false, true] {
+                        let dst = DestinationState { executed, cancelled };
+                        for source in [Some(src(refunded)), None] {
+                            let d = decide(source.as_ref(), &dst, aged, true, true);
+                            assert!(
+                                matches!(d, Decision::Skip(_)),
+                                "executed={executed} cancelled={cancelled} aged={aged} \
+                                 refunded={refunded} source={} produced {d:?}, so skipping \
+                                 the on-chain reads would drop real work",
+                                source.is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pre-filter itself: both domains signed by us, matched case-insensitively.
+    #[test]
+    fn fully_attested_needs_both_domains() {
+        let me = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let sig = |a: Address| SignerSig {
+            signer: format!("{a:#X}"), // upper-case: the store's label casing varies
+            signature: "0x00".into(),
+        };
+        let mut rec = SubmissionRecord {
+            submission_id: String::new(),
+            bridge_domain: String::new(),
+            debridge_id: String::new(),
+            amount: String::new(),
+            chain_id_from: 1,
+            chain_id_to: 2,
+            nonce: 0,
+            receiver: String::new(),
+            auto_params: String::new(),
+            native_sender: String::new(),
+            token: String::new(),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        };
+        assert!(!fully_attested_by_us(&rec, me));
+
+        rec.cancel_signatures = vec![sig(me)];
+        assert!(!fully_attested_by_us(&rec, me), "cancel alone is not done");
+
+        rec.refund_signatures = vec![sig(other)];
+        assert!(!fully_attested_by_us(&rec, me), "another validator's refund is not ours");
+
+        rec.refund_signatures.push(sig(me));
+        assert!(fully_attested_by_us(&rec, me));
     }
 
     #[test]

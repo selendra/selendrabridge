@@ -151,6 +151,20 @@ private_key = "$VALIDATOR_KEY"
 
 [store]
 dir = "$STORE"
+
+# A watches A->B and A->C, so it must be able to read BOTH far gates: the
+# submissionId does not commit to the asset's scale (H-2), so the validator
+# confirms each destination agrees on the bridge decimals before signing. It
+# fails CLOSED — a destination missing here is a destination nothing bridges to.
+[[destinations]]
+chain_id = $B_CHAIN
+rpcs = ["$B_RPC"]
+gate = "$GATE_B"
+
+[[destinations]]
+chain_id = $C_CHAIN
+rpcs = ["$C_RPC"]
+gate = "$GATE_C"
 EOF
 
 # ONE keeper, TWO destinations.

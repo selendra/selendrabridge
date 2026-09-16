@@ -1251,12 +1251,27 @@ impl Db {
     ///
     /// Deliberately returns candidates rather than decisions — the caller must
     /// still verify both chains on-chain before signing anything.
-    pub async fn refund_candidates(&self) -> Result<Vec<SubmissionRecord>, DbError> {
+    ///
+    /// PAGED (audit 2026-09-16, H-6). This queue is polled by every validator's
+    /// refund loop on every tick, and the eligibility sweep adds to it any aged
+    /// row regardless of whether it describes a deliverable transfer. Unbounded,
+    /// one `Sign` credential could grow the response past the client's 8 MiB cap
+    /// and wedge every refund loop in the fleet permanently. `ORDER BY` is made
+    /// total with `submission_id` so a walk cannot skip or repeat a row when
+    /// timestamps collide.
+    pub async fn refund_candidates(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SubmissionRecord>, DbError> {
         let rows: Vec<SubmissionRow> = sqlx::query_as(
             "SELECT * FROM submissions \
              WHERE status <> 'claimed' AND refund_status IN ('eligible','cancelled') \
-             ORDER BY created_at",
+             ORDER BY created_at, submission_id \
+             LIMIT $1 OFFSET $2",
         )
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 

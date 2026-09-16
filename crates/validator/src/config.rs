@@ -26,6 +26,35 @@ pub struct Config {
     /// a transfer was delivered).
     #[serde(default)]
     pub refund: Option<RefundConfig>,
+    /// Peer chains this validator can read gate state from, for the H-2
+    /// bridge-decimals cross-check (audit 2026-09-16).
+    ///
+    /// The submissionId does not commit to the scale an amount is in, so a
+    /// destination gate registered one digit off pays a power of ten wrong on an
+    /// ordinary transfer. `claim` is permissionless, so a validator withholding
+    /// its signature is the only thing that still prevents it — and to decide
+    /// that, the validator must be able to read the destination gate.
+    ///
+    /// A peer with no entry here CANNOT be verified, so transfers to it are not
+    /// signed. Left empty, this validator falls back to `refund.destinations`,
+    /// which carries the same (chain_id, gate, rpcs) shape — so a deployment
+    /// that already attests refunds gets the check without new configuration.
+    #[serde(default)]
+    pub destinations: Vec<RefundChain>,
+}
+
+impl Config {
+    /// Peer chains usable for the H-2 check: the dedicated list when given, else
+    /// the refund loop's destinations, which are the same thing by another name.
+    pub fn scale_destinations(&self) -> &[RefundChain] {
+        if !self.destinations.is_empty() {
+            return &self.destinations;
+        }
+        match self.refund.as_ref() {
+            Some(r) => &r.destinations,
+            None => &[],
+        }
+    }
 }
 
 /// Drives the two-phase refund attestation loop.
@@ -331,6 +360,42 @@ mod tests {
              [store]\n\
              dir = \"./sigs\"\n"
         )
+    }
+
+    // --- H-2 bridge-decimals cross-check coverage (audit 2026-09-16) ---------
+
+    const PEER: &str = "chain_id = 1338\n\
+         rpcs = [\"http://localhost:8546\"]\n\
+         gate = \"0x0000000000000000000000000000000000000002\"\n";
+
+    /// The dedicated list is what the check uses when it is given.
+    #[test]
+    fn scale_destinations_prefers_the_dedicated_list() {
+        let toml = format!("{}[[destinations]]\n{PEER}", cfg("block_confirmation = 12"));
+        let c = Config::from_toml(&toml).expect("loads");
+        let d = c.scale_destinations();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].chain_id, 1338);
+    }
+
+    /// An existing deployment already lists its peers under `[refund.destinations]`
+    /// — the same (chain_id, gate, rpcs) shape. Falling back to it means the H-2
+    /// check turns on without anyone editing a config, which matters because the
+    /// check fails CLOSED: no peers means no signatures.
+    #[test]
+    fn scale_destinations_falls_back_to_the_refund_block() {
+        let c = Config::from_toml(&refund_cfg("")).expect("loads");
+        assert!(c.destinations.is_empty(), "premise: no dedicated list");
+        assert_eq!(c.scale_destinations().len(), c.refund.as_ref().unwrap().destinations.len());
+        assert!(!c.scale_destinations().is_empty(), "the refund peers are used");
+    }
+
+    /// Neither configured => empty, and the caller withholds every signature.
+    /// Asserted so the fail-closed default cannot be silently inverted later.
+    #[test]
+    fn scale_destinations_is_empty_when_nothing_is_configured() {
+        let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("loads");
+        assert!(c.scale_destinations().is_empty());
     }
 
     #[test]

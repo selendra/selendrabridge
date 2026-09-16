@@ -134,6 +134,16 @@ private_key = "$2"
 
 [store]
 url = "$STORE_URL"
+
+# All three validators get the destination gate. The submissionId does not commit
+# to the asset's scale (H-2), so each one independently reads the far end and
+# signs only if it agrees on the bridge decimals — and it fails CLOSED, so a
+# validator missing this block contributes nothing and the 2-of-3 threshold below
+# could never be reached.
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 EOF
 }
 write_vcfg "$ROOT/val1-p7.toml" "$V1K" "$LOGS/val1-p7-state.json"

@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { bytesToHex, hexToBytes, keccak256, submissionId } from "../../src/wallet/keccak";
+import { bytesToHex, debridgeId, hexToBytes, keccak256, submissionId } from "../../src/wallet/keccak";
 
 /**
  * The submissionId is the one value the whole bridge agrees on: Solidity, Rust
@@ -22,6 +22,26 @@ test("keccak256 matches the known empty-input digest", () => {
   expect(bytesToHex(keccak256(new TextEncoder().encode("abc")))).toBe(
     "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
   );
+});
+
+/**
+ * The asset id the browser derives to ask a DESTINATION gate what scale it would
+ * pay an asset out in (H-2). A wrong id there is not a visible failure: the gate
+ * answers "not registered", the UI refuses every transfer of that asset, and the
+ * mismatch it exists to catch is never actually checked.
+ *
+ * Golden value from `cast keccak $(cast abi-encode --packed 'f(uint256,address)'
+ * 1337 0xaa…aa)`, i.e. exactly `BridgeHash.getDebridgeId(1337, 0xaa…aa)`.
+ */
+test("debridgeId packs a 32-byte chain id and the RAW 20-byte token", () => {
+  expect(debridgeId(1337n, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).toBe(
+    "0xd663e6c160b55911e4e4c0e0dc08ae44f1493be27a4356da0f44e1960f0eba54"
+  );
+  // The token is NOT word-padded: padding it would hash to an id no gate maps.
+  expect(debridgeId(1337n, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).not.toBe(
+    bytesToHex(keccak256(hexToBytes("0x" + (1337).toString(16).padStart(64, "0") + "aa".repeat(20).padStart(64, "0"))))
+  );
+  expect(() => debridgeId(1337n, "0x1234")).toThrow(/bad token address/);
 });
 
 test("submissionId matches every Solidity fixture without an auto payload", () => {

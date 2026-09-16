@@ -27,6 +27,20 @@ pub const MAX_PAGE: u64 = 200;
 /// makes `limit_complexity` a bound on RPC fan-out rather than on JSON size.
 pub const CHAIN_READ_COST: usize = 20;
 
+/// Complexity charged for a field that pulls a page from the signature store —
+/// one HTTP round trip returning up to the store's own 5,000-row page.
+///
+/// Audit 2026-09-16, H-7: these fields used to cost the default 1, so ~4,000
+/// aliases of `stats` fitted one 128 KiB body and async-graphql resolved them
+/// CONCURRENTLY. The list multiplier also *replaced* the field's own cost, which
+/// made `submissions(limit: 1)` score 1 while still fetching the full page — so
+/// the formulas below are additive: the fetch is paid for whatever the page size.
+pub const STORE_READ_COST: usize = 50;
+
+/// Complexity for a whole-pool snapshot: a block number, the stable address and
+/// two `eth_call`s per listed token, so it is worth several plain chain reads.
+pub const POOL_READ_COST: usize = CHAIN_READ_COST * 8;
+
 /// Effective page size for a `limit` argument: default when absent, capped at
 /// [`MAX_PAGE`], never zero.
 pub fn page_size(limit: Option<u64>) -> usize {
@@ -605,7 +619,7 @@ impl Query {
     /// for a stable order, as one page: `limit` rows (default 50, at most 200)
     /// starting at `offset` (default 0). Both are optional, so existing clients
     /// keep working and simply receive the first page.
-    #[graphql(complexity = "page_size(limit) * child_complexity")]
+    #[graphql(complexity = "STORE_READ_COST + page_size(limit) * child_complexity")]
     async fn submissions(
         &self,
         ctx: &Context<'_>,
@@ -642,6 +656,7 @@ impl Query {
     }
 
     /// A single submission by its `0x`-prefixed submissionId, or null if unknown.
+    #[graphql(complexity = "STORE_READ_COST")]
     async fn submission(
         &self,
         ctx: &Context<'_>,
@@ -670,6 +685,7 @@ impl Query {
     /// Live snapshot of a same-chain swap pool: every listed token with its
     /// price, reserve (the swap lock), and max-swap-out USD value. `null` when
     /// the API has no `--swap` configured for `chainId` (or the RPC read failed).
+    #[graphql(complexity = "POOL_READ_COST")]
     async fn pools(&self, ctx: &Context<'_>, chain_id: u64) -> Option<Vec<PoolTokenView>> {
         state(ctx)
             .swaps
@@ -681,6 +697,7 @@ impl Query {
     /// Full snapshot of a same-chain swap pool INCLUDING its contract address and
     /// core stablecoin, so a UI can execute a swap (approve + `swap`) against it.
     /// `null` when the API has no `--swap` for `chainId` (or the RPC read failed).
+    #[graphql(complexity = "POOL_READ_COST")]
     async fn swap_pool(&self, ctx: &Context<'_>, chain_id: u64) -> Option<SwapPoolInfo> {
         state(ctx)
             .swaps
@@ -695,6 +712,7 @@ impl Query {
     /// an address/amount is malformed, a token isn't listed (call reverts), or —
     /// on Solana — a leg's price is older than the pool's `maxPriceAge`, which
     /// the program would reject as `StalePrice` (see `PoolTokenView.priceFresh`).
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn swap_quote(
         &self,
         ctx: &Context<'_>,
@@ -714,6 +732,7 @@ impl Query {
     /// are packed into the instruction by the browser, and a wrong value here
     /// yields a submissionId the program does not derive, so the transaction
     /// fails rather than pays the wrong account.
+    #[graphql(complexity = "CHAIN_READ_COST * 4")]
     async fn solana_gate_context(
         &self,
         ctx: &Context<'_>,
@@ -789,6 +808,7 @@ impl Query {
     /// signs its own swap transaction — this is the one piece it cannot derive,
     /// and passing it through here keeps the RPC credential server-side.
     /// `null` for an EVM chain or an unconfigured one.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn solana_blockhash(&self, ctx: &Context<'_>, chain_id: u64) -> Option<String> {
         state(ctx).swaps.solana_blockhash(chain_id).await
     }
@@ -796,6 +816,7 @@ impl Query {
     /// SPL balance of a token account, as a decimal string ("0" when the
     /// account does not exist yet). The caller derives the address; this only
     /// reads it.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn solana_token_balance(
         &self,
         ctx: &Context<'_>,
@@ -807,6 +828,7 @@ impl Query {
 
     /// Confirmation state of a Solana transaction: `pending`, `processed`,
     /// `confirmed`, `finalized` or `failed`. `null` for an EVM chain.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn solana_signature_status(
         &self,
         ctx: &Context<'_>,
@@ -817,6 +839,7 @@ impl Query {
     }
 
     /// Aggregate counts across the whole store.
+    #[graphql(complexity = "STORE_READ_COST")]
     async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<Stats> {
         use std::collections::BTreeMap;
         let st = state(ctx);
@@ -866,7 +889,7 @@ impl Query {
     ///
     /// One page: `limit` rows (default 50, at most 200) from `offset` (default
     /// 0), applied after `filter`.
-    #[graphql(complexity = "page_size(limit) * child_complexity")]
+    #[graphql(complexity = "STORE_READ_COST + page_size(limit) * child_complexity")]
     async fn history(
         &self,
         ctx: &Context<'_>,
@@ -891,7 +914,7 @@ impl Query {
     /// Newest first, optionally scoped to one chain. Served over the sig-store's
     /// read scope for the reason `history` documents. Needs `--store-url`.
     /// `limit` defaults to 50 and is capped at 200.
-    #[graphql(complexity = "page_size(limit) * child_complexity")]
+    #[graphql(complexity = "STORE_READ_COST + page_size(limit) * child_complexity")]
     async fn swap_history(
         &self,
         ctx: &Context<'_>,
@@ -1035,6 +1058,60 @@ mod tests {
         let msg = store_error(e).message;
         assert_eq!(msg, "signature store unavailable");
         assert!(!msg.contains("internal-store"));
+    }
+
+    /// Round 5, H-7. Every field that costs an upstream round trip must carry a
+    /// price, or `limit_complexity` bounds nothing: `stats` and `submission` cost
+    /// the default 1, so thousands of ALIASES of them fitted one body and
+    /// async-graphql resolved them concurrently — thousands of simultaneous
+    /// full-page store reads from one anonymous POST.
+    #[tokio::test]
+    async fn aliasing_a_store_read_is_bounded_by_complexity() {
+        let dir = std::env::temp_dir().join(format!("graphql-api-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = async_graphql::Schema::build(
+            Query,
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .limit_complexity(8000)
+        .data(ApiState {
+            backend: Arc::new(StoreBackend::file(&dir).unwrap()),
+            threshold: Some(2),
+            chains: Chains::new(),
+            registry: vec![],
+            swaps: Swaps::new(),
+        })
+        .finish();
+
+        let aliased = |field: &str, n: usize| {
+            let body: String =
+                (0..n).map(|i| format!("a{i}:{field} ")).collect();
+            format!("{{ {body} }}")
+        };
+
+        // Each `stats` now costs STORE_READ_COST, so a flood is refused before a
+        // single store read happens. At the old cost of 1 this was admitted.
+        let res = schema.execute(aliased("stats{total}", 200)).await;
+        assert!(!res.errors.is_empty(), "an aliased stats flood must be refused");
+        assert!(
+            res.errors[0].message.to_lowercase().contains("complex"),
+            "{:?}",
+            res.errors
+        );
+
+        // A small page must still pay for the fetch it causes: the list formula is
+        // additive, so `limit: 1` no longer scores 1 while pulling a full page.
+        let res = schema.execute(aliased("submissions(limit:1){nonce}", 200)).await;
+        assert!(!res.errors.is_empty(), "an aliased limit-1 flood must be refused");
+
+        // Ordinary use is unaffected.
+        assert!(schema.execute("{ stats { total } }").await.errors.is_empty());
+        assert!(schema
+            .execute(&aliased("stats{total}", 10))
+            .await
+            .errors
+            .is_empty());
     }
 
     /// The complexity multiplier is what turns `limit_complexity` into a bound

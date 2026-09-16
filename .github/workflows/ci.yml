@@ -212,11 +212,37 @@ jobs:
   audit:
     name: Dependency advisories
     runs-on: ubuntu-latest
+    # audit-check reports through the Checks API, which the workflow-level
+    # `contents: read` does not grant — without this the job could fail to
+    # annotate silently (audit 2026-09-16, LOW).
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    # Audit 2026-09-16, H-3: a live Alchemy key was committed in a generated
+    # compose file, shipped to `origin/master`, and survived three audit rounds
+    # — `.gitignore` was tightened each time but nothing ever checked. This is
+    # the check. It scans FULL HISTORY, not just the diff, so a key reintroduced
+    # on a branch and rebased away is still caught.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Self-contained rather than a third-party action: no extra supply-chain
+      # surface on the job whose whole purpose is credential hygiene, and a
+      # developer runs the identical check locally.
+      - name: Keyed RPC URLs and private keys
+        run: bash scripts/secret-scan.sh
 
   deploy-readiness:
     name: Solana SBF build + deploy (deploy gate)

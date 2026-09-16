@@ -33,10 +33,14 @@
 //! during an incident. Withholding the signature is the only thing that actually
 //! stops the transfer, so it happens here.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+
 use anyhow::Context as _;
+use bridge_solana::account::{self, AssetAccount};
 use bridge_solana::gate::Sent;
 use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
 use bridge_solana::relayer::{
@@ -50,6 +54,7 @@ use solana_transaction_status::UiTransactionEncoding;
 use tracing::{info, warn};
 
 use crate::config::SourceChain;
+use crate::evm::GateReader;
 use crate::gate::{commitment, decode_config_view, evm_address, sign};
 use crate::state::Cursor;
 use crate::store::{Allowlist, SignerSig, Store, SubmissionRecord};
@@ -162,6 +167,17 @@ pub struct Scanner {
     /// Refetched every tick, so an operator de-listing a token takes effect
     /// across the fleet without restarting anything.
     allowlist: Option<Allowlist>,
+    /// EVM destination gates this scanner can read, for the H-2 bridge-decimals
+    /// cross-check. A peer with no reader cannot be verified, so transfers to it
+    /// are not signed — see [`Scanner::scale_agrees`].
+    evm_gates: BTreeMap<u64, GateReader>,
+    /// `(chain_id_to, debridge_id) -> destination scale`. Registrations are
+    /// write-once, so a successful read is good forever; failures are never
+    /// cached, or one RPC fault would become a permanent refusal.
+    scale_cache: Mutex<HashMap<(u64, [u8; 32]), u8>>,
+    /// Chains already warned about, so an unconfigured peer does not log once
+    /// per transfer.
+    scale_warned: Mutex<HashSet<u64>>,
 }
 
 impl Scanner {
@@ -169,6 +185,7 @@ impl Scanner {
         cfg: SourceChain,
         secret_key: [u8; 32],
         store: Store,
+        evm_gates: BTreeMap<u64, GateReader>,
     ) -> anyhow::Result<Self> {
         let commitment = commitment(&cfg.commitment);
         let secret = libsecp256k1::SecretKey::parse(&secret_key)
@@ -180,6 +197,9 @@ impl Scanner {
             program_id: Pubkey::from_str(&cfg.program_id)
                 .map_err(|_| anyhow::anyhow!("program_id is not a valid pubkey"))?,
             bridge_domain: [0u8; 32],
+            evm_gates,
+            scale_cache: Mutex::new(HashMap::new()),
+            scale_warned: Mutex::new(HashSet::new()),
             cfg,
             secret,
             signer_address,
@@ -435,7 +455,30 @@ impl Scanner {
         // The gate's `["sent", submissionId]` PDA is program state only
         // `process_send` can write, so it is the thing that actually distinguishes
         // "the gate locked these funds" from "someone printed a convincing line".
-        if !self.origin_proof_holds(event, sent, tx).await? {
+        let asset = match self.asset_for(&event.debridge_id, tx).await? {
+            Some(a) => a,
+            None => {
+                warn!(
+                    tx,
+                    submission_id = %format!("0x{}", hex::encode(sent.submission_id)),
+                    debridge_id = %format!("0x{}", hex::encode(sent.debridge_id)),
+                    "REJECTED unauthentic BRIDGE_SENT — no usable [\"asset\"] registration \
+                     for its debridgeId; refusing to sign (possible forged event)"
+                );
+                return Ok(false);
+            }
+        };
+        if !self.origin_proof_holds(event, sent, tx, &asset).await? {
+            return Ok(false);
+        }
+
+        // H-2 (audit 2026-09-16): the submissionId does not commit to the scale
+        // the amount is in. This gate divides by its own registered bridge
+        // decimals and the destination multiplies by ITS own, so two ends that
+        // disagree pay a power of ten wrong on an ordinary transfer. `Gate.claim`
+        // is permissionless and these signatures are public, so withholding is
+        // the only thing that stops it — the same reasoning as the allowlist.
+        if !self.scale_agrees(sent, &asset).await? {
             return Ok(false);
         }
 
@@ -502,6 +545,107 @@ impl Scanner {
         Ok(true)
     }
 
+    /// The asset's `10^(local-bridge)` scale, from the gate's own
+    /// `["asset", debridgeId]` registration.
+    ///
+    /// `Ok(None)` means the account is absent, foreign-owned, undecodable, or
+    /// carries decimals that cannot produce a unit — none of which a genuine
+    /// `send` could have produced, since `process_send` loads this very account.
+    /// An RPC fault is an `Err`, so the caller retries rather than mistaking a
+    /// lookup failure for a forgery.
+    async fn asset_for(
+        &self,
+        debridge_id: &[u8; 32],
+        tx: &str,
+    ) -> anyhow::Result<Option<AssetAccount>> {
+        let (pda, _bump) =
+            Pubkey::find_program_address(&[b"asset", debridge_id], &self.program_id);
+        let account = self
+            .rpc
+            .get_account_with_commitment(&pda, self.rpc.commitment())
+            .await
+            .with_context(|| format!("reading [\"asset\"] PDA {pda} for tx {tx}"))?
+            .value;
+        let Some(account) = account else { return Ok(None) };
+        if account.owner != self.program_id {
+            return Ok(None);
+        }
+        Ok(account::decode::<AssetAccount>(&account.data))
+    }
+
+    /// Do this gate and the EVM destination agree about the asset's scale?
+    ///
+    /// H-2 (audit 2026-09-16). Solana `send` hashed `local / bridge_unit`; the
+    /// EVM `claim` will pay `amount * 10^(localDecimals - bridgeDecimals)` using
+    /// the DESTINATION's own registration. Nothing in the submissionId ties the
+    /// two together, so a peer registered one digit off pays a power of ten wrong
+    /// — with no attacker input at all.
+    ///
+    /// Fails CLOSED: a destination we cannot read is exactly the case we cannot
+    /// clear. Returns `Ok(false)` to withhold (the transfer really happened, so
+    /// the cursor moves past it), and only propagates `Err` for faults worth
+    /// retrying the whole tick over.
+    async fn scale_agrees(&self, sent: &Sent, asset: &AssetAccount) -> anyhow::Result<bool> {
+        let chain_to = sent.chain_id_to;
+        let Some(reader) = self.evm_gates.get(&chain_to) else {
+            if self.scale_warned.lock().await.insert(chain_to) {
+                warn!(
+                    chain_to,
+                    "no [[refund.evm]] reader for this destination — cannot verify it agrees \
+                     on the asset's bridge decimals, so transfers to it will NOT be signed \
+                     (audit H-2). Add its chain_id/gate/rpc to this relayer's config."
+                );
+            }
+            return Ok(false);
+        };
+
+        let key = (chain_to, sent.debridge_id);
+        let cached = self.scale_cache.lock().await.get(&key).copied();
+        let destination = match cached {
+            Some(d) => d,
+            None => match reader.bridge_decimals_for(&sent.debridge_id).await {
+                Ok(Some(d)) => {
+                    self.scale_cache.lock().await.insert(key, d);
+                    d
+                }
+                Ok(None) => {
+                    warn!(
+                        chain_to,
+                        debridge_id = %hex::encode(sent.debridge_id),
+                        "destination gate has no corridor for this debridgeId — withholding \
+                         signature"
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    warn!(
+                        chain_to,
+                        error = %e,
+                        "reading the destination's bridgeDecimalsFor failed (is that gate \
+                         older than the H-2 fix?) — withholding signature"
+                    );
+                    return Ok(false);
+                }
+            },
+        };
+
+        if destination == asset.bridge_decimals {
+            return Ok(true);
+        }
+        warn!(
+            submission_id = %format!("0x{}", hex::encode(sent.submission_id)),
+            debridge_id = %format!("0x{}", hex::encode(sent.debridge_id)),
+            chain_to,
+            source_bridge_decimals = asset.bridge_decimals,
+            destination_bridge_decimals = destination,
+            "BRIDGE DECIMALS MISMATCH — the two gates disagree about this asset's scale, so \
+             a claim would pay out a power of ten wrong. Withholding signature. Both \
+             registrations are write-once: fixing this needs a gate upgrade or a new mesh \
+             generation."
+        );
+        Ok(false)
+    }
+
     /// Read the gate's `["sent", submissionId]` record and check it corroborates
     /// the event.
     ///
@@ -519,6 +663,7 @@ impl Scanner {
         event: &SentEvent,
         sent: &Sent,
         tx: &str,
+        asset: &AssetAccount,
     ) -> anyhow::Result<bool> {
         let (pda, _bump) = Pubkey::find_program_address(
             &[b"sent", &sent.submission_id],
@@ -535,7 +680,23 @@ impl Scanner {
             .as_ref()
             .map(|a| (a.owner == self.program_id, a.data.as_slice()));
 
-        match verify_sent_record(view, event) {
+        // The record's amount is in the MINT's decimals and the event's is in the
+        // asset's bridge decimals, so corroborating one against the other needs
+        // the asset's scale. Same split of failure modes as the record itself: an
+        // RPC fault is "we do not know" and propagates; anything else means this
+        // event does not describe a registered asset, so it is not ours.
+        let Some(bridge_unit) = asset.bridge_unit() else {
+            warn!(
+                tx,
+                submission_id = %hex::encode(sent.submission_id),
+                debridge_id = %hex::encode(event.debridge_id),
+                "asset registration has decimals that produce no usable bridge unit — \
+                 refusing to sign"
+            );
+            return Ok(false);
+        };
+
+        match verify_sent_record(view, event, bridge_unit) {
             Ok(_) => Ok(true),
             Err(e) => {
                 warn!(

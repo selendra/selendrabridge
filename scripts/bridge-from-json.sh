@@ -138,6 +138,16 @@ emit_signer() { # $1 jq path
 }
 
 THRESHOLD="$(j '.threshold')"
+# Confirmation depth for on-chain reads that gate a signature. The relayer
+# refuses 0 (a reorg after signing is a double-spend); on an instant-final anvil
+# 1 is the honest minimum.
+rbc_for_scale() {
+  local v; v="$(jr '.refund.block_confirmation')"
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  (( v >= 1 )) || v=1
+  printf '%s' "$v"
+}
+
 mapfile -t CHAIN_IDS < <(j '.chains[] | select(.enabled != false) | .chain_id')
 (( ${#CHAIN_IDS[@]} >= 1 )) || die ".chains is empty"
 (( ${#CHAIN_IDS[@]} >= 2 )) || warn "only one chain configured — nothing to bridge to"
@@ -312,6 +322,16 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
         echo "allow_unauthenticated = true"
       fi
     fi
+    # H-2 (audit 2026-09-16): peer gates this validator cross-checks for
+    # bridge-decimals agreement before signing. Unconditional — a validator with
+    # no verifiable destination withholds every signature.
+    for cid in "${CHAIN_IDS[@]}"; do
+      echo
+      echo "[[destinations]]"
+      echo "chain_id = $cid"
+      echo "rpcs = $(jq -c ".chains[] | select(.chain_id == $cid) | .rpcs" "$CONFIG")"
+      echo "gate = \"$(cf "$cid" gate)\""
+    done
     if [[ "$REFUND_ON" == "true" ]]; then
       # No [refund] block => this validator never votes on cancels/refunds, and
       # stranded transfers stay stranded. That is the safe default: a node that
@@ -418,6 +438,18 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         # (reports are idempotent), and the token must be handed out narrowly.
         echo "indexer_token_env = \"SIG_STORE_INDEXER_TOKEN\""
       fi
+      # H-2 (audit 2026-09-16): the peer gates the SCANNER cross-checks for
+      # bridge-decimals agreement before signing. Emitted unconditionally, unlike
+      # [refund] which an operator may disable — a relayer with no verifiable
+      # destination withholds every signature.
+      for cid in "${CHAIN_IDS[@]}"; do
+        echo
+        echo "[[evm_destinations]]"
+        echo "chain_id = $cid"
+        echo "gate = \"$(cf "$cid" gate)\""
+        echo "rpc_env = \"RPC_$cid\""
+        echo "block_confirmation = $(rbc_for_scale)"
+      done
       if [[ "$REFUND_ON" == "true" ]]; then
         # The refund attester's on-chain sources (M-13): without this block the
         # relayer votes REFUND but never CANCEL, so a stranded EVM->Solana

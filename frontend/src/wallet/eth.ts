@@ -27,6 +27,8 @@ const SEL = {
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
   gate: "7a0ebc88", // gate() — SwapRouter's immutable Gate
   bridgeUnit: "4e3ff796", // bridgeUnit(address) — Gate
+  bridgeDecimalsFor: "93b06e9d", // bridgeDecimalsFor(bytes32) — Gate (H-2)
+  tokenOf: "bae667bc", // tokenOf(bytes32) — Gate; the pre-H-2 fallback path
 } as const;
 
 function strip0x(h: string): string {
@@ -263,6 +265,83 @@ export async function readBridgeUnit(req: Eip1193Request, gate: string, token: s
   const unit = hexToBigInt(await ethCall(req, gate, "0x" + SEL.bridgeUnit + encAddress(token)));
   if (unit <= 0n) throw new Error("gate reports no bridge unit for this token");
   return unit;
+}
+
+/**
+ * The bridge decimals a `bridgeUnit` implies: the unit is `10^(localDecimals -
+ * bridgeDecimals)`, so the answer is `localDecimals` minus the unit's power of
+ * ten. `null` when the unit is not a whole power of ten, or the local decimals
+ * are nonsense — a gate we cannot decompose is one we do not understand, and
+ * "do not understand" must never read as "agrees" (see readBridgeDecimalsFor).
+ */
+export function bridgeDecimalsFromUnit(localDecimals: number, unit: bigint): number | null {
+  if (unit <= 0n) return null;
+  if (!Number.isInteger(localDecimals) || localDecimals < 0 || localDecimals > 36) return null;
+  let pow = 0;
+  let rest = unit;
+  while (rest % 10n === 0n) {
+    rest /= 10n;
+    pow += 1;
+  }
+  if (rest !== 1n) return null;
+  const bridgeDecimals = localDecimals - pow;
+  return bridgeDecimals >= 0 ? bridgeDecimals : null;
+}
+
+/**
+ * The bridge decimals a gate would pay `debridgeId` out in, or `null` when they
+ * cannot be established.
+ *
+ * H-2: the submissionId does not commit to the scale an amount travels in. The
+ * SOURCE gate divides the local amount by its own registered scale and the
+ * DESTINATION multiplies by its own, so two gates that disagree by one digit
+ * mis-pay every claim of that asset by a power of ten — permissionlessly, and
+ * uncorrectably, since both registrations are write-once. Nothing on-chain and
+ * nothing in the attestation core can see the mismatch, so the browser asks the
+ * far gate directly before it will build a transfer.
+ *
+ * Two paths, because a gate deployed before `bridgeDecimalsFor` exists has no
+ * such function and answers an unknown selector with empty data (or a revert):
+ *
+ *  1. `bridgeDecimalsFor(bytes32)` — resolves the corridor's local token and its
+ *     registered decimals in one call, and never reverts.
+ *  2. the pre-H-2 pair `tokenOf(bytes32)` then `bridgeUnit(address)` (+ the
+ *     token's own `decimals()`), which every gate generation has.
+ *
+ * `null` means UNKNOWN, including an asset the gate does not map at all (whose
+ * claim would revert `UnknownAsset` and strand the lock). It never means "fine":
+ * callers must refuse the transfer on it.
+ */
+export async function readBridgeDecimalsFor(
+  req: Eip1193Request,
+  gate: string,
+  debridgeId: string
+): Promise<number | null> {
+  try {
+    const raw = strip0x(await ethCall(req, gate, "0x" + SEL.bridgeDecimalsFor + encBytes32(debridgeId)));
+    // (bool set, uint8 bridgeDecimals, uint8 localDecimals, address localToken)
+    // — four static words. Anything shorter is not this function's return, so
+    // fall through rather than decode whatever did come back.
+    if (raw.length >= 256) {
+      if (hexToBigInt("0x" + raw.slice(0, 64)) === 0n) return null; // corridor unregistered here
+      return Number(hexToBigInt("0x" + raw.slice(64, 128)));
+    }
+  } catch {
+    /* pre-H-2 gate, or an RPC hiccup — try the two-call path before giving up */
+  }
+  try {
+    const raw = strip0x(await ethCall(req, gate, "0x" + SEL.tokenOf + encBytes32(debridgeId)));
+    if (raw.length < 64) return null;
+    const token = "0x" + raw.slice(24, 64);
+    if (/^0x0{40}$/.test(token)) return null; // not mapped on this gate
+    const [unit, localDecimals] = await Promise.all([
+      readBridgeUnit(req, gate, token),
+      readDecimals(req, token),
+    ]);
+    return bridgeDecimalsFromUnit(localDecimals, unit);
+  } catch {
+    return null;
+  }
 }
 
 export async function readAllowance(

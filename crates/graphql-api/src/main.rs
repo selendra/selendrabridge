@@ -46,7 +46,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post_service};
 use axum::Router;
 use bridge_core::backend::StoreBackend;
-use bridge_core::ratelimit::{enforce as rate_limit, RateLimit};
+use bridge_core::ratelimit::{enforce_by_peer as rate_limit, RateLimit};
 use clap::Parser;
 use tracing::{info, warn};
 
@@ -275,9 +275,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Same posture as the sig-store: bound what one caller can cost us. Keyed on
-    // the bearer token when there is one, shared otherwise — this service is
-    // usually unauthenticated and public, so the shared bucket is the common case.
+    // Bound what one caller can cost us. Keyed on the PEER ADDRESS, not on the
+    // bearer token the sig-store keys on: this service mounts no authentication,
+    // so a token here is a string the caller invents. Keying on it let anyone
+    // send a fresh random bearer per request, land on a brand-new full bucket
+    // every time and never be limited at all (audit 2026-09-16, H-7).
     if args.rate_per_second > 0.0 {
         let limit = RateLimit::new(args.rate_burst, args.rate_per_second);
         info!(burst = args.rate_burst, per_second = args.rate_per_second, "rate limit active");
@@ -303,7 +305,10 @@ async fn main() -> anyhow::Result<()> {
         history = args.store_url.is_some(),
         "graphql-api listening (GraphiQL at /)"
     );
-    axum::serve(listener, app).await?;
+    // `enforce_by_peer` reads `ConnectInfo<SocketAddr>`; without this the
+    // extension is absent and every peer shares one bucket.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await?;
     Ok(())
 }
 

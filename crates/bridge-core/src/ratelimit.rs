@@ -33,6 +33,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use std::net::SocketAddr;
+
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
@@ -101,6 +104,19 @@ impl RateLimit {
                 let refilled = b.tokens + now.saturating_duration_since(b.last).as_secs_f64() * rate;
                 refilled < burst
             });
+            // That alone does not bound the map: a bucket DRAINED by a request is
+            // never full, so a caller who can mint fresh keys (an unauthenticated
+            // service keys on something it does not control) would grow it without
+            // limit and make every later request pay for the sweep. Evict the
+            // least-recently-used half, which is the half closest to refilling
+            // anyway (audit 2026-09-16, H-7).
+            if buckets.len() >= SWEEP_AT {
+                let mut times: Vec<Instant> = buckets.values().map(|b| b.last).collect();
+                let cut = times.len() / 2;
+                times.select_nth_unstable(cut);
+                let cutoff = times[cut];
+                buckets.retain(|_, b| b.last > cutoff);
+            }
         }
 
         let bucket = buckets
@@ -141,6 +157,42 @@ fn credential(req: &Request) -> String {
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_owned()
+}
+
+/// The peer's IP address, or `""` when the server was not built with
+/// [`axum::extract::connect_info::ConnectInfo`].
+///
+/// Keyed on the IP, not the socket, so a client cannot escape its bucket by
+/// opening a new connection.
+fn peer(req: &Request) -> String {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_default()
+}
+
+/// Middleware enforcing a [`RateLimit`] keyed on the PEER ADDRESS.
+///
+/// Use this on a surface with no authentication (audit 2026-09-16, H-7). Keying
+/// on the bearer token there is worse than no limit at all: the key is then a
+/// string the caller invents, so every request with a fresh random token lands on
+/// a brand-new full bucket and the configured rate is never reached. [`enforce`]
+/// is correct only where a scope check has already established that the token is
+/// one of a known few.
+///
+/// Requires the server to be started with
+/// `into_make_service_with_connect_info::<SocketAddr>()`; without it every peer
+/// shares one bucket, which is a bound rather than a bypass.
+pub async fn enforce_by_peer(
+    State(limit): State<RateLimit>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if limit.check(&peer(&req)) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
 }
 
 /// Middleware enforcing a [`RateLimit`]. Wire it per route group:

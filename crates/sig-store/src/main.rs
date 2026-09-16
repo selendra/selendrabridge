@@ -532,10 +532,15 @@ async fn post_attestation(
     Ok(Json(rec))
 }
 
+/// Paged, like `/submissions` and `/history` (audit 2026-09-16, H-6): this queue
+/// is polled by every validator on every tick, and nothing bounds how many rows
+/// the eligibility sweep can put in it.
 async fn get_refund_candidates(
     State(s): State<AppState>,
+    Query(q): Query<PageQuery>,
 ) -> Result<Json<Vec<SubmissionRecord>>, (StatusCode, String)> {
-    Ok(Json(s.db.refund_candidates().await.map_err(db_err)?))
+    let (limit, offset) = page(q.limit, q.offset);
+    Ok(Json(s.db.refund_candidates(limit, offset).await.map_err(db_err)?))
 }
 
 // --- observed terminal states (Indexer scope) -----------------------------

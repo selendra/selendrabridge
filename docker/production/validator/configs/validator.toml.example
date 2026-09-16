@@ -56,6 +56,29 @@ url = "https://sig-store.example.com"
 bind = "0.0.0.0:9090"
 # token comes from VALIDATOR_API_TOKEN in .env
 
+# ── Peer gates: the bridge-decimals cross-check ───────────────────────────────
+# REQUIRED. List every chain any [[sources]] entry above can send to. This node
+# will NOT sign a transfer to a chain it cannot read here — that is deliberate.
+#
+# Why (audit 2026-09-16, H-2): every transfer travels in a per-asset "bridge
+# decimals" scale. The source gate divides the locked amount by ITS registered
+# scale and the destination multiplies by ITS OWN, and the submissionId does not
+# commit to either. Two gates that disagree by one digit therefore pay a power of
+# ten too much or too little on an ORDINARY user's transfer — no attacker needed,
+# and both registrations are write-once, so it cannot be corrected in place.
+#
+# `Gate.claim` is permissionless and the collected signatures are public, so once
+# a quorum exists anyone can complete the transfer. Withholding the signature is
+# the only thing that still stops it, which is why this is checked here and why
+# an unreadable destination is refused rather than assumed fine.
+#
+# Omit this and the validator falls back to [[refund.destinations]] below, which
+# has the same shape. Configure one of the two.
+[[destinations]]
+chain_id = 56
+rpcs = ["https://your-bsc-node.example.com"]
+gate = "0x0000000000000000000000000000000000000000"
+
 # ── Refund attestation ────────────────────────────────────────────────────────
 # Omit this whole block and this validator never votes on whether a stranded
 # transfer may be cancelled or refunded. That is the SAFE default, not a

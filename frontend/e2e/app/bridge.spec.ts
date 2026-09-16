@@ -1,6 +1,6 @@
-import { test, expect, startApp, connectWallet, gotoView } from "../fixtures/app";
+import { test, expect, startApp, connectWallet, gotoView, type ChainRpcSetup } from "../fixtures/app";
 import { driftChain, sentTransactions, walletCalls, ACCOUNT } from "../fixtures/wallet";
-import { GATE_A, GATE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
+import { CHAINS, GATE_A, GATE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
 
 /**
  * BridgeView, direct mode: the lock-and-emit path.
@@ -35,9 +35,16 @@ const tokenField = (page: import("@playwright/test").Page) =>
 async function openBridge(
   page: import("@playwright/test").Page,
   calls: Record<string, string> = APPROVED,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
+  // H-2: the destination gate's registered scale, read over the registry's RPC.
+  // It has to agree with the source `bridgeUnit` above or the form refuses to
+  // build the transfer — so a test that changes one usually changes both.
+  chainRpc: ChainRpcSetup = {}
 ) {
-  await startApp(page, { wallet: { chainId: 1337, calls, receiptLogs: [SENT_LOG], ...extra } });
+  await startApp(page, {
+    wallet: { chainId: 1337, calls, receiptLogs: [SENT_LOG], ...extra },
+    chainRpc,
+  });
   await connectWallet(page);
   await gotoView(page, "Bridge");
   await expect(page.getByRole("heading", { name: "Bridge" })).toBeVisible();
@@ -217,9 +224,11 @@ test.describe("approve → bridge", () => {
 test.describe("bridge decimals", () => {
   // An 18-decimal token bridged at 6 decimals: the gate's unit is 10^12.
   const UNIT_1E12 = { ...APPROVED, "4e3ff796": (10n ** 12n).toString(16) };
+  // …and a destination gate that agrees about those 6 decimals.
+  const DEST_6: ChainRpcSetup = { bridgeDecimals: 6 };
 
   test("refuses precision the bridge cannot carry, before any transaction", async ({ page }) => {
-    await openBridge(page, UNIT_1E12);
+    await openBridge(page, UNIT_1E12, {}, DEST_6);
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1.0000001");
     await expect(primaryButton(page)).toHaveText("Too precise — this asset bridges at most 6 decimals");
     await expect(primaryButton(page)).toBeDisabled();
@@ -227,14 +236,14 @@ test.describe("bridge decimals", () => {
   });
 
   test("accepts an amount that is a whole number of bridge units", async ({ page }) => {
-    await openBridge(page, UNIT_1E12);
+    await openBridge(page, UNIT_1E12, {}, DEST_6);
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1.000001");
     await expect(primaryButton(page)).toHaveText("Bridge");
   });
 
   test("Max rounds the balance down to a whole bridge unit", async ({ page }) => {
     const dusty = 1000n * 10n ** 18n + 123n; // 1000 TST and 123 wei of dust
-    await openBridge(page, { ...UNIT_1E12, "70a08231": dusty.toString(16) });
+    await openBridge(page, { ...UNIT_1E12, "70a08231": dusty.toString(16) }, {}, DEST_6);
     await page.getByRole("button", { name: /^Max/ }).click();
     await expect(page.locator(".field").filter({ hasText: "Amount" }).locator("input")).toHaveValue("1000");
     await expect(primaryButton(page)).toHaveText("Bridge");
@@ -245,6 +254,135 @@ test.describe("bridge decimals", () => {
     await openBridge(page, { ...APPROVED, "4e3ff796": "0" });
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
     await expect(primaryButton(page)).toHaveText("This token isn't bridgeable through this Gate");
+  });
+});
+
+/**
+ * H-2. The submissionId does not commit to the scale an amount travels in: the
+ * source gate divides the local amount by ITS registered bridge decimals and the
+ * destination multiplies by ITS OWN. One digit of disagreement pays out (or
+ * strands) a power of ten on every claim of that asset, permissionlessly, and
+ * neither registration can be corrected — both are write-once.
+ *
+ * Nothing on-chain and nothing in the attestation core can see it, so the only
+ * place it can be caught before funds move is here, in the browser, BEFORE the
+ * user is asked to sign. These tests are about exactly that: the transfer must
+ * not become signable.
+ */
+test.describe("H-2: source and destination must agree on the scale", () => {
+  // Source: 18-decimal token, bridgeUnit 1 => bridges at 18 decimals.
+  // Destination gate: registered at 17. A claim there would pay out 10x.
+  test("refuses to build a transfer when the two gates disagree", async ({ page }) => {
+    await openBridge(page, APPROVED, {}, { bridgeDecimals: 17 });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+
+    await expect(primaryButton(page)).toHaveText("Bridge decimals mismatch — refusing to send");
+    await expect(primaryButton(page)).toBeDisabled();
+    // Not just disabled: clicking must not produce a transaction to sign.
+    await primaryButton(page).click({ force: true });
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
+
+  test("names both scales so the operator can be told which gate is wrong", async ({ page }) => {
+    await openBridge(page, APPROVED, {}, { bridgeDecimals: 17 });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    const notice = page.getByTestId("bridge-decimals-mismatch");
+    await expect(notice).toContainText("Chain A bridges this asset at 18 decimals");
+    await expect(notice).toContainText("Chain B's Gate is registered at 17");
+    await expect(notice).toContainText("times too much");
+  });
+
+  test("sends normally when both ends agree", async ({ page }) => {
+    await openBridge(page, APPROVED, {}, { bridgeDecimals: 18 });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+    await expect(page.getByTestId("bridge-decimals-mismatch")).toHaveCount(0);
+  });
+
+  /** Fail closed: an unknown far end is not an agreeing far end. */
+  test("refuses when the destination gate has no such corridor registered", async ({ page }) => {
+    await openBridge(page, APPROVED, {}, { bridgeDecimals: null }); // set == false
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("Can't confirm how Chain B scales this asset");
+    await expect(primaryButton(page)).toBeDisabled();
+    await expect(page.getByTestId("bridge-decimals-unknown")).toBeVisible();
+  });
+
+  /**
+   * A gate deployed before `bridgeDecimalsFor` existed answers that selector
+   * with empty data. The check must fall back to `tokenOf` + `bridgeUnit`
+   * rather than treat the old gate as unverifiable (which would block every
+   * transfer on a mesh that hasn't been upgraded yet).
+   */
+  test("falls back to tokenOf + bridgeUnit on a pre-upgrade gate", async ({ page }) => {
+    await openBridge(page, APPROVED, {}, { legacyGate: true, bridgeUnit: 1n });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+  });
+
+  /**
+   * EVM -> Solana. The far end is a Solana program, which cannot be eth_called,
+   * so the destination scale comes from the API's `solanaGateContext` — the same
+   * `bridgeDecimals` the Solana panel already uses to size an outbound amount.
+   * The refusal has to be identical: H-5(a) makes a mis-registration WORSE on
+   * Solana, where registration has no timelock at all.
+   */
+  test.describe("with a Solana destination", () => {
+    const SOL_RECEIVER = "33A9xPRuLjv8NBrp5XjjdU22yfXdNx6vGczW9XY3bpgb";
+    const SOLANA_CHAIN = {
+      chainId: 7565164,
+      name: "Solana Devnet",
+      rpcUrl: null as unknown as string,
+      gate: null as unknown as string,
+      token: "8T2cxAqp8mDNkdTTb5giew9eYgZ7NmHdEWz6kMeE7WFV",
+      tokens: [{ symbol: "TST", address: "8T2cxAqp8mDNkdTTb5giew9eYgZ7NmHdEWz6kMeE7WFV" }],
+      router: null as unknown as string,
+    };
+
+    async function openToSolana(page: import("@playwright/test").Page, bridgeDecimals: number) {
+      await startApp(page, {
+        backend: {
+          chains: [CHAINS[0], SOLANA_CHAIN],
+          solanaGateContext: {
+            programId: "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133",
+            bridgeDomain: "0x" + "61".repeat(32),
+            chainId: SOLANA_CHAIN.chainId,
+            nonce: 3,
+            debridgeId: "0x" + "4b".repeat(32),
+            vault: "33A9xPRuLjv8NBrp5XjjdU22yfXdNx6vGczW9XY3bpgb",
+            decimals: 6,
+            bridgeDecimals,
+            paused: false,
+          },
+        },
+        wallet: { chainId: 1337, calls: APPROVED, receiptLogs: [SENT_LOG] },
+      });
+      await connectWallet(page);
+      await gotoView(page, "Bridge");
+      await field(page, "Receiver").fill(SOL_RECEIVER);
+      await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    }
+
+    test("refuses when the Solana gate is registered at another scale", async ({ page }) => {
+      await openToSolana(page, 6); // source bridges at 18
+      await expect(primaryButton(page)).toHaveText("Bridge decimals mismatch — refusing to send");
+      await expect(primaryButton(page)).toBeDisabled();
+      expect(await sentTransactions(page)).toHaveLength(0);
+    });
+
+    test("sends when the Solana gate agrees", async ({ page }) => {
+      await openToSolana(page, 18);
+      await expect(primaryButton(page)).toHaveText("Bridge");
+    });
+  });
+
+  test("still catches a mismatch through the pre-upgrade fallback", async ({ page }) => {
+    // Destination token is 18-decimal with a unit of 10^12 => 6 bridge decimals,
+    // against a source bridging at 18.
+    await openBridge(page, APPROVED, {}, { legacyGate: true, bridgeUnit: 10n ** 12n });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("Bridge decimals mismatch — refusing to send");
+    expect(await sentTransactions(page)).toHaveLength(0);
   });
 });
 

@@ -120,6 +120,15 @@ private_key = "$2"
 
 [store]
 url = "$STORE_URL"
+
+# Both validators must be able to read the destination gate: the submissionId
+# does not commit to the asset's scale (H-2), so each withholds its signature
+# until it has confirmed the far end agrees on the bridge decimals. Without this
+# the store stays empty and every query below would assert against nothing.
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 EOF
 }
 write_vcfg "$ROOT/val1-gql.toml" "$V1K" "$LOGS/val1-gql-state.json"

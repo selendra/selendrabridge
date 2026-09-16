@@ -159,6 +159,27 @@ bind = "$API"
 # 127.0.0.1 with no token to distribute. The validator now leaves those routes
 # UNMOUNTED unless a token is set or this says otherwise.
 allow_unauthenticated = true
+
+# One process, two sources — so it needs every gate the mesh has: the
+# submissionId does not commit to the asset's scale (H-2), and a signature is
+# withheld until this validator has read the destination gate itself and seen it
+# agree on the bridge decimals. B and C are listed alongside the real target A
+# because either is a legal destination for the other; an unused entry is inert,
+# a missing one silently kills that corridor.
+[[destinations]]
+chain_id = $A_CHAIN
+rpcs = ["$A_RPC"]
+gate = "$GATE_A"
+
+[[destinations]]
+chain_id = $B_CHAIN
+rpcs = ["$B_RPC"]
+gate = "$GATE_B"
+
+[[destinations]]
+chain_id = $C_CHAIN
+rpcs = ["$C_RPC"]
+gate = "$GATE_C"
 EOF
 
 cat > "$LOGS/keeper.toml" <<EOF

@@ -145,6 +145,27 @@ private_key = "$VALIDATOR_KEY"
 
 [store]
 dir = "$STORE"
+
+# The mesh is symmetric, so every validator gets every gate: the submissionId
+# does not commit to the asset's scale (H-2), and a validator signs only once it
+# has read the destination gate and seen it agree on the bridge decimals. Listing
+# a chain that is also this validator's own source costs nothing; omitting one it
+# can send to costs every transfer on that corridor, because the check fails
+# CLOSED.
+[[destinations]]
+chain_id = $A_CHAIN
+rpcs = ["$A_RPC"]
+gate = "$GATE_A"
+
+[[destinations]]
+chain_id = $B_CHAIN
+rpcs = ["$B_RPC"]
+gate = "$GATE_B"
+
+[[destinations]]
+chain_id = $C_CHAIN
+rpcs = ["$C_RPC"]
+gate = "$GATE_C"
 EOF
 }
 write_validator "$LOGS/validator-B.toml" $B_CHAIN "$B_RPC" "$GATE_B" "$LOGS/val-B-state.json"

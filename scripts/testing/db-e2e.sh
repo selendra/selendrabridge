@@ -177,6 +177,16 @@ private_key = "$V1K"
 
 [store]
 url = "$STORE_URL"
+
+# The allowlist is no longer the only thing that can withhold a signature: the
+# submissionId does not commit to the asset's scale (H-2), so the validator also
+# reads the destination gate and refuses unless it agrees on the bridge decimals.
+# CHECK 1/3 need that read to succeed, hence this entry. $OTHER_CHAIN stays
+# absent on purpose — CHECK 4's unallowlisted pair is unreachable anyway.
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 EOF
 cat > "$LOGS/db-keeper.toml" <<EOF
 [target]

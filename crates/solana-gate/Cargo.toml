@@ -46,3 +46,11 @@ libsecp256k1 = "0.6"
 # — which is how the relayer's mirrored `Config`/`SubmissionRecord` broke once.
 # default-features = false drops k256 (zeroize ^1.5 vs solana-program's <1.4).
 bridge-solana = { path = "../bridge-solana", default-features = false }
+
+# The deployed bytecode is built `--release` by `cargo build-sbf`, where Rust's
+# default is WRAP on overflow, while the host `cargo test` runs `dev`, where it
+# panics. Without this the tests check stricter arithmetic than the program that
+# ships (audit 2026-09-16, M-13). The code uses `checked_*` at every hot spot;
+# this is the belt to that pair of braces.
+[profile.release]
+overflow-checks = true

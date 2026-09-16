@@ -49,7 +49,9 @@ use crate::evm::GateReader;
 use crate::gate::{
     commitment, domain_id, hex32, sign, CANCEL_PREFIX, MARKER_CANCELLED, REFUND_PREFIX,
 };
-use crate::store::{SignerSig, Store};
+use crate::store::{
+    SignerSig, Store, SubmissionRecord, MAX_REFUND_PAGES, REFUND_PAGE,
+};
 
 /// What a DESTINATION gate says about a submission (either VM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,7 +293,19 @@ impl Attester {
     }
 
     async fn tick(&self) -> anyhow::Result<()> {
-        for rec in self.store.refund_candidates().await? {
+        // Walk the queue a page at a time (audit 2026-09-16, H-6); a short page
+        // is the end of it.
+        let mut candidates: Vec<SubmissionRecord> = Vec::new();
+        for p in 0..MAX_REFUND_PAGES {
+            let page = self.store.refund_candidates(REFUND_PAGE, p * REFUND_PAGE).await?;
+            let short = (page.len() as u64) < REFUND_PAGE;
+            candidates.extend(page);
+            if short {
+                break;
+            }
+        }
+
+        for rec in candidates {
             let Ok(id) = hex32(&rec.submission_id) else { continue };
 
             let facts = if rec.chain_id_to == self.chain_id {

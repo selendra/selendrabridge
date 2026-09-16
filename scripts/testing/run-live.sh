@@ -153,6 +153,21 @@ private_key = "$2"
 
 [store]
 url = "$STORE_URL"
+
+# Bridging runs BOTH ways here, so each validator needs both gates as peers: the
+# submissionId does not commit to the asset's scale (H-2), and a signature is
+# withheld until this validator has read the destination gate and seen it agree
+# on the bridge decimals. Drop either entry and that direction goes dead in the
+# UI with no error — the check fails CLOSED.
+[[destinations]]
+chain_id = $SRC_CHAIN
+rpcs = ["$SRC_RPC"]
+gate = "$GATE_SRC"
+
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 CFG
 }
 write_vcfg "$ROOT/.live-val1.toml" "$V1K" "$ROOT/.live-val1-state"

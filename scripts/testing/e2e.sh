@@ -141,6 +141,15 @@ private_key = "$VALIDATOR_KEY"
 
 [store]
 dir = "$STORE"
+
+# The submissionId does not commit to the scale the amount is in (H-2), so the
+# validator re-reads the DESTINATION gate and signs only once both ends agree on
+# the asset's bridge decimals. It fails CLOSED — with no peer listed here this
+# validator signs nothing and the transfer below never gets a signature.
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 EOF
 
 cat > "$LOGS/keeper.toml" <<EOF

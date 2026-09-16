@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import {
   WrongChainError,
+  bridgeDecimalsFromUnit,
   encodeApprove,
   encodeAutoParamsTo,
   encodeFinalize,
@@ -12,6 +13,7 @@ import {
   extractSent,
   readAllowance,
   readBalance,
+  readBridgeDecimalsFor,
   readDecimals,
   readRemoteRouter,
   readRouterGate,
@@ -383,6 +385,98 @@ test.describe("reads", () => {
     } finally {
       globalThis.fetch = original;
     }
+  });
+});
+
+// --- H-2: the destination gate's scale ------------------------------------
+
+/**
+ * `bridgeDecimalsFromUnit` / `readBridgeDecimalsFor`.
+ *
+ * H-2: the submissionId does not commit to the scale an amount is denominated
+ * in. The source gate divides by its own registered bridge decimals, the
+ * destination multiplies by its own, and one digit of disagreement mis-pays
+ * every claim of that asset by a power of ten — uncorrectably, since both
+ * registrations are write-once. The UI can only refuse such a transfer if this
+ * read is right, so the failure modes are pinned here: an unknown answer must
+ * come back as `null` (which the caller treats as a refusal), never as a number.
+ */
+const wordAddr = (a: string) => a.replace(/^0x/, "").toLowerCase().padStart(64, "0");
+
+/** A gate stub keyed by selector; a missing entry throws, like a revert. */
+function gateStub(answers: Record<string, string>) {
+  const selectors: string[] = [];
+  const req: Eip1193Request = async ({ method, params }) => {
+    if (method !== "eth_call") return null;
+    const data = (params?.[0] as { data: string }).data;
+    const sel = data.slice(2, 10);
+    selectors.push(sel);
+    const hit = answers[sel];
+    if (hit === undefined) throw new Error("execution reverted");
+    return hit;
+  };
+  return { req, selectors };
+}
+
+const ID = "0x" + "77".repeat(32);
+
+test.describe("bridgeDecimalsFromUnit", () => {
+  test("inverts unit = 10^(localDecimals - bridgeDecimals)", () => {
+    expect(bridgeDecimalsFromUnit(18, 1n)).toBe(18);
+    expect(bridgeDecimalsFromUnit(18, 10n ** 12n)).toBe(6);
+    expect(bridgeDecimalsFromUnit(6, 10n ** 6n)).toBe(0);
+  });
+
+  test("returns null rather than a guess for a unit that is not a power of ten", () => {
+    // A gate we cannot decompose is one we do not understand — and "do not
+    // understand" must not read as "agrees with the source".
+    expect(bridgeDecimalsFromUnit(18, 3n)).toBeNull();
+    expect(bridgeDecimalsFromUnit(18, 0n)).toBeNull();
+    expect(bridgeDecimalsFromUnit(18, 10n ** 19n)).toBeNull(); // more zeros than decimals
+    expect(bridgeDecimalsFromUnit(Number.NaN, 1n)).toBeNull();
+  });
+});
+
+test.describe("readBridgeDecimalsFor", () => {
+  test("decodes bridgeDecimalsFor(bytes32) and asks for the right asset", async () => {
+    const { req, selectors } = gateStub({
+      "93b06e9d": "0x" + word(1n) + word(6n) + word(18n) + wordAddr(B),
+    });
+    expect(await readBridgeDecimalsFor(req, A, ID)).toBe(6);
+    expect(selectors).toEqual(["93b06e9d"]); // one call, no fallback needed
+  });
+
+  test("an unmapped corridor (set == false) is UNKNOWN, not zero", async () => {
+    // `claim` there would revert UnknownAsset, so there is no scale to agree with.
+    const { req } = gateStub({ "93b06e9d": "0x" + word(0n) + word(0n) + word(0n) + word(0n) });
+    expect(await readBridgeDecimalsFor(req, A, ID)).toBeNull();
+  });
+
+  test("falls back to tokenOf + bridgeUnit on a gate deployed before this function", async () => {
+    // A pre-H-2 gate has no `bridgeDecimalsFor`: the call reverts (here) or
+    // returns empty data (below). Both must reach the two-call path, or the UI
+    // would refuse every transfer on a mesh that hasn't been upgraded yet.
+    const legacy = {
+      bae667bc: "0x" + wordAddr(B), // tokenOf(debridgeId) -> the local token
+      "4e3ff796": "0x" + word(10n ** 12n), // bridgeUnit(token)
+      "313ce567": "0x" + word(18n), // token.decimals()
+    };
+    const reverting = gateStub(legacy);
+    expect(await readBridgeDecimalsFor(reverting.req, A, ID)).toBe(6);
+    expect(reverting.selectors[0]).toBe("93b06e9d"); // tried the new one first
+
+    const empty = gateStub({ ...legacy, "93b06e9d": "0x" });
+    expect(await readBridgeDecimalsFor(empty.req, A, ID)).toBe(6);
+  });
+
+  test("is UNKNOWN when neither path answers", async () => {
+    expect(await readBridgeDecimalsFor(gateStub({}).req, A, ID)).toBeNull();
+    // An address with no code: every call succeeds and returns nothing.
+    expect(await readBridgeDecimalsFor(gateStub({ "93b06e9d": "0x", bae667bc: "0x" }).req, A, ID)).toBeNull();
+    // Mapped to the zero address = not registered here.
+    expect(
+      await readBridgeDecimalsFor(gateStub({ "93b06e9d": "0x", bae667bc: "0x" + word(0n) }).req, A, ID)
+    ).toBeNull();
   });
 });
 

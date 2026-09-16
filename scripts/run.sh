@@ -692,6 +692,18 @@ for key in "${VALIDATOR_KEYS[@]}"; do
     echo
     echo "[store]"
     echo "url = \"$STORE_URL\""
+    # H-2 (audit 2026-09-16): a validator must be able to read each peer gate to
+    # confirm it agrees on an asset's bridge decimals, or a destination
+    # registered one digit off pays a power of ten wrong and nothing on-chain
+    # catches it. Emitted UNCONDITIONALLY — unlike [refund], which an operator
+    # may legitimately disable — because without it the validator signs nothing.
+    for i in "${!CID[@]}"; do
+      echo
+      echo "[[destinations]]"
+      echo "chain_id = ${CID[$i]}"
+      echo "rpcs = [\"${CRPC[$i]}\"]"
+      echo "gate = \"${CGATE[$i]}\""
+    done
     if [[ "$ENABLE_REFUND" == "true" ]]; then
       echo
       echo "[refund]"

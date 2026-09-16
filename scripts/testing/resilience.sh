@@ -110,6 +110,16 @@ bind = "$API"
 # 127.0.0.1 with no token to distribute. The validator now leaves those routes
 # UNMOUNTED unless a token is set or this says otherwise.
 allow_unauthenticated = true
+
+# A is the only destination this run ever sends to, and the submissionId does not
+# commit to the asset's scale (H-2) — so without A here the validator would sign
+# nothing and the fault-isolation claim below would be untestable. C is
+# deliberately NOT listed: it is the chain we kill, and the point of the test is
+# that losing it costs B nothing.
+[[destinations]]
+chain_id = $A_CHAIN
+rpcs = ["$A_RPC"]
+gate = "$GATE_A"
 EOF
 cat > "$LOGS/keeper.toml" <<EOF
 [[targets]]

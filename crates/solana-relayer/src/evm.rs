@@ -77,6 +77,35 @@ fn quantity(v: &Value) -> anyhow::Result<u64> {
     Ok(u64::from_str_radix(if s.is_empty() { "0" } else { s }, 16)?)
 }
 
+/// Decode `bridgeDecimalsFor`'s return: `(bool set, uint8 bridgeDecimals,
+/// uint8 localDecimals, address localToken)` — four 32-byte words, each value
+/// right-aligned in its own word. `None` when `set` is false.
+///
+/// Hand-rolled because this crate deliberately carries no ABI codec (see
+/// Cargo.toml on why `bridge-core` is not a dependency), which is exactly why it
+/// is a separate, tested function rather than indexing inline.
+pub fn decode_bridge_decimals_for(ret: &[u8]) -> anyhow::Result<Option<u8>> {
+    if ret.len() < 128 {
+        anyhow::bail!(
+            "bridgeDecimalsFor returned {} bytes, expected at least 128 (is this gate older \
+             than the H-2 fix, which added the function?)",
+            ret.len()
+        );
+    }
+    // A bool is 31 zero bytes then 0 or 1; anything else is not this function's
+    // return and must not be read as one.
+    if ret[..31].iter().any(|b| *b != 0) || ret[31] > 1 {
+        anyhow::bail!("bridgeDecimalsFor's first word is not a bool");
+    }
+    if ret[31] == 0 {
+        return Ok(None); // no corridor registered for this id
+    }
+    if ret[32..63].iter().any(|b| *b != 0) {
+        anyhow::bail!("bridgeDecimalsFor's bridgeDecimals word exceeds a uint8");
+    }
+    Ok(Some(ret[63]))
+}
+
 pub struct GateReader {
     pub chain_id: u64,
     gate: String,
@@ -167,6 +196,24 @@ impl GateReader {
         Ok(EvmDestinationState { executed, cancelled })
     }
 
+    /// The bridge decimals this EVM gate would pay `debridge_id` out at, or
+    /// `None` when it has no corridor for it (or is older than the function).
+    ///
+    /// H-2 (audit 2026-09-16): the submissionId does not commit to the scale an
+    /// amount is in, so a Solana->EVM transfer whose two ends disagree is paid a
+    /// power of ten wrong. `claim` is permissionless, so this relayer withholding
+    /// its signature is the only thing that stops it — see `source.rs`.
+    ///
+    /// Read at the CONFIRMED block, like every other decision here: a
+    /// registration seen only at the tip could be reorged away after we signed.
+    pub async fn bridge_decimals_for(&self, debridge_id: &[u8; 32]) -> anyhow::Result<Option<u8>> {
+        let block = self.confirmed_block().await?;
+        let ret = self
+            .call(&encode_bytes32_call("bridgeDecimalsFor(bytes32)", debridge_id), block)
+            .await?;
+        decode_bridge_decimals_for(&ret)
+    }
+
     /// Source-side view at a confirmed block: did this gate lock `id`
     /// (`sentBy != 0`), and has it already paid it back (`refunded`)?
     pub async fn source_state(&self, id: &[u8; 32]) -> anyhow::Result<EvmSourceState> {
@@ -210,6 +257,63 @@ impl GateReader {
             Some(block) => self.was_sent_by_block(id, block).await,
             None => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_bridge_decimals {
+    use super::decode_bridge_decimals_for;
+
+    fn word(v: u8) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[31] = v;
+        w
+    }
+
+    fn ret(set: u8, bridge: u8, local: u8) -> Vec<u8> {
+        let mut r = word(set);
+        r.extend(word(bridge));
+        r.extend(word(local));
+        r.extend(vec![0u8; 32]); // localToken
+        r
+    }
+
+    /// H-2: the whole refusal hinges on reading the right byte out of the right
+    /// word. A 9-decimal mint bridged at 6 must read back as 6, not 9 or 0.
+    #[test]
+    fn reads_the_bridge_decimals_word() {
+        assert_eq!(decode_bridge_decimals_for(&ret(1, 6, 9)).unwrap(), Some(6));
+        assert_eq!(decode_bridge_decimals_for(&ret(1, 0, 18)).unwrap(), Some(0));
+    }
+
+    /// `set == false` is "no corridor", which must be distinguishable from a
+    /// corridor whose scale happens to be 0 — otherwise an unregistered peer
+    /// would compare equal to a 0-decimal asset and be waved through.
+    #[test]
+    fn an_unset_corridor_is_none_not_zero() {
+        assert_eq!(decode_bridge_decimals_for(&ret(0, 0, 0)).unwrap(), None);
+        assert_ne!(decode_bridge_decimals_for(&ret(1, 0, 0)).unwrap(), None);
+    }
+
+    /// A gate deployed before this function reverts, and an `eth_call` to a
+    /// non-contract returns empty. Neither may read as a valid scale.
+    #[test]
+    fn a_short_return_is_an_error_not_a_scale() {
+        assert!(decode_bridge_decimals_for(&[]).is_err());
+        assert!(decode_bridge_decimals_for(&word(1)).is_err(), "one word is not enough");
+        assert!(decode_bridge_decimals_for(&ret(1, 6, 9)[..127]).is_err());
+    }
+
+    /// Garbage that is not this function's return must not be decoded as one.
+    #[test]
+    fn a_non_bool_first_word_is_an_error() {
+        let mut r = ret(1, 6, 9);
+        r[0] = 0xff; // first word no longer a bool
+        assert!(decode_bridge_decimals_for(&r).is_err());
+
+        let mut r = ret(1, 6, 9);
+        r[32] = 0x01; // bridgeDecimals word wider than a uint8
+        assert!(decode_bridge_decimals_for(&r).is_err());
     }
 }
 

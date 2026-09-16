@@ -14,6 +14,15 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+/// Page size for walking [`Store::refund_candidates`]. Mirrors
+/// `bridge_core::backend::REFUND_PAGE`, which this crate cannot import (see the
+/// dependency note in Cargo.toml); keep the two in step.
+pub const REFUND_PAGE: u64 = 500;
+
+/// Pages walked per tick before deferring the remainder to the next one.
+/// Mirrors `bridge_core::backend::MAX_REFUND_PAGES`.
+pub const MAX_REFUND_PAGES: u64 = 20;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignerSig {
     pub signer: String,
@@ -90,8 +99,19 @@ impl Store {
     /// Submissions the store has flagged as stuck. Candidates only — the caller
     /// MUST still verify both ends on-chain before signing anything, which is
     /// exactly what `refund::Attester` does.
-    pub async fn refund_candidates(&self) -> anyhow::Result<Vec<SubmissionRecord>> {
-        let res = self.client.get(format!("{}/refund-candidates", self.base)).send().await?;
+    /// Paged: the queue is unbounded and the store is untrusted, so an unpaged
+    /// fetch can be grown until it fails on every tick (audit 2026-09-16, H-6).
+    /// Callers walk pages — see [`REFUND_PAGE`].
+    pub async fn refund_candidates(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<Vec<SubmissionRecord>> {
+        let res = self
+            .client
+            .get(format!("{}/refund-candidates?limit={limit}&offset={offset}", self.base))
+            .send()
+            .await?;
         if !res.status().is_success() {
             anyhow::bail!("sig-store refund-candidates failed ({})", res.status());
         }

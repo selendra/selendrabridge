@@ -717,6 +717,43 @@ contract Gate is Initializable, UUPSUpgradeable {
         return 10 ** (d.localDecimals - d.bridgeDecimals);
     }
 
+    /// @notice The scale THIS gate would use to pay out `debridgeId`, resolved
+    ///         through its own corridor registration.
+    ///
+    /// @dev    H-2 (audit 2026-09-16). The submissionId commits to `debridgeId`
+    ///         and an `amount`, but NOT to the decimals that amount is expressed
+    ///         in — the source divides by its own registered scale and the
+    ///         destination multiplies by its own, and nothing on-chain makes the
+    ///         two agree. One gate registered a digit off therefore pays a power
+    ///         of ten too much or too little on every claim of that asset, to any
+    ///         caller, and both registrations are write-once so it cannot be
+    ///         corrected in place.
+    ///
+    ///         Off-chain holds a `debridgeId`, not this chain's local token, so
+    ///         checking the destination scale used to take two calls
+    ///         (`tokenOf` then `bridgeDecimalsOf`) with a race between them. This
+    ///         answers it in one, atomically, which is what lets a validator
+    ///         refuse to sign a transfer whose two ends disagree — the only place
+    ///         the mismatch can still be stopped, since `claim` is permissionless
+    ///         and any holder of a quorum can submit it.
+    ///
+    ///         Never reverts: an unregistered corridor or token is `set == false`,
+    ///         so a caller can tell "no corridor" from "corridor at scale 0".
+    /// @return set          true when `debridgeId` maps to a token with decimals registered
+    /// @return bridgeDecimals the wire scale, meaningless unless `set`
+    /// @return localDecimals  the payout token's own decimals, meaningless unless `set`
+    /// @return localToken     the token that would be released, or the zero address
+    function bridgeDecimalsFor(bytes32 debridgeId)
+        external
+        view
+        returns (bool set, uint8 bridgeDecimals, uint8 localDecimals, address localToken)
+    {
+        localToken = tokenOf[debridgeId];
+        if (localToken == address(0)) return (false, 0, 0, address(0));
+        BridgeDecimals memory d = bridgeDecimalsOf[localToken];
+        return (d.set, d.bridgeDecimals, d.localDecimals, localToken);
+    }
+
     /// @notice Convert a local amount of `token` to its wire (bridge-decimals)
     ///         amount. Reverts {InexactAmount} when it does not convert exactly.
     function toBridgeAmount(address token, uint256 localAmount) public view returns (uint256) {

@@ -40,6 +40,39 @@ start)
   # Scoped sig-store credential: a relayer signs, so `Sign` is all it needs.
   [[ -f "$RUN_DIR/tokens.env" ]] && { set -a; . "$RUN_DIR/tokens.env"; set +a; }
 
+  # The EVM gates the scanner cross-checks before signing (H-2, audit
+  # 2026-09-16). The submissionId does not commit to the asset's scale, so a
+  # Solana->EVM transfer is signed only once the relayer has read the DESTINATION
+  # gate and seen it agree on the bridge decimals. It fails CLOSED, so a chain
+  # missing here is a chain nothing bridges to — which is why a missing
+  # addresses.env is an error and not a shrug.
+  ADDR_ENV="$RUN_DIR/addresses.env"
+  [[ -f "$ADDR_ENV" ]] || {
+    echo "  !! $ADDR_ENV not found — run scripts/run.sh first; without the gate" >&2
+    echo "     addresses the relayers can verify nothing and would sign nothing." >&2
+    exit 1
+  }
+  # shellcheck disable=SC1090
+  source "$ADDR_ENV"
+
+  # The RPC URLs carry the Alchemy key, so they reach the process through the
+  # environment like the signing keys do — never inlined into a world-readable
+  # TOML in /tmp.
+  # A scale read at the chain tip can be reorged away, so the reader refuses a
+  # zero buffer outright — clamp rather than emit a config it will reject.
+  EVM_CONF="${REFUND_BLOCK_CONFIRMATION:-6}"
+  (( EVM_CONF >= 1 )) || EVM_CONF=1
+  EVM_PEERS=()
+  for _entry in "${CHAINS[@]}"; do
+    IFS='|' read -r _cid _nm _rpc _ <<<"$_entry"
+    _cid="${_cid// /}"; _rpc="${_rpc// /}"
+    _gate_var="CHAIN_${_cid}_GATE"
+    _gate="${!_gate_var:-}"
+    [[ -n "$_gate" ]] || { echo "  !! $_gate_var unset in $ADDR_ENV" >&2; exit 1; }
+    export "EVM_RPC_$_cid=$_rpc"
+    EVM_PEERS+=("$_cid|$_gate")
+  done
+
   n=0
   for key in "${VALIDATOR_KEYS[@]}"; do
     n=$((n + 1))
@@ -67,6 +100,18 @@ start)
       echo "[store]"
       echo "url = \"$STORE_URL\""
       echo "token_env = \"SIG_STORE_VALIDATOR_TOKEN\""
+      # One reader per EVM chain a Solana-origin transfer can land on — see the
+      # EVM_PEERS comment above. block_confirmation is the same reorg argument as
+      # the refund attester's: a scale read at the tip can be reorged away.
+      for _peer in "${EVM_PEERS[@]}"; do
+        IFS='|' read -r _cid _gate <<<"$_peer"
+        echo
+        echo "[[evm_destinations]]"
+        echo "chain_id = $_cid"
+        echo "gate = \"$_gate\""
+        echo "rpc_env = \"EVM_RPC_$_cid\""
+        echo "block_confirmation = $EVM_CONF"
+      done
       # Exactly one deliverer — see the header.
       if [[ "$n" == "1" ]]; then
         echo

@@ -6,8 +6,14 @@
 #   * sequential nonce advance on real Sent events (0 then 1)
 #   * pause actually halts processing; resume drains the backlog
 #
-# Validator-only: we boot just the source chain (the target need not exist for
-# the validator to scan/sign). Run from anywhere:  bash scripts/testing/phase6.sh
+# Validator-only — no keeper, nothing is ever claimed. The target chain used to
+# be left un-booted entirely, but H-2 (audit 2026-09-16) makes the destination
+# gate a precondition for SIGNING, not just for claiming: the submissionId does
+# not commit to the asset's scale, so the validator reads the far gate's bridge
+# decimals and withholds its signature when it cannot. So we boot a minimal
+# target chain here — a gate and a registered corridor, no liquidity, no keeper.
+#
+# Run from anywhere:  bash scripts/testing/phase6.sh
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
@@ -30,6 +36,7 @@ VALIDATOR_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 RECEIVER=0x90F79bf6EB2c4f870365E785982E1f101E93b906
 
 SRC_RPC=http://127.0.0.1:8545
+DST_RPC=http://127.0.0.1:8546
 DEAD_RPC=http://127.0.0.1:9999       # intentionally down → exercises failover guard
 SRC_CHAIN=1337
 DST_CHAIN=1338
@@ -39,10 +46,12 @@ TWICE=200000000000000000000
 
 VALIDATOR_PID=""
 ANVIL_PID=""
+ANVIL_DST_PID=""
 cleanup() {
   echo "--- cleaning up ---"
   [[ -n "$VALIDATOR_PID" ]] && kill "$VALIDATOR_PID" 2>/dev/null || true
   [[ -n "$ANVIL_PID" ]] && kill "$ANVIL_PID" 2>/dev/null || true
+  [[ -n "$ANVIL_DST_PID" ]] && kill "$ANVIL_DST_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -70,12 +79,16 @@ stop_validator() {
 echo "=== building validator ==="
 ( cd "$ROOT" && cargo build -p validator >/dev/null 2>&1 )
 
-echo "=== starting anvil (source $SRC_CHAIN) ==="
+echo "=== starting anvil (source $SRC_CHAIN, target $DST_CHAIN) ==="
 pkill -f "anvil --chain-id" 2>/dev/null || true
 sleep 1
 anvil --chain-id $SRC_CHAIN --port 8545 >"$LOGS/anvil-p6.log" 2>&1 &
 ANVIL_PID=$!
-for i in $(seq 1 50); do cast chain-id --rpc-url "$SRC_RPC" >/dev/null 2>&1 && break; sleep 0.2; done
+anvil --chain-id $DST_CHAIN --port 8546 >"$LOGS/anvil-p6-dst.log" 2>&1 &
+ANVIL_DST_PID=$!
+for url in $SRC_RPC $DST_RPC; do
+  for i in $(seq 1 50); do cast chain-id --rpc-url "$url" >/dev/null 2>&1 && break; sleep 0.2; done
+done
 
 cd "$CONTRACTS"
 forge build >/dev/null
@@ -89,6 +102,19 @@ set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE" "$TOKEN" 18
 
 cast send "$TOKEN" "mint(address,uint256)" $ACC0 $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN" "approve(address,uint256)" "$GATE" $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+
+# The target side exists only to be READ. H-2 makes the far gate's registered
+# bridge decimals part of what a validator checks before signing, so the corridor
+# has to be registered there (setLocalToken + matching decimals) even though
+# nothing in this script ever claims. No liquidity and no keeper on purpose.
+TOKEN_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 \
+            --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
+GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$VALIDATOR]" 1)
+echo "  dst token=$TOKEN_DST gate=$GATE_DST"
+set_bridge_decimals "$DST_RPC" "$KEY0" "$GATE_DST" "$TOKEN_DST" 18
+DEBRIDGE_ID=$(cast keccak "0x$(printf '%064x' $SRC_CHAIN)${TOKEN#0x}")
+cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" \
+  --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
 echo "=== writing validator config (dead RPC first → failover guard) ==="
 cat > "$VCFG" <<EOF
@@ -115,6 +141,14 @@ bind = "$API"
 # 127.0.0.1 with no token to distribute. The validator now leaves those routes
 # UNMOUNTED unless a token is set or this says otherwise.
 allow_unauthenticated = true
+
+# Without this the validator signs nothing and every check below fails: the
+# submissionId does not commit to the asset's scale (H-2), so a destination it
+# cannot read is treated as the dangerous case and the signature is withheld.
+[[destinations]]
+chain_id = $DST_CHAIN
+rpcs = ["$DST_RPC"]
+gate = "$GATE_DST"
 EOF
 
 : > "$LOGS/validator-p6.log"

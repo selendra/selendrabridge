@@ -306,8 +306,17 @@ impl RemoteStore {
 
     /// Submissions the refund relayer should examine. Candidates only — the
     /// caller still verifies both chains on-chain before signing anything.
-    pub async fn refund_candidates(&self) -> Result<Vec<SubmissionRecord>, RemoteError> {
-        let url = format!("{}/refund-candidates", self.base);
+    /// One page of the refund queue. Paged because the store is untrusted and the
+    /// queue is unbounded: a full response could otherwise exceed
+    /// [`MAX_RESPONSE_BYTES`] forever, which fails the loop closed on every tick
+    /// with no way to make progress (audit 2026-09-16, H-6).
+    pub async fn refund_candidates(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<SubmissionRecord>, RemoteError> {
+        let url =
+            format!("{}/refund-candidates?limit={limit}&offset={offset}", self.base);
         json_capped(self.client.get(url).send().await?).await
     }
 

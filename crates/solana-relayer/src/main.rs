@@ -12,8 +12,8 @@
 //! the EVM validator uses, and store the signature.
 
 use solana_relayer::gate::evm_address;
-use solana_relayer::{config, observer, refund, source, store, target};
-use tracing::info;
+use solana_relayer::{config, evm, observer, refund, source, store, target};
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -91,7 +91,24 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let scanner = source::Scanner::new(cfg.source, key, sig_store())?;
+    // H-2: the scanner cross-checks each EVM destination's bridge decimals before
+    // signing, so it needs the same gate readers the refund attester uses. A peer
+    // with no reader here is unverifiable and will not be signed for.
+    let mut evm_gates = std::collections::BTreeMap::new();
+    for reader_cfg in cfg.scale_readers() {
+        evm_gates.insert(reader_cfg.chain_id, evm::GateReader::new(reader_cfg)?);
+    }
+    if evm_gates.is_empty() {
+        warn!(
+            "no [[evm_destinations]] (and no [[refund.evm]]) — this relayer cannot verify that an EVM destination \
+             agrees on an asset's bridge decimals, so it will sign NOTHING (audit H-2)"
+        );
+    } else {
+        info!(peers = ?evm_gates.keys().collect::<Vec<_>>(),
+              "bridge-decimals cross-check active for these EVM destinations");
+    }
+
+    let scanner = source::Scanner::new(cfg.source, key, sig_store(), evm_gates)?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");
 
     // Each loop is isolated: a dead submitter, attester or observer must never

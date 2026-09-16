@@ -104,6 +104,20 @@ sol! {
         /// The local ERC-20 backing a debridgeId on this chain, or address(0) if
         /// the asset isn't registered (a claim would revert with UnknownAsset).
         function tokenOf(bytes32 debridgeId) external view returns (address);
+        /// The asset's registered wire scale for a LOCAL token. `set == false`
+        /// when the token has none, in which case `send` would revert.
+        function bridgeDecimalsOf(address token)
+            external
+            view
+            returns (bool set, uint8 bridgeDecimals, uint8 localDecimals);
+        /// H-2: the scale THIS gate would pay `debridgeId` out at, resolved
+        /// through `tokenOf` in one atomic call. Never reverts; an unregistered
+        /// corridor is `set == false`. Absent on a gate deployed before the fix,
+        /// where the call reverts — the caller must treat that as "unknown".
+        function bridgeDecimalsFor(bytes32 debridgeId)
+            external
+            view
+            returns (bool set, uint8 bridgeDecimals, uint8 localDecimals, address localToken);
         /// True when `executed` was set by `cancel` rather than `claim` — i.e. the
         /// transfer was burned, not delivered.
         function cancelled(bytes32 submissionId) external view returns (bool);
