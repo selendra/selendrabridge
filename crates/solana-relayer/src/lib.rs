@@ -15,6 +15,7 @@
 //! account layout and digest domains with the runner ([`gate`]) rather than
 //! keeping its own — the duplication that let `bridge_domain` break both.
 
+pub mod cli;
 pub mod config;
 pub mod evm;
 pub mod gate;

@@ -445,3 +445,171 @@ contract DecimalsRouterTest is Test {
         assertEq(usdB.balanceOf(address(routerB)), 0, "no stable stranded at the router");
     }
 }
+
+/// @notice The router with a bridge unit > 1 on BOTH ends. `DecimalsRouterTest`
+///         scales the source only — its destination stable is 6/6, so there
+///         `toLocalAmount` is the identity and deleting the router's conversion
+///         would pass every test. Here the destination stable has 18 decimals
+///         bridged at 6: a claim releases `wire * 1e12`, and the swap, the owed
+///         debt and the stable fallback must all be in that local amount.
+contract DecimalsRouterScaledTest is Test {
+    uint256 constant CHAIN_A = 1337;
+    uint256 constant CHAIN_B = 8453;
+    uint256 constant UNIT = 1e12; // 18 local decimals bridged at 6
+
+    uint256 v1pk = 0xA11CE;
+    address user = address(0xBEEF);
+    address finalReceiver = address(0xF1A1);
+
+    Gate gateA;
+    Gate gateB;
+    DecToken usdA; // 18 decimals, bridged at 6
+    DecToken usdB; // 18 decimals, bridged at 6
+    DecToken weth;
+    DecToken tt;
+    SwapPool poolA;
+    SwapPool poolB;
+    SwapRouter routerA;
+    SwapRouter routerB;
+
+    function setUp() public {
+        address[] memory vals = new address[](1);
+        vals[0] = vm.addr(v1pk);
+
+        vm.chainId(CHAIN_A);
+        gateA = deployTestGate(vals, 1);
+        gateA.setSupportedChain(CHAIN_B, true);
+        usdA = new DecToken("USDa", 18);
+        weth = new DecToken("WETH", 18);
+        gateA.setBridgeDecimals(address(usdA), 6);
+        poolA = new SwapPool(address(usdA), 1000);
+        poolA.listToken(address(weth), 3180e18);
+        _seed(poolA, usdA, 10_000_000e18);
+        _seed(poolA, weth, 100e18);
+        routerA = new SwapRouter(gateA, poolA);
+
+        vm.chainId(CHAIN_B);
+        gateB = deployTestGate(vals, 1);
+        usdB = new DecToken("USDb", 18);
+        tt = new DecToken("TT", 18);
+        gateB.setBridgeDecimals(address(usdB), 6);
+        poolB = new SwapPool(address(usdB), 1000);
+        poolB.listToken(address(tt), 2e18);
+        _seed(poolB, usdB, 10_000_000e18);
+        _seed(poolB, tt, 1_000_000e18);
+        routerB = new SwapRouter(gateB, poolB);
+        gateB.setLocalToken(BridgeHash.getDebridgeId(CHAIN_A, address(usdA)), address(usdB));
+        usdB.mint(address(gateB), 10_000_000e18);
+
+        routerA.setRemoteRouter(CHAIN_B, abi.encodePacked(address(routerB)));
+        routerB.setRemoteRouter(CHAIN_A, abi.encodePacked(address(routerA)));
+    }
+
+    function _seed(SwapPool pool, DecToken token, uint256 amt) internal {
+        token.mint(address(this), amt);
+        token.approve(address(pool), amt);
+        pool.seedLiquidity(address(token), amt);
+    }
+
+    struct Leg {
+        bytes32 did;
+        uint256 wire;
+        bytes recv;
+        bytes autoParams;
+        bytes sender;
+        bytes32 id;
+    }
+
+    /// 1 WETH -> 3180 USDa (no dust at this price) -> 3180e6 on the wire -> B.
+    function _send() internal returns (Leg memory l) {
+        vm.chainId(CHAIN_A);
+        weth.mint(user, 1e18);
+        vm.startPrank(user);
+        weth.approve(address(routerA), 1e18);
+        l.id = routerA.swapAndBridge(address(weth), 1e18, 0, CHAIN_B, address(tt), finalReceiver, 0);
+        vm.stopPrank();
+        l.wire = 3180e6;
+        l.did = BridgeHash.getDebridgeId(CHAIN_A, address(usdA));
+        l.recv = abi.encodePacked(address(routerB));
+        l.sender = abi.encodePacked(address(routerA));
+        l.autoParams = abi.encode(
+            Gate.AutoParamsTo({
+                executionFee: 0,
+                flags: 0,
+                fallbackAddress: abi.encodePacked(finalReceiver),
+                data: abi.encode(address(tt), finalReceiver, uint256(0))
+            })
+        );
+        assertEq(l.id, gateA.computeSubmissionId(l.did, l.wire, CHAIN_A, CHAIN_B, 0, l.recv, l.autoParams, l.sender));
+        vm.chainId(CHAIN_B);
+    }
+
+    function _sigs(bytes32 id) internal view returns (bytes[] memory sigs) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(v1pk, MessageHashUtils.toEthSignedMessageHash(id));
+        sigs = new bytes[](1);
+        sigs[0] = abi.encodePacked(r, s, v);
+    }
+
+    function _finalize(address who, Leg memory l) internal {
+        vm.prank(who);
+        routerB.finalize(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender);
+    }
+
+    function test_Destination_SwapsTheLocalAmountTheClaimReleased() public {
+        Leg memory l = _send();
+        routerB.claimAndFinalize(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
+
+        // 3180e18 USDb at TT = 2.0 -> 1590 TT. Swapping the wire amount instead
+        // (3180e6 units) would pay 1590e6 TT units — a trillionth.
+        assertEq(tt.balanceOf(finalReceiver), 1590e18, "must swap the local amount");
+        assertEq(usdB.balanceOf(address(routerB)), 0, "no stable stranded at the router");
+    }
+
+    function test_Destination_DeferredDebtAndFallbackAreInLocalUnits() public {
+        Leg memory l = _send();
+        gateB.claim(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
+        poolB.pause();
+
+        _finalize(address(0xBAD), l);
+        assertFalse(routerB.finalized(l.id));
+        assertEq(routerB.owedStable(), l.wire * UNIT, "the debt is what the router holds, in local units");
+        assertEq(usdB.balanceOf(address(routerB)), l.wire * UNIT);
+
+        vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
+        _finalize(finalReceiver, l);
+        assertTrue(routerB.finalized(l.id));
+        assertEq(usdB.balanceOf(finalReceiver), l.wire * UNIT, "the fallback pays the local amount");
+        assertEq(routerB.owedStable(), 0, "debt cleared exactly");
+        assertEq(usdB.balanceOf(address(routerB)), 0);
+    }
+
+    /// A swap whose whole output is below one bridge unit has nothing to bridge:
+    /// refused, and the caller keeps their input.
+    function test_SwapAndBridge_AnOutputOfOnlyDustReverts() public {
+        vm.chainId(CHAIN_A);
+        uint256 amountIn = 1e8; // 1e-10 WETH -> 3.18e-7 USDa = 318_000_000_000 units < 1e12
+        assertLt(poolA.quote(address(weth), address(usdA), amountIn), UNIT, "setup: must be sub-unit");
+        weth.mint(user, amountIn);
+        vm.startPrank(user);
+        weth.approve(address(routerA), amountIn);
+        vm.expectRevert(SwapRouter.ZeroAmount.selector);
+        routerA.swapAndBridge(address(weth), amountIn, 0, CHAIN_B, address(tt), finalReceiver, 0);
+        vm.stopPrank();
+        assertEq(weth.balanceOf(user), amountIn, "input untouched");
+        assertEq(gateA.nonceTo(CHAIN_B), 0, "nothing sent");
+    }
+
+    /// Paying in the stable skips the pool, and still returns the sub-unit tail.
+    function test_SwapAndBridge_StableInputReturnsItsDust() public {
+        vm.chainId(CHAIN_A);
+        uint256 amountIn = 5e18 + 123; // 5 USDa and 123 units of dust
+        usdA.mint(user, amountIn);
+        vm.startPrank(user);
+        usdA.approve(address(routerA), amountIn);
+        routerA.swapAndBridge(address(usdA), amountIn, 0, CHAIN_B, address(tt), finalReceiver, 0);
+        vm.stopPrank();
+        assertEq(usdA.balanceOf(user), 123, "dust handed back");
+        assertEq(usdA.balanceOf(address(routerA)), 0, "router keeps nothing");
+        assertEq(usdA.balanceOf(address(gateA)), 5e18, "only whole units locked");
+    }
+}

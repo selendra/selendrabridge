@@ -12,7 +12,9 @@
 //! `solana-swap` rather than mirrored here. Hand-copied definitions are how the
 //! gate's two `Sent` structs drifted apart while both sides kept compiling.
 //!
-//!   swap-admin --rpc <url> --keypair <path> --program <pubkey> <command>
+//!   swap-admin (--rpc-env <VAR> | --rpc <url>) --keypair <path> --program <pubkey> <command>
+//!
+//!     Prefer `--rpc-env` for a keyed provider URL: `--rpc` puts it in `ps`.
 //!
 //!     init --hub-mint <pubkey> --hub-vault <pubkey>
 //!          [--fee-bps N] [--deviation-bps N] [--min-price-interval SECS]
@@ -135,7 +137,9 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no command; see the header of this file"))?;
     let args = Args(argv);
 
-    let rpc_url = args.req("--rpc")?;
+    let rpc_url = solana_relayer::cli::resolve_rpc(args.get("--rpc"), args.get("--rpc-env"), |v| {
+        std::env::var(v).ok()
+    })?;
     let program_id = args.key("--program")?;
     let payer = read_keypair_file(args.req("--keypair")?)
         .map_err(|e| anyhow::anyhow!("reading keypair: {e}"))?;

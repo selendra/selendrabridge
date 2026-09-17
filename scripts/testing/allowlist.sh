@@ -38,9 +38,15 @@ fi
 # The ERC-20 `seed` allowlists. Prefer the address the running stack actually
 # deployed; fall back to the deterministic local anvil one (account #0 deploys
 # TestToken first).
-if [ -z "${TOKEN:-}" ] && [ -f "${RUN_DIR:-/tmp/bridge-run}/addresses.env" ]; then
-  # shellcheck disable=SC1090
-  . "${RUN_DIR:-/tmp/bridge-run}/addresses.env"
+#
+# Read with load_env_file, never `.`: this used to SOURCE a file from the fixed,
+# shared /tmp/bridge-run — which any local user could create first (audit round
+# 5, LOW). The default is now scripts/run.sh's own private run dir.
+# shellcheck source=_rundir.sh
+. "$(dirname "${BASH_SOURCE[0]}")/_rundir.sh"
+_run_dir="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/run}"
+if [ -z "${TOKEN:-}" ] && [ -f "$_run_dir/addresses.env" ]; then
+  load_env_file "$_run_dir/addresses.env" || exit 1
   TOKEN="${TOKEN_TST_1337:-}"
 fi
 TOKEN="${TOKEN:-0x5FbDB2315678afecb367f032d93F642f64180aa3}"

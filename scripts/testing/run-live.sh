@@ -26,8 +26,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 WEB="$ROOT/frontend"
-LOG=/tmp/bridge-run
-mkdir -p "$LOG"
+# A private per-user dir, not the fixed /tmp/bridge-run (audit round 5, LOW): a
+# shared path can be pre-created or symlinked by another local user, and the
+# keeper TOML written here carries a private key.
+source "$ROOT/scripts/testing/_rundir.sh"
+LOG="$(bridge_state_dir live)"
 
 # Postgres-backed sig-store (the file-per-id store was retired). Runs in Docker.
 PG_NAME=bridge-pg-live

@@ -187,14 +187,47 @@ enum Decision {
 /// `handle_candidate` would spend to reach the same answer, on every tick, for
 /// as long as the row stays in the queue (audit 2026-09-16, H-6).
 ///
-/// Uses the store's `signer` labels, like [`decide`]'s own inputs: the sig-store
-/// verifies a signature against its claimed signer on write, and a store hostile
-/// enough to forge the label already controls this loop's liveness by choosing
-/// the candidate list. It is a cost filter, never a safety boundary.
-fn fully_attested_by_us(rec: &SubmissionRecord, signer_addr: Address) -> bool {
-    let me = format!("{signer_addr:#x}");
-    let mine = |sigs: &[SignerSig]| sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&me));
-    mine(&rec.cancel_signatures) && mine(&rec.refund_signatures)
+/// Counts only attestations that RECOVER to this validator over their own
+/// domain's digest — see [`attested_by`].
+fn fully_attested_by_us(rec: &SubmissionRecord, id: B256, signer_addr: Address) -> bool {
+    attested_by(&rec.cancel_signatures, id, SigKind::Cancel, signer_addr)
+        && attested_by(&rec.refund_signatures, id, SigKind::Refund, signer_addr)
+}
+
+/// Does `sigs` hold a genuine `kind` attestation by `signer_addr` for `id`?
+///
+/// Decided by RECOVERING each signature over `kind`'s digest, never by the
+/// store's `signer` label (audit 2026-09-16, LOW). The label is a string the
+/// store hands back: a store — or anything between us and it — that puts our
+/// address on a junk signature used to make this validator believe it had
+/// already voted, so it never attested that transfer again and its refund quorum
+/// was one short for good. Recovery is what the Gate will do with the bytes, so
+/// it is the only answer to "have we voted" that means anything on-chain.
+fn attested_by(sigs: &[SignerSig], id: B256, kind: SigKind, signer_addr: Address) -> bool {
+    sigs.iter()
+        .any(|s| matches!(bridge_core::store::verify_attestation(id, kind, s), Ok(a) if a == signer_addr))
+}
+
+/// The submissionId a candidate's OWN params hash to, or an error if the store
+/// paired them with a different id.
+///
+/// Every routing decision in [`handle_candidate`] — which chain is the
+/// destination, which is the source — comes from `chain_id_to`/`chain_id_from`,
+/// while every read and the signature itself are keyed on `submission_id`.
+/// Nothing tied the two together (audit 2026-09-16, LOW), so a record naming a
+/// real id with a different corridor sent the `executed`/`cancelled` reads to a
+/// gate that has never heard of the transfer and decided it from what that gate
+/// said. The sig-store enforces this binding on write; this validator no longer
+/// takes that on trust, exactly as it does not take the store's timeout.
+fn bound_submission_id(rec: &SubmissionRecord) -> anyhow::Result<B256> {
+    let claimed = B256::from_str(&rec.submission_id).context("bad submission_id")?;
+    let computed = bridge_core::store::canonical_submission_id(rec)
+        .map_err(|e| anyhow::anyhow!("candidate params do not form a submissionId: {e}"))?;
+    anyhow::ensure!(
+        computed == claimed,
+        "candidate {claimed:#x} carries params that hash to {computed:#x}; refusing to route reads by them"
+    );
+    Ok(claimed)
 }
 
 /// Decide from on-chain facts alone. Split out from the I/O so the safety rules
@@ -365,11 +398,19 @@ pub async fn run(
             // a candidate this validator has already attested in both domains has
             // nothing left for it to do, and re-deciding it costs the same RPC
             // budget as a fresh one.
-            if fully_attested_by_us(&rec, signer_addr) {
+            let id = match bound_submission_id(&rec) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(submission_id = %rec.submission_id, error = %e, "refund candidate refused");
+                    continue;
+                }
+            };
+            if fully_attested_by_us(&rec, id, signer_addr) {
                 continue;
             }
             if let Err(e) = handle_candidate(
                 &rec,
+                id,
                 &source_readers,
                 &dest_readers,
                 &signer,
@@ -390,6 +431,8 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn handle_candidate(
     rec: &SubmissionRecord,
+    // Verified by `bound_submission_id`: the id `rec`'s params hash to.
+    id: B256,
     source_readers: &BTreeMap<u64, GateReader>,
     dest_readers: &BTreeMap<u64, GateReader>,
     signer: &PrivateKeySigner,
@@ -405,8 +448,6 @@ async fn handle_candidate(
     // refund leg is possible — `decide` enforces that — and the age is never
     // claimed: `aged_out` stays false.
     let src = source_readers.get(&rec.chain_id_from);
-
-    let id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
     let dst_state = dst.destination_state(id).await.context("reading destination gate")?;
     let src_state = match src {
@@ -433,13 +474,12 @@ async fn handle_candidate(
         }
     };
 
-    let mine = |sigs: &[SignerSig]| sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&format!("{signer_addr:#x}")));
     let decision = decide(
         src_state.as_ref(),
         &dst_state,
         aged_out,
-        mine(&rec.cancel_signatures),
-        mine(&rec.refund_signatures),
+        attested_by(&rec.cancel_signatures, id, SigKind::Cancel, signer_addr),
+        attested_by(&rec.refund_signatures, id, SigKind::Refund, signer_addr),
     );
 
     let kind = match decision {
@@ -600,41 +640,114 @@ mod tests {
         }
     }
 
-    /// The pre-filter itself: both domains signed by us, matched case-insensitively.
-    #[test]
-    fn fully_attested_needs_both_domains() {
-        let me = Address::repeat_byte(0x11);
-        let other = Address::repeat_byte(0x22);
-        let sig = |a: Address| SignerSig {
-            signer: format!("{a:#X}"), // upper-case: the store's label casing varies
-            signature: "0x00".into(),
-        };
-        let mut rec = SubmissionRecord {
-            submission_id: String::new(),
-            bridge_domain: String::new(),
-            debridge_id: String::new(),
-            amount: String::new(),
+    use alloy::signers::SignerSync;
+    use alloy::primitives::U256;
+
+    /// A candidate whose id genuinely binds its params.
+    fn bound_record() -> SubmissionRecord {
+        let domain = B256::repeat_byte(0xD0);
+        let token = Address::repeat_byte(0x33);
+        let debridge_id = bridge_core::debridge_id(U256::from(1u64), token);
+        let receiver = Address::repeat_byte(0xAB).to_vec();
+        let id = bridge_core::submission_id(
+            domain,
+            debridge_id,
+            U256::from(100u64),
+            U256::from(1u64),
+            U256::from(2u64),
+            U256::from(7u64),
+            &receiver,
+        );
+        SubmissionRecord {
+            submission_id: format!("{id:#x}"),
+            bridge_domain: format!("{domain:#x}"),
+            debridge_id: format!("{debridge_id:#x}"),
+            amount: "100".into(),
             chain_id_from: 1,
             chain_id_to: 2,
-            nonce: 0,
-            receiver: String::new(),
-            auto_params: String::new(),
-            native_sender: String::new(),
-            token: String::new(),
+            nonce: 7,
+            receiver: format!("0x{}", hex::encode(&receiver)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: format!("{token:#x}"),
             signatures: vec![],
             cancel_signatures: vec![],
             refund_signatures: vec![],
-        };
-        assert!(!fully_attested_by_us(&rec, me));
+        }
+    }
 
-        rec.cancel_signatures = vec![sig(me)];
-        assert!(!fully_attested_by_us(&rec, me), "cancel alone is not done");
+    fn attest(key: &PrivateKeySigner, id: B256, kind: SigKind) -> SignerSig {
+        let sig = key.sign_message_sync(kind.digest(id).as_slice()).unwrap();
+        SignerSig { signer: format!("{:#X}", key.address()), signature: encode_signature(&sig) }
+    }
 
-        rec.refund_signatures = vec![sig(other)];
-        assert!(!fully_attested_by_us(&rec, me), "another validator's refund is not ours");
+    /// The pre-filter itself: both domains genuinely signed by us.
+    #[test]
+    fn fully_attested_needs_both_domains() {
+        let me = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random();
+        let mut rec = bound_record();
+        let id = bound_submission_id(&rec).unwrap();
+        assert!(!fully_attested_by_us(&rec, id, me.address()));
 
-        rec.refund_signatures.push(sig(me));
-        assert!(fully_attested_by_us(&rec, me));
+        rec.cancel_signatures = vec![attest(&me, id, SigKind::Cancel)];
+        assert!(!fully_attested_by_us(&rec, id, me.address()), "cancel alone is not done");
+
+        rec.refund_signatures = vec![attest(&other, id, SigKind::Refund)];
+        assert!(!fully_attested_by_us(&rec, id, me.address()), "another validator's refund is not ours");
+
+        rec.refund_signatures.push(attest(&me, id, SigKind::Refund));
+        assert!(fully_attested_by_us(&rec, id, me.address()));
+    }
+
+    /// THE regression (audit 2026-09-16, LOW). The dedupe used to trust the
+    /// store's `signer` LABEL, so a junk signature filed under our address made
+    /// this validator believe it had already voted — it never attested that
+    /// transfer, and the refund quorum stayed one short forever.
+    #[test]
+    fn a_label_with_our_address_on_a_signature_we_did_not_make_is_not_our_vote() {
+        let me = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random();
+        let rec = bound_record();
+        let id = bound_submission_id(&rec).unwrap();
+        let mine = format!("{:#x}", me.address());
+
+        // Someone else's genuine signature, relabelled as ours.
+        let mut forged = attest(&other, id, SigKind::Cancel);
+        forged.signer = mine.clone();
+        assert!(!attested_by(&[forged], id, SigKind::Cancel, me.address()));
+
+        // Garbage bytes under our label.
+        let junk = SignerSig { signer: mine, signature: format!("0x{}", "00".repeat(65)) };
+        assert!(!attested_by(&[junk], id, SigKind::Cancel, me.address()));
+
+        // Our real transfer signature does not count as a cancel vote either.
+        let wrong_domain = attest(&me, id, SigKind::Transfer);
+        assert!(!attested_by(&[wrong_domain], id, SigKind::Cancel, me.address()));
+
+        // And the real thing does.
+        assert!(attested_by(&[attest(&me, id, SigKind::Cancel)], id, SigKind::Cancel, me.address()));
+    }
+
+    /// THE regression (audit 2026-09-16, LOW). Reads are routed by
+    /// `chain_id_to`/`chain_id_from` but keyed on `submission_id`; a candidate
+    /// whose corridor was swapped under a real id is refused before any read.
+    #[test]
+    fn a_candidate_whose_params_do_not_hash_to_its_id_is_refused() {
+        let good = bound_record();
+        assert!(bound_submission_id(&good).is_ok(), "premise: the fixture binds");
+
+        let mut rerouted = good.clone();
+        rerouted.chain_id_to = 99;
+        assert!(bound_submission_id(&rerouted).is_err(), "a different destination must not be read");
+
+        let mut resourced = good.clone();
+        resourced.chain_id_from = 98;
+        assert!(bound_submission_id(&resourced).is_err(), "a different source must not be read");
+
+        let mut garbage = good;
+        garbage.submission_id = "not-an-id".into();
+        assert!(bound_submission_id(&garbage).is_err());
     }
 
     #[test]

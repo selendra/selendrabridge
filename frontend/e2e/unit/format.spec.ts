@@ -8,6 +8,7 @@ import {
   isSolanaAccount,
   parseUnits,
   receiverProblem,
+  isNonEvmChain,
   shortHex,
   tokenGradient,
 } from "../../src/data/format";
@@ -127,27 +128,40 @@ test.describe("address + receiver validation", () => {
     expect(isSolanaAccount("1".repeat(45))).toBe(false);
   });
 
+  const EVM_DEST = { gate: "0x" + "b".repeat(40), rpcUrl: "http://127.0.0.1:8546" };
+  const SOLANA_DEST = { gate: "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133", rpcUrl: null };
+
   test("an EVM destination demands an EVM address", () => {
-    expect(receiverProblem("0x" + "a".repeat(40), 1338)).toBeNull();
-    expect(receiverProblem("", 1338)).toMatch(/Enter a receiver/);
-    expect(receiverProblem("nonsense", 1338)).toMatch(/valid 0x address/);
+    expect(receiverProblem("0x" + "a".repeat(40), EVM_DEST)).toBeNull();
+    expect(receiverProblem("", EVM_DEST)).toMatch(/Enter a receiver/);
+    expect(receiverProblem("nonsense", EVM_DEST)).toMatch(/valid 0x address/);
   });
 
   test("a Solana key typed into an EVM destination is named, not just rejected", () => {
-    const problem = receiverProblem("SysvarC1ock11111111111111111111111111111111", 1338);
+    const problem = receiverProblem("SysvarC1ock11111111111111111111111111111111", EVM_DEST);
     expect(problem).toMatch(/Solana key/);
   });
 
   test("a Solana destination demands a base58 token account", () => {
-    expect(receiverProblem("SysvarC1ock11111111111111111111111111111111", SOLANA_CHAIN_ID)).toBeNull();
-    expect(receiverProblem("!!!!", SOLANA_CHAIN_ID)).toMatch(/base58/);
+    expect(receiverProblem("SysvarC1ock11111111111111111111111111111111", SOLANA_DEST)).toBeNull();
+    expect(receiverProblem("!!!!", SOLANA_DEST)).toMatch(/base58/);
   });
 
   test("an EVM address typed into a Solana destination is named", () => {
     // Funds released to a 20-byte value on Solana are unrecoverable without a
     // round trip, so this has to be caught before signing, not after.
-    const problem = receiverProblem("0x" + "a".repeat(40), SOLANA_CHAIN_ID);
+    const problem = receiverProblem("0x" + "a".repeat(40), SOLANA_DEST);
     expect(problem).toMatch(/EVM address/);
+  });
+
+  test("the destination's VM comes from its registry row, not a chain id", () => {
+    // A base58 gate is a Solana program whatever id it is registered under.
+    expect(isNonEvmChain(SOLANA_DEST)).toBe(true);
+    expect(isNonEvmChain(EVM_DEST)).toBe(false);
+    // The older "listed, not polled" row: no gate, no url.
+    expect(isNonEvmChain({ gate: null, rpcUrl: null })).toBe(true);
+    // An unknown destination is validated as EVM, as before.
+    expect(receiverProblem("0x" + "a".repeat(40), null)).toBeNull();
   });
 
   test("SOLANA_CHAIN_ID is deBridge's value, hashed into every submissionId", () => {

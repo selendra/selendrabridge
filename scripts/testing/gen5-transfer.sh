@@ -17,9 +17,12 @@ export PATH="$HOME/.foundry/bin:$PATH"
 CFG="${1:-scripts/gen5.config.local}"
 # shellcheck disable=SC1090
 source "$CFG"
-RUN_DIR="${RUN_DIR:-/tmp/bridge-gen5}"
-# shellcheck disable=SC1091
-source "$RUN_DIR/addresses.env"
+# Run-dir files are PARSED, not sourced, and only from a dir this user owns
+# (audit round 5, LOW: the old fixed /tmp default could be pre-created by any
+# local user). See _rundir.sh.
+source "$ROOT/scripts/testing/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/gen5}"
+load_env_file "$RUN_DIR/addresses.env"
 GQL="http://${BIND_HOST:-127.0.0.1}:${GQL_PORT:-8088}/graphql"
 
 rpc_for() { local want=$1 e c n r; for e in "${CHAINS[@]}"; do IFS='|' read -r c n r _ <<<"$e"; [[ "${c// /}" == "$want" ]] && { printf '%s' "${r// /}"; return; }; done; }

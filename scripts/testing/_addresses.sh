@@ -16,9 +16,14 @@
 # actually wrote instead of restating them here.
 #
 # Sets: GATE_A GATE_B TOKEN_A TOKEN_B TOKEN GATE SWAP_POOL BRIDGE_DOMAIN
-# Honours: RUN_DIR (default /tmp/bridge-run), CHAIN_A/CHAIN_B, ASSET.
+# Honours: RUN_DIR (default: scripts/run.sh's run dir), CHAIN_A/CHAIN_B, ASSET.
+#
+# The file is parsed, not sourced (audit round 5, LOW): it used to be read from a
+# fixed /tmp path any local user could create first. See _rundir.sh.
 
-RUN_DIR="${RUN_DIR:-/tmp/bridge-run}"
+# shellcheck source=_rundir.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/run}"
 CHAIN_A="${CHAIN_A:-1337}"
 CHAIN_B="${CHAIN_B:-1338}"
 ASSET="${ASSET:-TST}"
@@ -28,8 +33,7 @@ if [[ ! -f "$_addr_env" ]]; then
   echo "ERROR: $_addr_env not found — is the stack up? (bash scripts/run.sh)" >&2
   return 1 2>/dev/null || exit 1
 fi
-# shellcheck disable=SC1090
-source "$_addr_env"
+load_env_file "$_addr_env" || { return 1 2>/dev/null || exit 1; }
 
 _need() {  # _need VARNAME  -> echoes its value, or dies naming what is missing
   local v="${!1:-}"

@@ -997,14 +997,23 @@ pub enum GateError {
     /// config account was sized for at init.
     #[error("at capacity — the config account was sized for fewer entries")]
     AtCapacity,
-    /// M-2: refund asked for a submissionId this gate never emitted (or one
-    /// already refunded — the record is closed on payout).
+    /// M-2: refund asked for a submissionId this gate never emitted. (An id
+    /// already refunded never gets this far: the `["refunded", id]` marker
+    /// refuses it first with `AlreadyExecuted`, and its `sent` record is zeroed,
+    /// not closed.)
     #[error("this gate never sent that submissionId")]
     NotSent,
-    /// M-2: the transfer was already claimed here, so it cannot be cancelled.
+    /// RESERVED — never returned. A cancel of an already-claimed transfer fails
+    /// with `AlreadyExecuted` (claim and cancel share the `["executed", id]`
+    /// marker). Kept only because the discriminant is the on-chain `Custom` code
+    /// and removing a variant would renumber every error after it.
     #[error("already claimed — cannot cancel")]
     AlreadyClaimed,
-    /// M-2: the destination has not been burned, so no refund is authorised.
+    /// RESERVED — never returned. The program cannot observe the destination
+    /// chain, so it never checks for a burn directly: a refund is authorised by
+    /// the validators' refund quorum, which they only sign after observing the
+    /// burn. Without that quorum a refund fails `NotEnoughSignatures`. Kept for
+    /// discriminant stability, like `AlreadyClaimed`.
     #[error("destination not cancelled")]
     NotCancelled,
     /// More signatures than the gate has validators. A correct array can never
@@ -1092,6 +1101,20 @@ fn validate_validator_set(validators: &[[u8; 20]], threshold: u32) -> Result<(),
         if validators[..i].contains(v) {
             return Err(GateError::DuplicateValidator.into());
         }
+    }
+    Ok(())
+}
+
+/// `init`'s `chain_id` (audit 2026-09-16 LOW: it accepted any value). It is
+/// hashed into every submissionId this gate emits or accepts and can never be
+/// changed afterwards, so a zero — what an unset field looks like — would be a
+/// gate whose every transfer hashes to ids no peer derives. Only the zero is
+/// refused: every real deployment passes deBridge's Solana id, and no other value
+/// is knowable to be wrong on-chain.
+fn validate_init_chain_id(chain_id: u64) -> Result<(), ProgramError> {
+    if chain_id == 0 {
+        msg!("chain_id must be non-zero");
+        return Err(ProgramError::InvalidArgument);
     }
     Ok(())
 }
@@ -1445,7 +1468,14 @@ fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArg
 ///            source_token(w), vault_authority, spl_token_program, system_program]
 ///
 /// M-2, SOURCE side. Return locked funds to the token account they came from,
-/// after the destination has been burned.
+/// once a validator quorum has attested that the destination burned the
+/// transfer.
+///
+/// This program performs NO burn check of its own and cannot: the destination is
+/// another chain. The burn is established off-chain by each validator before it
+/// signs `refundId`, so the quorum below IS the burn proof — a refund without
+/// one fails `NotEnoughSignatures`, never `NotCancelled` (which is reserved and
+/// never returned).
 ///
 /// Three independent guards stand between a caller and the vault, mirroring
 /// `Gate.refund`:
@@ -1457,6 +1487,14 @@ fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArg
 ///
 /// The `["refunded", id]` marker is the replay guard, and the `sent` record is
 /// zeroed on payout so it can never authorise a second one.
+///
+/// The zeroed `sent` account is deliberately NOT closed, although that strands
+/// its rent (audit 2026-09-16 LOW, reviewed and kept). Off-chain readers
+/// distinguish three states at that address — absent (never sent), live (sent),
+/// zeroed (sent and refunded; see `solana-relayer`'s `solana_source_record`) —
+/// and the refund attester's cancel/refund decisions depend on "zeroed" not
+/// reading as "never sent". Closing it would change that across every relayer in
+/// the fleet at once, for a few thousand lamports per refund.
 fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArgs) -> ProgramResult {
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
@@ -1580,6 +1618,8 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
     }
     // LOW (round 4): threshold in range, no duplicates, no zero address.
     validate_validator_set(&args.validators, args.threshold)?;
+    // `chain_id` is bound into every submissionId and is write-once here.
+    validate_init_chain_id(args.chain_id)?;
     // Capacities must cover the initial set and be non-zero, or the gate is born
     // unable to register the corridor it needs to send anything.
     if args.max_validators < args.validators.len() as u32 || args.max_corridors == 0 {
@@ -2274,6 +2314,13 @@ fn bs58_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod c1_tests {
     use super::*;
+
+    /// `init` accepted any `chain_id`, including the zero an unset field reads as.
+    #[test]
+    fn init_refuses_a_zero_chain_id() {
+        assert_eq!(validate_init_chain_id(0), Err(ProgramError::InvalidArgument));
+        assert_eq!(validate_init_chain_id(7_565_164), Ok(()));
+    }
 
     fn pid() -> Pubkey {
         Pubkey::new_unique()

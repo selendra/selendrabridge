@@ -5,14 +5,20 @@
 # refund-eligible + records cancel/refund state — without it the refund path
 # can't run) and the GRAPHQL-API (the product surface the frontend talks to).
 # It runs as a non-root user.
+#
+# Every base image is pinned by DIGEST (the tag stays for readability): a tag is
+# mutable, so `rust:1-bookworm` could build different code tomorrow with nothing
+# in the diff (audit round 5, LOW). Bump by re-resolving the digest:
+#   docker buildx imagetools inspect rust:1-bookworm --format '{{json .Manifest.Digest}}'
+# CI (static job) refuses an unpinned FROM/image line.
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release \
       -p validator -p keeper -p sig-store -p indexer -p graphql-api -p price-keeper
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 # ca-certificates + libssl3 cover reqwest's TLS stack (HTTPS RPCs / sig-store);
 # curl is used by the compose healthchecks; tini reaps zombies + forwards signals.
 RUN apt-get update \

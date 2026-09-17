@@ -30,7 +30,7 @@ x-restart: &restart
 
 services:
   anvil-src:
-    image: ghcr.io/foundry-rs/foundry:latest
+    image: ghcr.io/foundry-rs/foundry:latest@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17
     <<: *restart
     # foundry image entrypoint wraps the command in a shell, hence one string.
     command: ["anvil --host 0.0.0.0 --chain-id 1337"]
@@ -42,7 +42,7 @@ services:
       retries: 20
 
   anvil-dst:
-    image: ghcr.io/foundry-rs/foundry:latest
+    image: ghcr.io/foundry-rs/foundry:latest@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17
     <<: *restart
     command: ["anvil --host 0.0.0.0 --chain-id 1338"]
     ports: ["8546:8545"]
@@ -53,7 +53,7 @@ services:
       retries: 20
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     <<: *restart
     environment:
       POSTGRES_USER: bridge

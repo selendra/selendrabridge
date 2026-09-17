@@ -21,7 +21,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-IMAGE=bridge-solana-tools
+IMAGE="${IMAGE:-bridge-solana-tools}"
 CONTAINER=bridge-solana-validator
 SO=crates/solana-gate/target/deploy/solana_gate.so
 
@@ -37,15 +37,16 @@ fi
 
 echo
 echo "== [2/3] cargo-build-sbf — the real BPF target =="
-# FIRST RUN IS SLOW (~25 min): cargo-build-sbf downloads the platform-tools
-# toolchain before it can compile anything. Subsequent runs reuse it."
-# Runs as root because the platform-tools SDK lives under /root in the image;
-# ownership of the artifacts is handed back afterwards.
-docker run --rm -v "$ROOT:/work" -w /work "$IMAGE" sh -c "
-  set -e
+# platform-tools is baked into the image (checksum-verified at image build), so
+# this compiles straight away instead of downloading the toolchain first.
+# Runs as the CALLER's uid, not root (audit round 5, LOW): the image carries a
+# verified platform-tools install readable by any uid, so the artifacts belong to
+# whoever ran this and nothing in the container runs privileged. The image's own
+# cache is read-only to this uid; the SDK's optional `criterion` (C test
+# framework) fetch then prints a harmless "mkdir ... Permission denied" after
+# the build — the Rust program does not use it.
+docker run --rm --user "$(id -u):$(id -g)" -v "$ROOT:/work" -w /work "$IMAGE" \
   cargo-build-sbf --manifest-path crates/solana-gate/Cargo.toml
-  chown -R $(id -u):$(id -g) crates/solana-gate/target /work/.docker-cargo 2>/dev/null || true
-"
 [[ -f "$SO" ]] || { echo "FAIL: no artifact at $SO"; exit 1; }
 echo "   built $(du -h "$SO" | cut -f1) -> $SO"
 

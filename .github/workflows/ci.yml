@@ -10,6 +10,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Every checkout sets `persist-credentials: false`: nothing after checkout talks
+# to the remote, and the default leaves the token in .git/config, readable by
+# every later step — including code from the PR under test (audit round 5, LOW).
+#
 # Least privilege for the GITHUB_TOKEN every job receives: nothing here pushes,
 # comments or releases, so read-only is all it needs. A job that must do more
 # (none today) declares its own `permissions:` block. Actions below are pinned
@@ -33,6 +37,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
         with:
@@ -61,6 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
         with:
@@ -88,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -109,6 +118,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
+          persist-credentials: false
 
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
 
@@ -134,6 +144,8 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
@@ -173,6 +185,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Throwaway values for the `${VAR:?}` guards. Every secret in the compose
       # file is required-with-no-default ON PURPOSE, so that `docker compose up`
@@ -190,6 +204,23 @@ jobs:
           SIG_STORE_READER_TOKEN: ci-not-a-real-secret
           SIG_STORE_ADMIN_TOKEN: ci-not-a-real-secret
         run: docker compose config --quiet
+
+      # Offline regression tests for the launchers (audit round 5, LOW): a config
+      # value must never become config structure, and run-dir files are parsed,
+      # never sourced. jq and python3 ship on the runner.
+      - name: Launcher config escaping + run-dir safety
+        run: |
+          bash scripts/testing/config-escaping.sh
+          bash scripts/testing/rundir-safety.sh
+
+      # A tag is mutable; a digest is not (audit round 5, LOW). Every tracked
+      # Dockerfile FROM and compose `image:` must carry @sha256 — except images
+      # this repo builds itself, which are named by variable.
+      - name: Container images are digest-pinned
+        run: |
+          bad=$(git grep -nE '^FROM |^\s*image:' -- Dockerfile 'docker/Dockerfile*' docker-compose.yml 'docker/production/*/docker-compose.yml' \
+                | grep -v '@sha256:' | grep -v 'image: *"\$' || true)
+          if [ -n "$bad" ]; then echo "unpinned images:"; echo "$bad"; exit 1; fi
 
       # Every generated config in these scripts is a place a fail-closed check can
       # be silently mis-emitted (findings H1 / M-7), so at minimum they must parse.
@@ -220,6 +251,8 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -261,6 +294,8 @@ jobs:
     # red here is a real regression, not toolchain drift.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Everything runs in Docker so the job needs no host Solana toolchain, and
       # it matches exactly what a developer runs locally.

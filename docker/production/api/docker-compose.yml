@@ -14,8 +14,10 @@
 #   * `--production` is set: no GraphiQL playground, no introspection. The depth
 #     and complexity caps bound what one QUERY can cost; they do nothing about a
 #     stranger reading the whole schema off the one box facing the internet.
-#     Note the `chains` query still returns each network's rpc_url verbatim, so
-#     never put a provider API key in configs/chains.json.
+#     The `chains` query serves each network's `public_rpc_url` as `rpcUrl` and
+#     never its `rpc_url`, so a keyed provider URL may go in `rpc_url` (it is
+#     used server-side only). `public_rpc_url` must be keyless: browsers get it,
+#     and `--production` refuses to start while any chain lacks one.
 #   * mutations are OFF. `--allow-mutations` would expose `submitSignature`,
 #     letting anyone who reaches this box push signatures into the store. The
 #     Gate would still reject non-validator keys on-chain, but there is no
@@ -82,7 +84,7 @@ services:
     networks: [bridge-api]
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
     ports:
       - "80:80"

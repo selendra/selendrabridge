@@ -63,6 +63,98 @@ fn checked_id(submission_id: &str) -> Result<String, DbError> {
     Ok(norm_id(submission_id))
 }
 
+// ---------------------------------------------------------------------------
+// Length bounds on caller-supplied text (audit 2026-09-16, LOW).
+//
+// Every column below is `TEXT` and every value reaches it from an HTTP body, so
+// the only bound used to be the store's body cap (256 KiB by default) — per row,
+// per column, repeatable on every id a credential can name. The id⇄params binding
+// makes a record's params self-certifying, but it says nothing about how LONG
+// they are, and the lifecycle / swap / allowlist columns are not bound to
+// anything at all. Each limit is set above anything a real chain can produce, so
+// a legitimate write can never be refused by one.
+// ---------------------------------------------------------------------------
+
+/// `receiver` and `native_sender` are 20 bytes (EVM) or 32 bytes (Solana). Both
+/// gates refuse any other receiver width at `send`, so nothing longer can ever be
+/// a real transfer.
+const MAX_ACCOUNT_BYTES: usize = 32;
+/// `auto_params` has no on-chain bound, so this is generous: it is paid for in
+/// source-chain calldata by the sender, and a real swap-and-bridge payload is a
+/// few hundred bytes.
+pub const MAX_AUTO_PARAMS_BYTES: usize = 32 * 1024;
+/// A transaction reference: an EVM hash (`0x` + 64 hex) or a Solana signature
+/// (base58, at most 88 characters).
+pub const MAX_TX_REF_LEN: usize = 128;
+/// A chain account as text: an EVM address (42) or a base58 Solana key (≤ 44).
+pub const MAX_ACCOUNT_TEXT_LEN: usize = 128;
+/// `uint256` in decimal is at most 78 digits.
+const MAX_UINT256_DECIMAL_LEN: usize = 78;
+/// An allowlist symbol is a human label.
+pub const MAX_SYMBOL_LEN: usize = 32;
+
+/// `0x`-hex no longer than `max_bytes` bytes. Well-formedness is left to the
+/// binding check that follows; this is only the size gate in front of it.
+fn bounded_hex(field: &'static str, s: &str, max_bytes: usize) -> Result<(), DbError> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.len() > 2 * max_bytes {
+        return Err(DbError::BadField(field));
+    }
+    Ok(())
+}
+
+/// Size-bound the free-form params of a submission before anything hashes them.
+fn bounded_record(r: &SubmissionRecord) -> Result<(), DbError> {
+    bounded_hex("receiver", &r.receiver, MAX_ACCOUNT_BYTES)?;
+    bounded_hex("native_sender", &r.native_sender, MAX_ACCOUNT_BYTES)?;
+    bounded_hex("auto_params", &r.auto_params, MAX_AUTO_PARAMS_BYTES)?;
+    bounded_hex("bridge_domain", &r.bridge_domain, 32)?;
+    bounded_hex("debridge_id", &r.debridge_id, 32)?;
+    bounded_hex("token", &r.token, 20)?;
+    if r.amount.len() > MAX_UINT256_DECIMAL_LEN {
+        return Err(DbError::BadField("amount"));
+    }
+    Ok(())
+}
+
+/// A transaction reference: empty (the indexer writes `""` for a log with no
+/// hash), or up to [`MAX_TX_REF_LEN`] ASCII alphanumerics after an optional `0x`.
+/// That admits both an EVM hash and a base58 Solana signature and nothing that
+/// can carry a newline, a quote or a megabyte.
+fn checked_tx_ref(field: &'static str, s: &str) -> Result<(), DbError> {
+    let body = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() > MAX_TX_REF_LEN || !body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(DbError::BadField(field));
+    }
+    Ok(())
+}
+
+/// Account-ish text (address, mint, receiver) for the swap tables.
+fn checked_account_text(field: &'static str, s: &str) -> Result<(), DbError> {
+    let body = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() > MAX_ACCOUNT_TEXT_LEN || !body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(DbError::BadField(field));
+    }
+    Ok(())
+}
+
+/// A non-negative integer amount, as the chains emit it.
+fn checked_amount(field: &'static str, s: &str) -> Result<(), DbError> {
+    if s.is_empty() || s.len() > MAX_UINT256_DECIMAL_LEN || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(DbError::BadField(field));
+    }
+    Ok(())
+}
+
+/// An allowlist symbol: short, and printable (no control characters to forge a
+/// log line or break a table).
+fn checked_symbol(s: &str) -> Result<(), DbError> {
+    if s.chars().count() > MAX_SYMBOL_LEN || s.chars().any(char::is_control) {
+        return Err(DbError::BadField("symbol"));
+    }
+    Ok(())
+}
+
 impl DbError {
     /// True for caller-input errors (HTTP 4xx); false for server/IO faults (5xx).
     pub fn is_client_error(&self) -> bool {
@@ -266,6 +358,8 @@ fn verify_binding(record: &SubmissionRecord) -> Result<alloy_primitives::B256, D
     if !store::is_valid_submission_id(&record.submission_id) {
         return Err(StoreError::BadField("submission_id").into());
     }
+    // Size before hashing: both write paths into `submissions` pass through here.
+    bounded_record(record)?;
     let computed = store::canonical_submission_id(record)?;
     let claimed = alloy_primitives::B256::from_str(&record.submission_id)
         .map_err(|_| StoreError::BadField("submission_id"))?;
@@ -760,6 +854,7 @@ impl Db {
     /// chains disagree, and quietly overwriting it would hide that.
     pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
+        checked_tx_ref("claim_tx", claim_tx)?;
         const SQL: &str = "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
                     refund_status = CASE WHEN refund_status = 'eligible' THEN 'none' \
                                          ELSE refund_status END \
@@ -795,6 +890,7 @@ impl Db {
     /// would only make it retry a write that carries no authority anyway.
     pub async fn note_keeper_claim(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
+        checked_tx_ref("claim_tx", claim_tx)?;
         sqlx::query(
             "UPDATE submissions SET keeper_claim_tx = COALESCE(keeper_claim_tx, $2) \
              WHERE submission_id = $1",
@@ -913,6 +1009,7 @@ impl Db {
     /// written from an observed on-chain event, never from a relayer's say-so.
     pub async fn mark_cancelled(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
+        checked_tx_ref("cancel_tx", cancel_tx)?;
         const SQL: &str = "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
              WHERE submission_id = $1 AND refund_status <> 'refunded'";
         let affected = self.lifecycle_update(SQL, &id, cancel_tx).await?;
@@ -928,6 +1025,7 @@ impl Db {
     /// Record that the source gate returned the funds (`Gate.Refunded`).
     pub async fn mark_refunded(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
+        checked_tx_ref("refund_tx", refund_tx)?;
         const SQL: &str = "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
              WHERE submission_id = $1";
         let affected = self.lifecycle_update(SQL, &id, refund_tx).await?;
@@ -1061,6 +1159,12 @@ impl Db {
         amount_out: &str,
         block_number: u64,
     ) -> Result<(), DbError> {
+        checked_tx_ref("tx_hash", tx_hash)?;
+        for (field, v) in [("sender", sender), ("receiver", receiver), ("token_in", token_in), ("token_out", token_out)] {
+            checked_account_text(field, v)?;
+        }
+        checked_amount("amount_in", amount_in)?;
+        checked_amount("amount_out", amount_out)?;
         sqlx::query(
             "INSERT INTO swaps \
              (chain_id, tx_hash, log_index, sender, receiver, token_in, token_out, \
@@ -1117,7 +1221,12 @@ impl Db {
         final_token: &str,
         final_receiver: &str,
     ) -> Result<(), DbError> {
-        let id = norm_id(submission_id);
+        let id = checked_id(submission_id)?;
+        for (field, v) in [("token_in", token_in), ("final_token", final_token), ("final_receiver", final_receiver)] {
+            checked_account_text(field, v)?;
+        }
+        checked_amount("amount_in", amount_in)?;
+        checked_amount("stable_out", stable_out)?;
         sqlx::query(
             "INSERT INTO swap_bridges \
              (submission_id, token_in, amount_in, stable_out, final_token, final_receiver) \
@@ -1188,6 +1297,8 @@ impl Db {
         fallback: bool,
     ) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
+        checked_tx_ref("finalize_tx", finalize_tx)?;
+        checked_amount("finalize_amount_out", amount_out)?;
         let update = || async {
             let res = sqlx::query(
                 "UPDATE swap_bridges SET finalize_tx = $2, finalize_amount_out = $3, \
@@ -1225,6 +1336,49 @@ impl Db {
             self.apply_pending_finalize(&id).await?;
         }
         Ok(())
+    }
+
+    /// Delete parked lifecycle / finalize markers older than `max_age` whose
+    /// submission (or swap-bridge intent) row never arrived. Returns how many
+    /// rows went.
+    ///
+    /// ## Why (audit 2026-09-16, LOW)
+    ///
+    /// A marker is parked when an observed `Claimed`/`Cancelled`/`Refunded`/
+    /// `Finalized` names an id with no row yet, and removed only when that row
+    /// appears. An id that never gets a row — a transfer from a gate this
+    /// deployment does not index, a superseded generation, or any well-formed id
+    /// an `Indexer`-scoped credential cares to name — parked forever: the table
+    /// grew without bound and nothing ever read the rows again.
+    ///
+    /// ## Why this is safe
+    ///
+    /// Only markers with NO matching row are touched (one with a row is applied
+    /// and deleted by the next write anyway), and only after `max_age`. The
+    /// markers are an indexing convenience, never an authority: losing one for a
+    /// transfer whose `Sent` is backfilled later than `max_age` costs the history
+    /// view its terminal status until the indexer rescans that range. Every
+    /// work queue re-checks the chain before acting, and the refund validators
+    /// read `executed` on-chain, so a delivered transfer can never be refunded
+    /// because its parked `Claimed` was collected.
+    pub async fn gc_parked_markers(&self, max_age: std::time::Duration) -> Result<u64, DbError> {
+        let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::MAX);
+        let cutoff = chrono::Utc::now().checked_sub_signed(max_age).unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let lifecycle = sqlx::query(
+            "DELETE FROM pending_lifecycle p WHERE p.created_at < $1 \
+             AND NOT EXISTS (SELECT 1 FROM submissions s WHERE s.submission_id = p.submission_id)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        let finalize = sqlx::query(
+            "DELETE FROM pending_finalize p WHERE p.created_at < $1 \
+             AND NOT EXISTS (SELECT 1 FROM swap_bridges b WHERE b.submission_id = p.submission_id)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(lifecycle.rows_affected() + finalize.rows_affected())
     }
 
     /// Flip `refund_status` from `'none'` to `'eligible'` for submissions that
@@ -1384,6 +1538,9 @@ impl Db {
         token: &str,
         symbol: Option<&str>,
     ) -> Result<AllowedToken, DbError> {
+        if let Some(sym) = symbol {
+            checked_symbol(sym)?;
+        }
         let addr = Address::from_str(token.trim()).map_err(|_| DbError::BadField("token"))?;
         let token_lc = format!("{addr:#x}");
         let debridge_id = format!("{:#x}", bridge_core::debridge_id(U256::from(chain_id), addr));
@@ -1493,5 +1650,89 @@ impl Db {
                 chain_id_to: chain_id_to as u64,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> SubmissionRecord {
+        SubmissionRecord {
+            submission_id: format!("0x{}", "11".repeat(32)),
+            bridge_domain: format!("0x{}", "d0".repeat(32)),
+            debridge_id: format!("0x{}", "22".repeat(32)),
+            amount: "100".into(),
+            chain_id_from: 1,
+            chain_id_to: 2,
+            nonce: 1,
+            receiver: format!("0x{}", "ab".repeat(20)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: format!("0x{}", "33".repeat(20)),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    /// THE regression (audit 2026-09-16, LOW): nothing bounded these fields but
+    /// the HTTP body cap. Real widths still pass.
+    #[test]
+    fn submission_params_are_size_bounded_before_hashing() {
+        assert!(bounded_record(&record()).is_ok());
+        let mut solana = record();
+        solana.receiver = format!("0x{}", "ab".repeat(32));
+        solana.native_sender = format!("0x{}", "cd".repeat(32));
+        solana.auto_params = format!("0x{}", "ee".repeat(MAX_AUTO_PARAMS_BYTES));
+        solana.amount = "9".repeat(78);
+        assert!(bounded_record(&solana).is_ok(), "the widest real values must pass");
+
+        type Mutation = fn(&mut SubmissionRecord);
+        let cases: [(&str, Mutation); 5] = [
+            ("receiver", |r| r.receiver = format!("0x{}", "ab".repeat(33))),
+            ("native_sender", |r| r.native_sender = format!("0x{}", "ab".repeat(4096))),
+            ("auto_params", |r| r.auto_params = format!("0x{}", "ee".repeat(MAX_AUTO_PARAMS_BYTES + 1))),
+            ("amount", |r| r.amount = "9".repeat(79)),
+            ("token", |r| r.token = format!("0x{}", "33".repeat(21))),
+        ];
+        for (field, mutate) in cases {
+            let mut r = record();
+            mutate(&mut r);
+            assert!(
+                matches!(bounded_record(&r), Err(DbError::BadField(f)) if f == field),
+                "{field} must be bounded"
+            );
+        }
+    }
+
+    #[test]
+    fn tx_refs_accept_real_hashes_and_nothing_else() {
+        checked_tx_ref("claim_tx", &format!("0x{}", "ab".repeat(32))).unwrap();
+        // A Solana signature (base58, 88 chars).
+        checked_tx_ref("claim_tx", &"5".repeat(88)).unwrap();
+        // The indexer writes "" for a log without a hash; refusing it would wedge a scan.
+        checked_tx_ref("claim_tx", "").unwrap();
+
+        assert!(checked_tx_ref("claim_tx", &"a".repeat(MAX_TX_REF_LEN + 1)).is_err());
+        assert!(checked_tx_ref("claim_tx", "0xab\nFORGED log line").is_err());
+        assert!(checked_tx_ref("claim_tx", "0xab\"}").is_err());
+    }
+
+    #[test]
+    fn swap_and_allowlist_text_is_bounded() {
+        checked_account_text("sender", &format!("0x{}", "ab".repeat(20))).unwrap();
+        checked_account_text("sender", "So11111111111111111111111111111111111111112").unwrap();
+        assert!(checked_account_text("sender", &"a".repeat(MAX_ACCOUNT_TEXT_LEN + 1)).is_err());
+        assert!(checked_account_text("sender", "0xab cd").is_err());
+
+        checked_amount("amount_in", &"9".repeat(78)).unwrap();
+        assert!(checked_amount("amount_in", &"9".repeat(79)).is_err());
+        assert!(checked_amount("amount_in", "-1").is_err());
+        assert!(checked_amount("amount_in", "").is_err());
+
+        checked_symbol("USDC.e").unwrap();
+        assert!(checked_symbol(&"X".repeat(MAX_SYMBOL_LEN + 1)).is_err());
+        assert!(checked_symbol("USD\nC").is_err());
     }
 }

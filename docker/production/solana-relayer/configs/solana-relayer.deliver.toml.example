@@ -28,6 +28,11 @@ commitment = "finalized"
 poll_interval_ms = 4000
 # Cap on transaction signatures fetched per tick.
 max_batch = 100
+# max_batch must be 1..=1000 (the RPC's page cap; larger values are refused).
+# With no state_file yet the relayer replays the program's full history (signing
+# is idempotent; >10k signatures stops it with an error). Set this only when every
+# older transfer is known to be settled:
+# start_at_tip = false
 # Must live on the `solana-relayer-state` volume.
 state_file = "/data/solana-relayer-state.json"
 

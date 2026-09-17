@@ -187,6 +187,25 @@ impl From<SwapError> for ProgramError {
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
+/// First `sol_log_data` field of every `Swapped` event (audit 2026-09-16 LOW).
+///
+/// The event used to be emitted as a lone Borsh blob, unlike every gate event
+/// (`BRIDGE_SENT`, `BRIDGE_CANCELLED`, `BRIDGE_REFUNDED`). An untagged
+/// `Program data:` line carries no type, so a consumer had to infer which event
+/// it was from its length and whether it happened to Borsh-decode — and any
+/// future event of a similar shape would have been ambiguous. Tagged, it is
+/// framed the same way the gate's events are. No off-chain consumer parsed the
+/// untagged form, so nothing downstream breaks.
+pub const SWAPPED_EVENT_TAG: &[u8] = b"SWAP_SWAPPED";
+
+/// The `sol_log_data` fields of a `Swapped` event: the tag, then the Borsh body.
+/// A function rather than inline so the framing is testable on the host —
+/// `solana-program-test`'s native runner does not surface `sol_log_data` lines.
+pub fn swapped_log_fields(ev: &SwappedEvent) -> Result<[Vec<u8>; 2], ProgramError> {
+    let body = borsh::to_vec(ev).map_err(|_| ProgramError::InvalidAccountData)?;
+    Ok([SWAPPED_EVENT_TAG.to_vec(), body])
+}
+
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -792,7 +811,8 @@ fn process_swap(
         amount_out: out,
         to: k(user_out.key),
     };
-    solana_program::log::sol_log_data(&[&borsh::to_vec(&ev).map_err(|_| ProgramError::InvalidAccountData)?]);
+    let fields = swapped_log_fields(&ev)?;
+    solana_program::log::sol_log_data(&[&fields[0], &fields[1]]);
     msg!("swapped {} -> {}", received, out);
     Ok(())
 }
@@ -903,6 +923,24 @@ fn process_set_role(program_id: &Pubkey, accounts: &[AccountInfo], role: Role) -
 
 #[cfg(test)]
 mod init_arg_tests {
+    /// `Swapped` was logged as a lone Borsh blob, unlike every gate event. It now
+    /// opens with its tag, and the body after the tag still decodes to the event.
+    #[test]
+    fn the_swapped_event_is_tagged_then_borsh() {
+        let ev = super::SwappedEvent {
+            version: 1,
+            sender: [1; 32],
+            mint_in: [2; 32],
+            mint_out: [3; 32],
+            amount_in: 10,
+            amount_out: 9,
+            to: [4; 32],
+        };
+        let [tag, body] = super::swapped_log_fields(&ev).unwrap();
+        assert_eq!(tag, b"SWAP_SWAPPED");
+        assert_eq!(swap_math::decode::<super::SwappedEvent>(&body), Some(ev));
+    }
+
     use super::*;
 
     fn args(fee_bps: u16, dev: u16, interval: i64) -> InitPoolArgs {

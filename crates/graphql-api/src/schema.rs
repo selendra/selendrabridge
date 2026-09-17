@@ -13,7 +13,7 @@ use bridge_core::allow::{SubmissionHistory, SwapBridgeInfo, SwapRecord};
 use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SignerSig, SubmissionRecord};
 
-use crate::chain::{ChainInfo, Chains};
+use crate::chain::{ChainInfo, Chains, GateScale};
 use crate::swap::{PoolInfo, PoolToken, Swaps};
 
 /// Rows returned by a list query when the caller passes no `limit`.
@@ -131,14 +131,29 @@ pub struct Chain {
 
 /// One bridgeable token on a chain.
 #[derive(SimpleObject)]
+#[graphql(complex)]
 pub struct Token {
     pub symbol: String,
     /// `0x`-prefixed ERC-20 address on this chain.
     pub address: String,
+    #[graphql(skip)]
+    pub chain_id: u64,
+    /// The registry's figure, served only through [`Token::bridge_decimals`].
+    #[graphql(skip)]
+    pub listed_bridge_decimals: Option<u8>,
+}
+
+#[ComplexObject]
+impl Token {
     /// The decimals transfer amounts of this asset are expressed in (the
     /// `amount` of a submission or history row), NOT this token's own decimals.
-    /// Null when the registry does not say.
-    pub bridge_decimals: Option<u8>,
+    /// Null when the registry does not say, or when this chain's gate is
+    /// registered at a different scale than the registry claims.
+    async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        let listed = self.listed_bridge_decimals?;
+        let token: alloy_primitives::Address = self.address.parse().ok()?;
+        state(ctx).verified_bridge_decimals(self.chain_id, token, listed).await
+    }
 }
 
 impl From<ChainInfo> for Chain {
@@ -153,7 +168,12 @@ impl From<ChainInfo> for Chain {
             tokens: c
                 .tokens
                 .into_iter()
-                .map(|t| Token { symbol: t.symbol, address: t.address, bridge_decimals: t.bridge_decimals })
+                .map(|t| Token {
+                    symbol: t.symbol,
+                    address: t.address,
+                    chain_id: c.chain_id,
+                    listed_bridge_decimals: t.bridge_decimals,
+                })
                 .collect(),
             router: c.router,
         }
@@ -361,7 +381,7 @@ impl Submission {
     /// same on every chain. Format `amount` with THIS, never with a local
     /// token's decimals. Null when the registry cannot resolve `debridgeId`.
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
-        state(ctx).bridge_decimals_of(&self.debridge_id)
+        state(ctx).bridge_decimals_of(&self.debridge_id).await
     }
 
     /// On-chain `executed(submissionId)` on the destination gate. `null` when the
@@ -436,6 +456,14 @@ pub struct Stats {
     pub routes: Vec<RouteCount>,
 }
 
+/// `symbol` is a query ARGUMENT — any anonymous caller's string. Formatted with
+/// `Display` (`%symbol`) it reached the log verbatim, so a `\n` in it forged a
+/// whole log line of the caller's choosing (audit 2026-09-16, LOW). `Debug`
+/// quotes it and escapes every control character.
+fn warn_unmapped_symbol(chain_id: u64, chain_id_to: u64, symbol: &str) {
+    tracing::warn!(chain_id, chain_id_to, symbol = ?symbol, "no debridgeId mapped on both solana gate and destination");
+}
+
 fn state<'c>(ctx: &Context<'c>) -> &'c ApiState {
     ctx.data_unchecked::<ApiState>()
 }
@@ -445,16 +473,55 @@ impl ApiState {
     /// from its `debridgeId` — `keccak(chainId, token)` of an EVM asset in the
     /// registry. A Solana-origin transfer carries such a (peer) id too, so this
     /// covers both VMs. `None` when no registry token derives that id.
-    pub fn bridge_decimals_of(&self, debridge_id: &str) -> Option<u8> {
+    ///
+    /// The registry is an operator-edited file; the gate is what actually
+    /// scales the transfer. So the registry's figure is served only once the
+    /// token's own gate agrees with it — see [`served_bridge_decimals`].
+    pub async fn bridge_decimals_of(&self, debridge_id: &str) -> Option<u8> {
         let want = debridge_id.trim().to_ascii_lowercase();
-        self.registry.iter().find_map(|c| {
+        let (chain_id, token, listed) = self.registry.iter().find_map(|c| {
             c.tokens.iter().find_map(|t| {
                 let dec = t.bridge_decimals?;
                 let addr: alloy_primitives::Address = t.address.parse().ok()?;
                 let id = bridge_core::debridge_id(alloy_primitives::U256::from(c.chain_id), addr);
-                (format!("{id:#x}") == want).then_some(dec)
+                (format!("{id:#x}") == want).then_some((c.chain_id, addr, dec))
             })
-        })
+        })?;
+        self.verified_bridge_decimals(chain_id, token, listed).await
+    }
+
+    /// The registry's `listed` bridge decimals for `token` on `chain_id`, checked
+    /// against that chain's gate. See [`served_bridge_decimals`].
+    async fn verified_bridge_decimals(&self, chain_id: u64, token: alloy_primitives::Address, listed: u8) -> Option<u8> {
+        let on_chain = self.chains.gate_bridge_decimals(chain_id, token).await;
+        let served = served_bridge_decimals(listed, on_chain);
+        if served.is_none() && self.chains.first_scale_warning(chain_id, token) {
+            tracing::warn!(
+                chain_id, %token, registry = listed, gate = ?on_chain,
+                "registry bridge_decimals disagrees with the gate; serving bridgeDecimals: null"
+            );
+        }
+        served
+    }
+}
+
+/// What to serve as `bridgeDecimals` given the registry's figure and the gate's.
+///
+/// Audit 2026-09-16 (LOW): the registry's value was served unchecked. A typo in
+/// it misformats every amount of that asset by a power of ten in the explorer —
+/// the same class of error H-2 guards the signers against — with nothing to say
+/// the page is wrong. A disagreement is now `null`, which a client already has
+/// to handle (and which the frontend renders with its own fallback rather than
+/// a confidently wrong number).
+///
+/// A gate that cannot be asked right now (`Unknown`) is not a disagreement:
+/// the registry's figure stands, as it did before, rather than blanking every
+/// amount over one slow RPC. It is not remembered, so the next request checks.
+pub fn served_bridge_decimals(registry: u8, gate: GateScale) -> Option<u8> {
+    match gate {
+        GateScale::Registered(d) => (d == registry).then_some(d),
+        GateScale::Unregistered => None,
+        GateScale::Unknown => Some(registry),
     }
 }
 
@@ -536,7 +603,7 @@ pub struct HistoryEntry {
 impl HistoryEntry {
     /// The decimals `amount` is expressed in — see `Submission.bridgeDecimals`.
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
-        state(ctx).bridge_decimals_of(&self.debridge_id)
+        state(ctx).bridge_decimals_of(&self.debridge_id).await
     }
 }
 
@@ -771,13 +838,20 @@ impl Query {
         let mut fallback = None;
         for (cid, token) in candidates {
             let id = bridge_core::debridge_id(alloy_primitives::U256::from(cid), token);
-            let mapped = st.chains.maps_asset(chain_id_to, id).await;
+            let Some(mapped) = st.swaps.upstream().metered(async { Some(st.chains.maps_asset(chain_id_to, id).await) }).await
+            else {
+                return fallback;
+            };
             if mapped == Some(false) {
                 continue;
             }
-            let c = match gate.send_context(&format!("{id:#x}"), chain_id_to).await {
-                Ok(c) => c,
-                Err(e) => {
+            let read = st.swaps.upstream().metered(async { Some(gate.send_context(&format!("{id:#x}"), chain_id_to).await) });
+            let c = match read.await {
+                // No slot: the upstream is saturated, so stop asking rather than
+                // walk the remaining candidates into the same wall.
+                None => return fallback,
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
                     tracing::debug!(chain_id, from_chain = cid, error = %e, "debridgeId unusable on solana gate");
                     continue;
                 }
@@ -799,7 +873,7 @@ impl Query {
             fallback.get_or_insert(ctx);
         }
         if fallback.is_none() {
-            tracing::warn!(chain_id, chain_id_to, %symbol, "no debridgeId mapped on both solana gate and destination");
+            warn_unmapped_symbol(chain_id, chain_id_to, &symbol);
         }
         fallback
     }
@@ -1165,6 +1239,176 @@ mod tests {
         // validation and into the resolver, which errors on the backend.)
         assert!(res.errors.iter().all(|e| !e.message.to_lowercase().contains("complex")), "{:?}", res.errors);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mock EVM JSON-RPC answering every `eth_call` with `reply` (a result hex
+    /// string, or an `error` object), counting calls. Returns its URL.
+    async fn mock_evm_rpc(reply: serde_json::Value, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let reply = reply.clone();
+                let calls = calls.clone();
+                async move {
+                    assert_eq!(req["method"], "eth_call");
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut body = serde_json::json!({"jsonrpc": "2.0", "id": req["id"]});
+                    if reply.get("code").is_some() {
+                        body["error"] = reply;
+                    } else {
+                        body["result"] = reply;
+                    }
+                    Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// `bridgeDecimalsOf` -> `(set, bridgeDecimals, localDecimals)`, ABI-encoded.
+    fn scale_reply(set: bool, bridge: u8, local: u8) -> serde_json::Value {
+        let mut w = [0u8; 96];
+        w[31] = set as u8;
+        w[63] = bridge;
+        w[95] = local;
+        serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(w)))
+    }
+
+    const TOKEN: &str = "0x00000000000000000000000000000000000000aa";
+    const GATE: &str = "0x00000000000000000000000000000000000000bb";
+
+    /// An API whose registry lists TOKEN on chain 11155111 at `listed` bridge
+    /// decimals, with that chain's gate served by `rpc`. Returns the state and
+    /// the TOKEN's debridgeId.
+    fn scale_state(rpc: &str, listed: u8) -> (ApiState, String) {
+        let dir = std::env::temp_dir().join(format!("graphql-api-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut chains = Chains::new();
+        chains.add(11155111, rpc, GATE).unwrap();
+        let registry = vec![ChainInfo {
+            chain_id: 11155111,
+            name: "Sepolia".into(),
+            rpc_url: Some(rpc.into()),
+            public_rpc_url: None,
+            gate: Some(GATE.into()),
+            token: None,
+            tokens: vec![crate::chain::TokenInfo {
+                symbol: "TST".into(),
+                address: TOKEN.into(),
+                bridge_decimals: Some(listed),
+            }],
+            router: None,
+            swap_pool: None,
+        }];
+        let id = bridge_core::debridge_id(
+            alloy_primitives::U256::from(11155111u64),
+            TOKEN.parse().unwrap(),
+        );
+        let state = ApiState {
+            backend: Arc::new(StoreBackend::file(&dir).unwrap()),
+            threshold: None,
+            chains,
+            registry,
+            swaps: Swaps::new(),
+        };
+        (state, format!("{id:#x}"))
+    }
+
+    /// Audit 2026-09-16 (LOW): `bridgeDecimals` came from the operator-edited
+    /// registry and was never compared with the gate. A registry saying 18 for an
+    /// asset the gate scales at 6 made the explorer show every amount of it a
+    /// trillion times too small.
+    #[tokio::test]
+    async fn a_registry_scale_the_gate_disagrees_with_is_not_served() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (st, id) = scale_state(&url, 18);
+        assert_eq!(st.bridge_decimals_of(&id).await, None, "registry 18 vs gate 6");
+    }
+
+    /// Agreement is served, and — a registration being write-once — costs one
+    /// `eth_call` for the life of the process, not one per row.
+    #[tokio::test]
+    async fn an_agreeing_scale_is_served_and_read_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (st, id) = scale_state(&url, 6);
+        for _ in 0..5 {
+            assert_eq!(st.bridge_decimals_of(&id).await, Some(6));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The gate has no scale for the token (unset, or a pre-decimals gate that
+    /// reverts): nothing confirms the registry, so nothing is served.
+    #[tokio::test]
+    async fn an_unregistered_or_reverting_gate_serves_null() {
+        for reply in [
+            scale_reply(false, 0, 0),
+            serde_json::json!({"code": 3, "message": "execution reverted", "data": "0x"}),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let url = mock_evm_rpc(reply.clone(), calls.clone()).await;
+            let (st, id) = scale_state(&url, 6);
+            assert_eq!(st.bridge_decimals_of(&id).await, None, "{reply}");
+        }
+    }
+
+    /// A gate that cannot be reached is not a disagreement: the registry's figure
+    /// stands rather than blanking the explorer over one slow RPC.
+    #[tokio::test]
+    async fn an_unreachable_gate_falls_back_to_the_registry() {
+        let (st, id) = scale_state("http://127.0.0.1:1", 6);
+        assert_eq!(st.bridge_decimals_of(&id).await, Some(6));
+    }
+
+    /// The `chains` query's per-token figure goes through the same check.
+    #[tokio::test]
+    async fn the_chains_query_applies_the_same_check() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (st, _) = scale_state(&url, 18);
+        let schema = async_graphql::Schema::build(Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .data(st)
+            .finish();
+        let res = schema.execute("{ chains { tokens { symbol bridgeDecimals } } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["chains"][0]["tokens"][0]["bridgeDecimals"], serde_json::Value::Null, "{json}");
+    }
+
+    /// A log sink the tests can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A caller-chosen `symbol` must not be able to write a log line of its own.
+    #[test]
+    fn a_hostile_symbol_cannot_forge_a_log_line() {
+        let sink = Captured::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let forged = "TST\n2026-09-17T00:00:00Z  INFO keeper: claim submitted submission_id=0xdead";
+        tracing::subscriber::with_default(subscriber, || warn_unmapped_symbol(1, 2, forged));
+
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(out.lines().count(), 1, "one event, one line — got:\n{out}");
+        assert!(out.contains(r"TST\n2026"), "the newline is visible, escaped: {out}");
     }
 
     /// ...while a store-side validation error (no URL in it) stays informative.

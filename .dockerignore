@@ -42,3 +42,14 @@ sig-store-data*
 !Cargo.toml
 frontend/.env.local
 .env
+# The `# secrets` block at the top of .gitignore. A .dockerignore pattern is
+# anchored at the context root (no implicit `**/` like git), so each is written
+# for every depth; without these a keystore or wallet anywhere in the tree is
+# copied into the builder layer (audit round 5, LOW).
+**/.env
+**/secrets
+**/keystore.json
+**/bundlr_wallet.json
+# Contract deploy env files carry deployer keys.
+contracts/fixtures/swap-deploy.env
+contracts/fixtures/xswap-*.env

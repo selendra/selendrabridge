@@ -4,13 +4,13 @@
 # workspace, which is why crates/solana-relayer is its own project).
 #
 # Build:  docker build -f docker/Dockerfile.relayer -t bridge-solana-relayer .
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --manifest-path crates/solana-relayer/Cargo.toml \
       --bin solana-relayer --bin gate-admin --bin solana-price-keeper
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates libssl3 curl tini \
  && rm -rf /var/lib/apt/lists/* \

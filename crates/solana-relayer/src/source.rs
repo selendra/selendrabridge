@@ -80,6 +80,14 @@ enum PageAction {
     TooDeep,
 }
 
+/// Whether a walk must reach the start of its range before the range is usable:
+/// always with a cursor, and — unless the operator explicitly chose
+/// `start_at_tip` — without one too, so a lost or never-written cursor replays
+/// history instead of silently skipping it.
+fn walks_to_start(has_cursor: bool, start_at_tip: bool) -> bool {
+    has_cursor || !start_at_tip
+}
+
 /// The pagination rule, extracted so the thing that actually went wrong is
 /// testable without an RPC.
 ///
@@ -90,14 +98,14 @@ enum PageAction {
 fn next_page_action(
     page_len: usize,
     max_batch: usize,
-    has_cursor: bool,
+    walk_to_start: bool,
     page_index: usize,
 ) -> PageAction {
     if page_len < max_batch {
         return PageAction::Complete; // reached `until`, or ran out of history
     }
-    if !has_cursor {
-        return PageAction::Complete; // first run: start at the tip by design
+    if !walk_to_start {
+        return PageAction::Complete; // no cursor AND `start_at_tip`: the operator's choice
     }
     if page_index + 1 >= MAX_PAGES {
         return PageAction::TooDeep;
@@ -320,17 +328,37 @@ impl Scanner {
                 )
                 .await?;
 
-            let action = next_page_action(sigs.len(), self.cfg.max_batch, until.is_some(), page);
+            let walk = walks_to_start(until.is_some(), self.cfg.start_at_tip);
+            let action = next_page_action(sigs.len(), self.cfg.max_batch, walk, page);
             let oldest = sigs.last().map(|s| s.signature.clone());
             newest_first.extend(sigs);
 
             match action {
                 PageAction::Complete => {
-                    if until.is_none() && page == 0 && !newest_first.is_empty() {
-                        info!("no cursor — starting from the current tip, not replaying history");
+                    if until.is_none() && !newest_first.is_empty() {
+                        if self.cfg.start_at_tip {
+                            warn!(
+                                "no cursor and [source].start_at_tip = true — starting from the \
+                                 current tip; nothing older will ever be signed by this relayer"
+                            );
+                        } else {
+                            warn!(
+                                transactions = newest_first.len(),
+                                "no cursor — replaying the program's full history (signing is \
+                                 idempotent). Set [source].start_at_tip = true only if older \
+                                 transfers are known to be settled"
+                            );
+                        }
                     }
                     return Ok(newest_first.into_iter().rev().collect());
                 }
+                PageAction::TooDeep if until.is_none() => anyhow::bail!(
+                    "no cursor at {} and the program's history exceeds {} signatures; refusing \
+                     to guess where to start — restore the state file, or set \
+                     [source].start_at_tip = true if every older transfer is known to be settled",
+                    self.cfg.state_file,
+                    MAX_PAGES * self.cfg.max_batch
+                ),
                 PageAction::TooDeep => anyhow::bail!(
                     "backlog exceeds {} signatures without reaching the cursor; refusing to \
                      advance past unscanned history — raise max_batch or investigate the stall",
@@ -900,11 +928,20 @@ mod tests {
         assert_eq!(next_page_action(0, 100, true, 3), PageAction::Complete);
     }
 
-    /// A first run has no cursor, so there is no range to be contiguous WITH:
-    /// starting at the tip is deliberate, not a skip.
+    /// A missing cursor used to mean "start at the tip", silently: a wiped state
+    /// volume skipped every transfer sent since the last save, for good. It now
+    /// walks history like any other backlog unless the operator opted out.
     #[test]
-    fn the_first_run_starts_at_the_tip() {
-        assert_eq!(next_page_action(100, 100, false, 0), PageAction::Complete);
+    fn a_missing_cursor_walks_history_unless_start_at_tip_is_explicit() {
+        assert_eq!(
+            next_page_action(100, 100, walks_to_start(false, false), 0),
+            PageAction::KeepWalking,
+            "no cursor, no opt-out: a full page means older history to replay"
+        );
+        assert_eq!(next_page_action(100, 100, walks_to_start(false, false), MAX_PAGES - 1), PageAction::TooDeep);
+        assert_eq!(next_page_action(100, 100, walks_to_start(false, true), 0), PageAction::Complete);
+        // A cursor always walks to itself, whatever `start_at_tip` says.
+        assert_eq!(next_page_action(100, 100, walks_to_start(true, true), 0), PageAction::KeepWalking);
     }
 
     /// Falling too far behind must fail loudly and leave the cursor put. Silently

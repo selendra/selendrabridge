@@ -25,7 +25,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
@@ -35,7 +34,7 @@ use tracing::{info, warn};
 
 use crate::config::{SourceChain, TargetChain};
 use crate::gate::{
-    compute_budget_for, decode_gate_config, domain_id, hex32, hex_bytes, recovered_address,
+    asset_vault, commitment, compute_budget_for, decode_gate_config, domain_id, hex32, hex_bytes, recovered_address,
     GateConfig, CANCEL_PREFIX, REFUND_PREFIX, SPL_TOKEN,
 };
 use crate::store::{Store, SubmissionRecord};
@@ -262,10 +261,12 @@ impl Submitter {
         let payer = read_keypair_file(&target.payer_keypair)
             .map_err(|e| anyhow::anyhow!("reading payer keypair {}: {e}", target.payer_keypair))?;
         Ok(Submitter {
-            rpc: RpcClient::new_with_commitment(
-                source.rpc.clone(),
-                CommitmentConfig::confirmed(),
-            ),
+            // The operator's configured commitment (`finalized` unless they opted
+            // out for a local validator), not a hardcoded `confirmed`: the marker
+            // reads below decide whether a transfer is already spent, and the
+            // config's `finalized`-only guard exists so no loop acts on state a
+            // fork can still discard.
+            rpc: RpcClient::new_with_commitment(source.rpc.clone(), commitment(&source.commitment)),
             program_id: Pubkey::from_str(&source.program_id)
                 .map_err(|_| anyhow::anyhow!("program_id is not a valid pubkey"))?,
             payer,
@@ -340,18 +341,32 @@ impl Submitter {
         }
     }
 
+    /// One pass over the store's two work queues for this chain.
+    ///
+    /// Queues, not `list()`: the whole-table poll re-read every submission the
+    /// store had ever held — across every chain — every few seconds, forever
+    /// (audit 2026-09-16 LOW). The store filters server-side on the lifecycle the
+    /// indexer and observer maintain; both queues are hints, and every `try_*`
+    /// still re-reads the chain before submitting anything.
     async fn tick(&self) -> anyhow::Result<()> {
-        for rec in self.store.list().await? {
-            // SOURCE side (round 4, M-4): a Solana-origin transfer whose
-            // destination was burned comes back here as a `refund`.
-            if rec.chain_id_from == self.chain_id {
-                if !rec.refund_signatures.is_empty() {
+        // SOURCE side (round 4, M-4): a Solana-origin transfer whose destination
+        // was burned comes back here as a `refund`. A failed fetch must not starve
+        // the claim queue below, so it is reported and the tick carries on.
+        match self.store.pending_refunds(self.chain_id).await {
+            Ok(queue) => {
+                for rec in queue {
+                    if rec.chain_id_from != self.chain_id || rec.refund_signatures.is_empty() {
+                        continue; // the store is untrusted; re-check its filter
+                    }
                     if let Err(e) = self.try_refund(&rec).await {
                         warn!(submission_id = %rec.submission_id, error = %e, "refund failed");
                     }
                 }
-                continue;
             }
+            Err(e) => warn!(error = %e, "fetching the refund queue failed; claims still run"),
+        }
+
+        for rec in self.store.pending_claims(self.chain_id).await? {
             if rec.chain_id_to != self.chain_id {
                 continue;
             }
@@ -527,11 +542,11 @@ impl Submitter {
             .get_account(&asset)
             .await
             .map_err(|_| anyhow::anyhow!("no asset registered for this debridge_id"))?;
-        // AssetConfig = debridge_id(32) || mint(32) || vault(32)
-        if asset_account.data.len() < 96 {
-            anyhow::bail!("asset account is malformed");
-        }
-        let vault = Pubkey::new_from_array(asset_account.data[64..96].try_into()?);
+        let vault = Pubkey::new_from_array(asset_vault(
+            asset_account.owner == self.program_id,
+            &asset_account.data,
+            &debridge_id,
+        )?);
 
         let args = wire::ClaimArgs {
             debridge_id,
@@ -632,10 +647,11 @@ impl Submitter {
             .get_account(&asset)
             .await
             .map_err(|_| anyhow::anyhow!("no asset registered for this debridge_id"))?;
-        if asset_account.data.len() < 96 {
-            anyhow::bail!("asset account is malformed");
-        }
-        let vault = Pubkey::new_from_array(asset_account.data[64..96].try_into()?);
+        let vault = Pubkey::new_from_array(asset_vault(
+            asset_account.owner == self.program_id,
+            &asset_account.data,
+            &enc.debridge_id,
+        )?);
 
         let args = wire::RefundArgs {
             debridge_id: enc.debridge_id,
@@ -707,6 +723,86 @@ pub fn refund_accounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that answers `[]` to everything and records each request line.
+    fn recording_store() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { continue };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                log.lock().unwrap().push(head.lines().next().unwrap_or_default().to_string());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn submitter_for(store: Store, commitment: &str) -> Submitter {
+        let dir = std::env::temp_dir().join(format!("solana-relayer-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keypair = dir.join(format!("payer-{commitment}.json"));
+        solana_sdk::signature::write_keypair_file(&Keypair::new(), &keypair).unwrap();
+        let source = SourceChain {
+            chain_id: 7_565_164,
+            rpc: "http://127.0.0.1:1".into(),
+            program_id: "11111111111111111111111111111111".into(),
+            commitment: commitment.into(),
+            allow_unfinalized: commitment != "finalized",
+            poll_interval_ms: 2000,
+            state_file: "unused".into(),
+            max_batch: 100,
+            start_at_tip: false,
+        };
+        let target = TargetChain { payer_keypair: keypair.to_string_lossy().into_owned(), poll_interval_ms: 2000 };
+        Submitter::new(&source, &target, store).unwrap()
+    }
+
+    /// The submitter polled `GET /submissions` — every record the store ever
+    /// held, across every chain — each tick. It must read only this chain's two
+    /// work queues.
+    #[tokio::test]
+    async fn the_submitter_reads_its_queues_not_the_whole_table() {
+        let (base, seen) = recording_store();
+        let s = submitter_for(Store::new(&base, None).unwrap(), "finalized");
+        s.tick().await.expect("empty queues are a clean tick");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|l| l.contains("pending=claims&chain_id_to=7565164")),
+            "claim queue not read: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|l| l.contains("pending=refunds&chain_id_from=7565164")),
+            "refund queue not read: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|l| l.starts_with("GET /submissions ")),
+            "the whole-table list is still polled: {seen:?}"
+        );
+    }
+
+    /// Marker reads decide "already spent"; they must honour the configured
+    /// commitment rather than a hardcoded `confirmed`.
+    #[test]
+    fn the_submitter_reads_at_the_configured_commitment() {
+        let store = || Store::new("http://127.0.0.1:1", None).unwrap();
+        assert_eq!(
+            submitter_for(store(), "finalized").rpc.commitment(),
+            solana_sdk::commitment_config::CommitmentConfig::finalized()
+        );
+        assert_eq!(
+            submitter_for(store(), "processed").rpc.commitment(),
+            solana_sdk::commitment_config::CommitmentConfig::processed()
+        );
+    }
 
     fn sign(seed: u8, digest: &[u8; 32]) -> ([u8; 20], Vec<u8>) {
         let secret = libsecp256k1::SecretKey::parse(&[seed; 32]).unwrap();

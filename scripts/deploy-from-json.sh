@@ -31,6 +31,10 @@
 # --no-config-update) patches gate/token/pool addresses straight into the
 # bridge runtime config named by `output.update_bridge_config`.
 set -euo pipefail
+# Everything this writes — the deploy record, forge/solana logs, the patched
+# runtime config — can carry keyed RPC URLs. Owner-only from creation, rather
+# than 0644 and fixed up afterwards (audit round 5, LOW).
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -946,6 +950,9 @@ fi
 # --- record ----------------------------------------------------------------
 say "writing $OUT_FILE"
 mkdir -p "$(dirname "$OUT_FILE")"
+# umask only applies to a NEW file: a record left 0644 by an earlier run keeps its
+# mode through `>`, so tighten it before the keyed URLs are written into it.
+[[ -e "$OUT_FILE" ]] && chmod 600 "$OUT_FILE"
 chains_json='[]'
 for cid in "${CHAIN_IDS[@]}"; do
   toks='{}'

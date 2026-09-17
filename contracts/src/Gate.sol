@@ -545,14 +545,19 @@ contract Gate is Initializable, UUPSUpgradeable {
         return keccak256(abi.encode("lowerThreshold", t));
     }
 
-    /// @notice The action id for registering `localToken` as the asset behind
-    ///         `debridgeId` (required by {setLocalToken} once {isSealed}).
-    /// @dev    Commits to BOTH halves, so a matured approval for "debridgeId X
-    ///         pays out token Y" cannot be spent to point X at anything else.
+    /// @notice The action id for registering `bridgeDecimals` as `token`'s wire
+    ///         scale (required by {setBridgeDecimals} once {isSealed}).
+    /// @dev    Commits to BOTH the token and the value, so a matured approval for
+    ///         "token Y carries 6 decimals" cannot be spent on another token or
+    ///         another scale — a digit off pays every claim a power of ten wrong.
     function setBridgeDecimalsActionId(address token, uint8 bridgeDecimals) public pure returns (bytes32) {
         return keccak256(abi.encode("setBridgeDecimals", token, bridgeDecimals));
     }
 
+    /// @notice The action id for registering `localToken` as the asset behind
+    ///         `debridgeId` (required by {setLocalToken} once {isSealed}).
+    /// @dev    Commits to BOTH halves, so a matured approval for "debridgeId X
+    ///         pays out token Y" cannot be spent to point X at anything else.
     function setLocalTokenActionId(bytes32 debridgeId, address localToken)
         public
         pure
@@ -564,7 +569,8 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @notice Queue a validator addition, threshold decrease or (after {seal})
     ///         corridor registration for execution once {GOVERNANCE_DELAY} has
     ///         elapsed. Build `actionId` with {addValidatorActionId} /
-    ///         {lowerThresholdActionId} / {setLocalTokenActionId}.
+    ///         {lowerThresholdActionId} / {setLocalTokenActionId} /
+    ///         {setBridgeDecimalsActionId}.
     /// @dev    Re-scheduling RESTARTS the delay, for the same reason
     ///         {scheduleUpgrade} does: otherwise one matured schedule would be an
     ///         indefinitely re-usable instant-change right against that action.

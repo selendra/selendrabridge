@@ -13,7 +13,10 @@
 //! Every subcommand is owner- or upgrade-authority-gated ON-CHAIN. This tool
 //! only builds and signs transactions; it grants no authority of its own.
 //!
-//!   gate-admin --rpc <url> --keypair <path> --program <pubkey> <command>
+//!   gate-admin (--rpc-env <VAR> | --rpc <url>) --keypair <path> --program <pubkey> <command>
+//!
+//!     `--rpc-env` names an environment variable holding the endpoint. Prefer it
+//!     for a keyed provider URL: `--rpc` puts the key in `ps` and shell history.
 //!
 //!     init --chain-id N --threshold N --validator 0x.. [--validator 0x..]
 //!          --bridge-domain <0x…32 bytes>
@@ -30,15 +33,21 @@
 //!     governance-status   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
 //!     send --debridge-id 0x.. --amount N --chain-id-to N --receiver 0x..
 //!          --from-token-account <pubkey>
-//!     cancel --debridge-id 0x.. --amount N --chain-id-from N --nonce N
+//!     cancel --submission-id 0x.. --debridge-id 0x.. --wire-amount N --chain-id-from N --nonce N
 //!            --receiver 0x.. --native-sender 0x.. --signature 0x.. [--signature 0x..]
-//!     refund --submission-id 0x.. --debridge-id 0x.. --amount N --chain-id-to N
+//!     refund --submission-id 0x.. --debridge-id 0x.. --wire-amount N --chain-id-to N
 //!            --nonce N --receiver 0x.. --native-sender 0x..
 //!            [--to-token-account <pubkey>]   (default: the account `send` debited,
 //!                                             read from the ["sent", id] record)
 //!            --signature 0x.. [--signature 0x..]
 //!     digest --submission-id 0x.. — print the cancel/refund digests to sign
 //!     show
+//!
+//! AMOUNTS: `send --amount` is in MINT units (the program scales it down).
+//! `cancel`/`refund --wire-amount` is the WIRE amount, in the asset's bridge
+//! decimals — the value hashed into the submissionId, i.e. the sig-store record's
+//! `amount`. They differ whenever an asset's mint has more decimals than its
+//! bridge decimals, so the two are deliberately different flags.
 //!
 //! `cancel`/`refund` take signatures as INPUT rather than signing themselves:
 //! they are validator attestations over domain-separated digests, and a tool that
@@ -146,7 +155,9 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no command; see the header of this file"))?;
     let args = Args(argv);
 
-    let rpc_url = args.req("--rpc")?;
+    let rpc_url = solana_relayer::cli::resolve_rpc(args.get("--rpc"), args.get("--rpc-env"), |v| {
+        std::env::var(v).ok()
+    })?;
     let program_id = Pubkey::from_str(&args.req("--program")?)?;
     let payer = read_keypair_file(args.req("--keypair")?)
         .map_err(|e| anyhow::anyhow!("reading keypair: {e}"))?;
@@ -269,6 +280,8 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!validators.is_empty(), "init needs at least one --validator");
             let threshold: u32 = args.req("--threshold")?.parse()?;
             let chain_id: u64 = args.req("--chain-id")?.parse()?;
+            // The program refuses it too; refusing here saves a doomed transaction.
+            anyhow::ensure!(chain_id != 0, "--chain-id must be non-zero (it is bound into every submissionId)");
             let max_validators: u32 =
                 args.get("--max-validators").unwrap_or_else(|| "8".into()).parse()?;
             let max_corridors: u32 =
@@ -500,9 +513,11 @@ fn main() -> anyhow::Result<()> {
         // M-2, DESTINATION side: burn the transfer so it can never be claimed.
         // Moves no funds; it only unlocks the source-side refund.
         "cancel" => {
+            let wire_amount =
+                solana_relayer::cli::wire_amount_flag("cancel", args.get("--amount"), args.get("--wire-amount"))?;
             let a = bridge_solana::instruction::CancelArgs {
                 debridge_id: hex32(&args.req("--debridge-id")?)?,
-                amount: args.req("--amount")?.parse()?,
+                amount: wire_amount,
                 chain_id_from: args.req("--chain-id-from")?.parse()?,
                 nonce: args.req("--nonce")?.parse()?,
                 receiver: hex::decode(
@@ -519,6 +534,7 @@ fn main() -> anyhow::Result<()> {
             let id = hex32(&args.req("--submission-id")?)?;
             let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &program_id);
             println!("burning {} (executed PDA {})", hex::encode(id), executed);
+            println!("wire amount  : {wire_amount} (bridge decimals, as hashed into the id)");
             (
                 GateInstruction::Cancel(a).to_bytes(),
                 vec![
@@ -529,13 +545,17 @@ fn main() -> anyhow::Result<()> {
                 ],
             )
         }
-        // M-2, SOURCE side: return the locked funds, but ONLY once the
-        // destination burn is on-chain. The gate checks that itself.
+        // M-2, SOURCE side: return the locked funds once a refund quorum exists.
+        // The gate cannot see the destination chain: what it checks is the
+        // validators' refund signatures, which they only give after observing
+        // the destination burn.
         "refund" => {
             let debridge_id = hex32(&args.req("--debridge-id")?)?;
+            let wire_amount =
+                solana_relayer::cli::wire_amount_flag("refund", args.get("--amount"), args.get("--wire-amount"))?;
             let a = bridge_solana::instruction::RefundArgs {
                 debridge_id,
-                amount: args.req("--amount")?.parse()?,
+                amount: wire_amount,
                 chain_id_to: args.req("--chain-id-to")?.parse()?,
                 nonce: args.req("--nonce")?.parse()?,
                 receiver: hex::decode(
@@ -556,8 +576,13 @@ fn main() -> anyhow::Result<()> {
             let (refunded_pda, _) =
                 Pubkey::find_program_address(&[b"refunded", &id], &program_id);
             let asset_acct = rpc.get_account(&asset_pda)?;
-            anyhow::ensure!(asset_acct.data.len() >= 96, "asset account is malformed");
-            let vault = Pubkey::new_from_array(asset_acct.data[64..96].try_into()?);
+            let vault = Pubkey::new_from_array(solana_relayer::gate::asset_vault(
+                asset_acct.owner == program_id,
+                &asset_acct.data,
+                &debridge_id,
+            )?);
+            let unit = solana_relayer::gate::asset_bridge_unit(&asset_acct.data)
+                .ok_or_else(|| anyhow::anyhow!("asset has invalid bridge decimals"))?;
 
             // The payout destination is the token account `send` debited, recorded
             // by the program in `["sent", id]` — so it can be read rather than
@@ -579,7 +604,12 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => recorded_to,
             };
-            println!("refunding {} : {} units from vault {vault} -> {to_token}", hex::encode(id), record.amount);
+            solana_relayer::cli::check_refund_amount(wire_amount, unit, record.amount)?;
+            println!(
+                "refunding {} : {} MINT units (= wire amount {wire_amount} x bridge unit {unit}) from vault {vault} -> {to_token}",
+                hex::encode(id),
+                record.amount
+            );
             println!("locked_at    : {} (cluster unix time)", record.locked_at);
             (
                 GateInstruction::Refund(a).to_bytes(),

@@ -420,8 +420,9 @@ mod tests {
             poll_interval_ms: 2000,
             state_file: "x".into(),
             max_batch: 1,
+            start_at_tip: false,
         };
-        let o = Observer::new(&src, &cfg, Store::new("http://127.0.0.1:1", None)).unwrap();
+        let o = Observer::new(&src, &cfg, Store::new("http://127.0.0.1:1", None).unwrap()).unwrap();
         assert_eq!(o.poll, Duration::from_secs(1));
         assert_eq!(ObserverConfig::default().poll_interval_ms, 10_000);
     }

@@ -369,14 +369,19 @@ test.describe("H-2: source and destination must agree on the scale", () => {
       router: null as unknown as string,
     };
 
-    async function openToSolana(page: import("@playwright/test").Page, bridgeDecimals: number) {
+    async function openToSolana(
+      page: import("@playwright/test").Page,
+      bridgeDecimals: number,
+      solanaChain: typeof SOLANA_CHAIN = SOLANA_CHAIN,
+      receiver: string = SOL_RECEIVER
+    ) {
       await startApp(page, {
         backend: {
-          chains: [CHAINS[0], SOLANA_CHAIN],
+          chains: [CHAINS[0], solanaChain],
           solanaGateContext: {
             programId: "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133",
             bridgeDomain: "0x" + "61".repeat(32),
-            chainId: SOLANA_CHAIN.chainId,
+            chainId: solanaChain.chainId,
             nonce: 3,
             debridgeId: "0x" + "4b".repeat(32),
             vault: "33A9xPRuLjv8NBrp5XjjdU22yfXdNx6vGczW9XY3bpgb",
@@ -389,7 +394,7 @@ test.describe("H-2: source and destination must agree on the scale", () => {
       });
       await connectWallet(page);
       await gotoView(page, "Bridge");
-      await field(page, "Receiver").fill(SOL_RECEIVER);
+      await field(page, "Receiver").fill(receiver);
       await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
     }
 
@@ -403,6 +408,33 @@ test.describe("H-2: source and destination must agree on the scale", () => {
     test("sends when the Solana gate agrees", async ({ page }) => {
       await openToSolana(page, 18);
       await expect(primaryButton(page)).toHaveText("Bridge");
+    });
+
+    /**
+     * The receiver check used to recognise Solana only by deBridge's chain id
+     * 7565164. A Solana gate registered under any other id (a local validator,
+     * a devnet mesh) was validated as EVM: its base58 token account refused, and
+     * a 20-byte address — which the Solana gate can never release to — accepted.
+     * The registry says what VM a chain is (a base58 gate), so ask it.
+     */
+    test.describe("registered under a chain id other than deBridge's", () => {
+      const OTHER_ID_SOLANA = {
+        ...SOLANA_CHAIN,
+        chainId: 424242,
+        name: "Solana Localnet",
+        gate: "HvGQTWChe6bMpSYGNavDhGcG8YrJkubJQCDmBrxNR133",
+      };
+
+      test("refuses an EVM address as the receiver", async ({ page }) => {
+        await openToSolana(page, 18, OTHER_ID_SOLANA, "0x" + "ee".repeat(20));
+        await expect(primaryButton(page)).toContainText("EVM address");
+        await expect(primaryButton(page)).toBeDisabled();
+      });
+
+      test("accepts a base58 token account as the receiver", async ({ page }) => {
+        await openToSolana(page, 18, OTHER_ID_SOLANA);
+        await expect(primaryButton(page)).toHaveText("Bridge");
+      });
     });
   });
 
@@ -445,6 +477,89 @@ test.describe("token switching", () => {
     // No trustworthy decimals => the button must refuse, not encode with stale ones.
     await expect(primaryButton(page)).toHaveText("Reading token…");
     await expect(primaryButton(page)).toBeDisabled();
+  });
+
+  /**
+   * A token read that resolves AFTER a newer one used to write anyway. Switch to
+   * token B (slow), then back to A (fast): A's read lands first, then B's lands
+   * over it — `readFor` names B while the form shows A, and the button sat on
+   * "Reading token…" with nothing left to re-trigger the read.
+   */
+  test("a superseded read that lands late does not wedge the form", async ({ page }) => {
+    await openBridge(page);
+    const amount = page.locator(".field").filter({ hasText: "Amount" }).locator("input");
+    await amount.fill("10");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+
+    // Hold every read of TOKEN_6 until released; it also reports 6 decimals.
+    await page.evaluate((slow) => {
+      const w = window as unknown as {
+        ethereum: { request: (a: { method: string; params?: unknown[] }) => Promise<unknown> };
+        __release: () => void;
+      };
+      const original = w.ethereum.request.bind(w.ethereum);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      w.__release = release;
+      w.ethereum.request = async (args) => {
+        const call = (args.params?.[0] ?? {}) as { to?: string; data?: string };
+        if (args.method === "eth_call" && call.to?.toLowerCase() === slow) {
+          await gate;
+          if (call.data?.startsWith("0x313ce567")) return "0x" + "6".padStart(64, "0");
+        }
+        return original(args);
+      };
+    }, TOKEN_6.toLowerCase());
+
+    await tokenField(page).fill(TOKEN_6);
+    await expect(primaryButton(page)).toHaveText("Reading token…");
+    await tokenField(page).fill(TOKEN_18);
+    await expect(primaryButton(page)).toHaveText("Bridge");
+
+    await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+    // Give the released reads every chance to land and (wrongly) write.
+    await page.waitForTimeout(1000);
+    await expect(primaryButton(page)).toHaveText("Bridge");
+    await expect(primaryButton(page)).toBeEnabled();
+
+    // And the amount is still scaled by TOKEN_18's 18 decimals, not the late 6.
+    await primaryButton(page).click();
+    await expect.poll(async () => (await sentTransactions(page)).length, { timeout: 10_000 }).toBe(1);
+    const [tx] = await sentTransactions(page);
+    expect(tx.to.toLowerCase()).toBe(GATE_A.toLowerCase());
+    const words = tx.data.slice(10).match(/.{64}/g)!;
+    expect(words[0]).toBe(TOKEN_18.slice(2).padStart(64, "0"));
+    expect(BigInt("0x" + words[1])).toBe(10n * 10n ** 18n); // 10 @ 18dp
+  });
+
+  /**
+   * `readDecimals(...).catch(() => 18)`: a token whose decimals() cannot be read
+   * was scaled as if it had 18 — a 6-decimal token sent at 10^12 times the typed
+   * amount — in the same function whose comment forbids guessing 18.
+   */
+  test("an unreadable decimals() blocks the send instead of guessing 18", async ({ page }) => {
+    await openBridge(page);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("10");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+
+    await page.evaluate(() => {
+      const w = window as unknown as {
+        ethereum: { request: (a: { method: string; params?: unknown[] }) => Promise<unknown> };
+      };
+      const original = w.ethereum.request.bind(w.ethereum);
+      w.ethereum.request = async (args) => {
+        const call = (args.params?.[0] ?? {}) as { data?: string };
+        if (args.method === "eth_call" && call.data?.startsWith("0x313ce567")) {
+          throw Object.assign(new Error("execution reverted"), { code: 3 });
+        }
+        return original(args);
+      };
+    });
+    await tokenField(page).fill(TOKEN_6);
+
+    await expect(primaryButton(page)).toHaveText("Couldn't read this token on the connected network");
+    await expect(primaryButton(page)).toBeDisabled();
+    expect(await sentTransactions(page)).toHaveLength(0);
   });
 
   test("re-reads balance and allowance for the newly selected token", async ({ page }) => {

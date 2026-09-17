@@ -32,8 +32,11 @@ for i in 1 2 3 4 5; do solana airdrop 100 >/dev/null 2>&1 && break || sleep 2; d
 echo "payer $(solana address) balance $(solana balance)"
 
 echo "== deploy =="
-solana program deploy "$ROOT/crates/solana-gate/target/deploy/solana_gate.so" --output json > /tmp/deploy.json
-PROGRAM_ID="$(python3 -c 'import json;print(json.load(open("/tmp/deploy.json"))["programId"])')"
+# mktemp, not a fixed /tmp/deploy.json another local user could pre-create or
+# symlink (audit round 5, LOW).
+DEPLOY_JSON="$(mktemp)"; trap 'rm -f "$DEPLOY_JSON"' EXIT
+solana program deploy "$ROOT/crates/solana-gate/target/deploy/solana_gate.so" --output json > "$DEPLOY_JSON"
+PROGRAM_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["programId"])' "$DEPLOY_JSON")"
 echo "programId $PROGRAM_ID"
 
 echo "== build ix helper =="

@@ -122,6 +122,10 @@ struct Args {
     /// dangerous configuration the one that takes an extra argument.
     #[arg(long, env = "SIG_STORE_ALLOW_UNAUTHENTICATED", default_value_t = false)]
     allow_unauthenticated: bool,
+    /// Age after which a parked lifecycle/finalize marker whose row never
+    /// arrived is garbage-collected (see `Db::gc_parked_markers`). 0 disables.
+    #[arg(long, env = "SIG_STORE_PARKED_MARKER_TTL_SECS", default_value_t = 30 * 24 * 3600)]
+    parked_marker_ttl_secs: u64,
 }
 
 impl Args {
@@ -174,6 +178,24 @@ async fn main() -> anyhow::Result<()> {
     let auth = args.auth();
     let db = Db::connect(&args.database_url).await?;
     info!("connected to Postgres and applied schema");
+
+    // Parked markers for ids that never get a row used to accumulate forever
+    // (audit 2026-09-16, LOW). Sweep hourly; failures are logged and retried.
+    if args.parked_marker_ttl_secs > 0 {
+        let gc_db = db.clone();
+        let ttl = std::time::Duration::from_secs(args.parked_marker_ttl_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match gc_db.gc_parked_markers(ttl).await {
+                    Ok(0) => {}
+                    Ok(n) => info!(removed = n, "collected stale parked lifecycle markers"),
+                    Err(e) => warn!(error = %e, "parked-marker GC failed; retrying next hour"),
+                }
+            }
+        });
+    }
 
     let state = AppState { db };
 
@@ -911,6 +933,7 @@ mod tests {
             rate_burst: 1,
             max_body_bytes: 1,
             allow_unauthenticated: false,
+            parked_marker_ttl_secs: 0,
         };
         let auth = args.auth();
         assert!(auth.is_enforced());

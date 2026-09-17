@@ -14,7 +14,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-RUN_DIR="${RUN_DIR:-/tmp/bridge-testnet}"
+# Run-dir files are PARSED, not sourced, and only from a dir this user owns
+# (audit round 5, LOW: the old fixed /tmp default could be pre-created by any
+# local user). See _rundir.sh.
+source "$ROOT/scripts/testing/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/run}"
 BIN="$ROOT/crates/solana-relayer/target/debug/solana-relayer"
 
 [[ -x "$BIN" ]] || {
@@ -25,7 +29,7 @@ BIN="$ROOT/crates/solana-relayer/target/debug/solana-relayer"
 # Scoped sig-store credential (finding L-5): a relayer signs, so `Sign` is all
 # it needs.
 if [[ -f "$RUN_DIR/tokens.env" ]]; then
-  set -a; . "$RUN_DIR/tokens.env"; set +a
+  load_env_file "$RUN_DIR/tokens.env" || exit 1
 fi
 
 # Detached so the instances outlive this shell, exactly as scripts/run.sh spawns

@@ -6,22 +6,66 @@
 # real build of `crates/solana-gate` needs — and what the SBF job in CI installs.
 #
 # Build:  docker build -f docker/Dockerfile.solana -t bridge-solana-tools .
-# Use:    docker run --rm -v "$PWD:/work" -w /work bridge-solana-tools \
+# Use:    docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work bridge-solana-tools \
 #           cargo-build-sbf --manifest-path crates/solana-gate/Cargo.toml
-FROM rust:1-bookworm
+#
+# SUPPLY CHAIN (audit round 5, LOW). This used to `curl | sh` the Anza installer
+# as root, which fetched whatever the release host served at build time, and
+# then let cargo-build-sbf download its ~370 MB platform-tools on first use,
+# also unverified — inside the image that backs the REQUIRED deploy-readiness
+# job. Now:
+#   * the base image is pinned by digest;
+#   * both archives are fetched directly and checked against the SHA-256 below
+#     before anything in them runs (the hashes were computed from the GitHub
+#     release assets and matched against release.anza.xyz's copies);
+#   * platform-tools is installed at build time, exactly where cargo-build-sbf
+#     looks for it, so a build needs no network for the toolchain;
+#   * the image runs as an unprivileged user. Run builds with
+#     `--user "$(id -u):$(id -g)"` so artifacts belong to the caller.
+#
+# Bumping SOLANA_VERSION: take the platform-tools version it expects from
+# `cargo-build-sbf --version`, download both archives, and replace all four ARGs.
+FROM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
 
 ARG SOLANA_VERSION=v1.18.26
+ARG SOLANA_SHA256=913c3fd7d9ac22b0a002dd2a691433176cc153e8839790589eba492d095f6d97
+ARG PLATFORM_TOOLS_VERSION=v1.41
+ARG PLATFORM_TOOLS_SHA256=d464229ce31fa36aaf1184505701a2da5c7bb48e29d34004f5b2055dfd9fb0b8
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       curl ca-certificates bzip2 libssl-dev pkg-config build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# The Anza installer provides solana, solana-test-validator and cargo-build-sbf.
-RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_VERSION}/install)"
-ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
+# An unprivileged user whose HOME holds the platform-tools cache. HOME is fixed
+# by ENV so a `--user <uid>` with no passwd entry still resolves the same cache.
+RUN useradd --create-home --uid 10001 --shell /bin/bash solana
+ENV HOME=/home/solana
 
-# Pre-fetch the SBF platform-tools so the first real build doesn't pay for it.
-RUN cargo-build-sbf --version || true
+# solana, solana-test-validator, cargo-build-sbf — verified, then unpacked.
+RUN curl -sSfL -o /tmp/solana.tar.bz2 \
+      "https://github.com/anza-xyz/agave/releases/download/${SOLANA_VERSION}/solana-release-x86_64-unknown-linux-gnu.tar.bz2" \
+ && echo "${SOLANA_SHA256}  /tmp/solana.tar.bz2" | sha256sum -c - \
+ && mkdir -p /opt/solana \
+ && tar -xjf /tmp/solana.tar.bz2 -C /opt/solana --strip-components=1 --no-same-owner \
+ && rm /tmp/solana.tar.bz2
+ENV PATH="/opt/solana/bin:${PATH}"
 
+# platform-tools where cargo-build-sbf expects it ($HOME/.cache/solana/<ver>),
+# linked into the SDK the way its own installer links it — so it finds a valid
+# install and never downloads one.
+RUN curl -sSfL -o /tmp/platform-tools.tar.bz2 \
+      "https://github.com/anza-xyz/platform-tools/releases/download/${PLATFORM_TOOLS_VERSION}/platform-tools-linux-x86_64.tar.bz2" \
+ && echo "${PLATFORM_TOOLS_SHA256}  /tmp/platform-tools.tar.bz2" | sha256sum -c - \
+ && PT="$HOME/.cache/solana/${PLATFORM_TOOLS_VERSION}/platform-tools" \
+ && mkdir -p "$PT" \
+ && tar -xjf /tmp/platform-tools.tar.bz2 -C "$PT" --no-same-owner \
+ && rm /tmp/platform-tools.tar.bz2 \
+ && mkdir -p /opt/solana/bin/sdk/sbf/dependencies \
+ && ln -s "$PT" /opt/solana/bin/sdk/sbf/dependencies/platform-tools \
+ && rustup toolchain link solana "$PT/rust" \
+ && chown -R solana:solana "$HOME" \
+ && chmod -R a+rX "$HOME" /opt/solana
+
+USER solana
 WORKDIR /work

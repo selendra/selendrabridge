@@ -21,17 +21,29 @@
 //! transfer a phishing or replay attempt should target, need the bearer token.
 //! With `allow_unauthenticated = true` (dev) everything is served in full.
 //!
-//! Every PRESENTED bearer, right or wrong, on any route draws from one small
-//! token bucket; when it is empty the API answers 429 without comparing. That
-//! bounds online guessing of the token at a few attempts per second. Requests
-//! with no `Authorization` header do not touch the bucket, so a healthcheck can
-//! never lock an operator out.
+//! Every PRESENTED bearer, right or wrong, on any route draws from a small token
+//! bucket owned by the PEER'S IP ADDRESS; when that bucket is empty the API
+//! answers 429 without comparing. That bounds online guessing of the token at a
+//! few attempts per second per address. Requests with no `Authorization` header
+//! do not touch any bucket, so a healthcheck can never lock an operator out.
+//!
+//! Per address, not global (audit 2026-09-16, LOW). A single shared bucket —
+//! which is what keying on the empty string amounted to — let anyone who could
+//! reach the port keep it drained with a wrong bearer every half second, and the
+//! operator's own correct token then got 429 on `/pause` for as long as the
+//! flood lasted: the halt button was deniable exactly when it was needed. The
+//! draw still happens BEFORE the compare, so a throttled address learns nothing
+//! from any guess. The residual — callers sharing one address (a NAT, or a
+//! proxy in front of the API) share one bucket — is why the API should be bound
+//! to a private interface, as the shipped configs do.
 //!
 //! Each source's state is shared with its scan loop via `Arc<Mutex<Runtime>>`.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -73,7 +85,7 @@ pub struct ApiState {
 struct Guard {
     token: Option<String>,
     allow_unauthenticated: bool,
-    /// One bucket for every presented bearer (see the module note).
+    /// One bucket per peer IP for presented bearers (see the module note).
     attempts: RateLimit,
 }
 
@@ -101,9 +113,10 @@ impl Guard {
             .and_then(|v| v.strip_prefix("Bearer "));
         let Some(presented) = presented else { return Credential::None };
         // Draw BEFORE comparing, so an exhausted bucket refuses to evaluate the
-        // guess at all — a correct token during a flood gets 429 too, briefly,
-        // which is the price of the response not being an oracle.
-        if !self.attempts.check("") {
+        // guess at all — a correct token from a flooding address gets 429 too,
+        // which is the price of the response not being an oracle. The bucket is
+        // the PEER's, so a flood from elsewhere cannot spend the operator's.
+        if !self.attempts.check(&peer_key(req)) {
             return Credential::Throttled;
         }
         if ct_eq(presented.as_bytes(), expected.as_bytes()) {
@@ -112,6 +125,19 @@ impl Guard {
             Credential::Wrong
         }
     }
+}
+
+/// The rate-limit key for a request: the peer's IP address.
+///
+/// Keyed on the IP rather than the socket, so a caller cannot escape its bucket
+/// by opening a new connection. A request with no `ConnectInfo` (only possible
+/// when the router is driven without [`serve`], i.e. in tests) shares one
+/// bucket, which is a bound rather than a bypass.
+fn peer_key(req: &Request) -> String {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_default()
 }
 
 enum Credential {
@@ -212,7 +238,9 @@ pub fn router(state: ApiState) -> Router {
 pub async fn serve(bind: &str, state: ApiState) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "operator API listening");
-    axum::serve(listener, router(state)).await?;
+    // `ConnectInfo` is what the auth bucket is keyed on; without it every peer
+    // would share one bucket again.
+    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -524,6 +552,43 @@ mod tests {
         // ...but the credential-less healthcheck read is untouched.
         let (code, _) = get_status(app.clone(), "/status", None).await;
         assert_eq!(code, StatusCode::OK);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    async fn post_from(app: Router, uri: &str, bearer: &str, peer: [u8; 4]) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::from((peer, 40000))));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// THE regression (audit 2026-09-16, LOW). Every presented bearer used to draw
+    /// from ONE bucket keyed on the empty string, so anyone who could reach the
+    /// port drained it with wrong guesses and the operator's CORRECT token then
+    /// got 429 on `/pause` for as long as the flood lasted. The bucket is now the
+    /// peer's: the attacker throttles only itself.
+    #[tokio::test]
+    async fn a_flood_from_one_address_cannot_lock_the_operator_out() {
+        let p = temp_state_path("auth-dos");
+        let app = app_with(&p, Some("s3cret"), false);
+        const ATTACKER: [u8; 4] = [203, 0, 113, 7];
+        const OPERATOR: [u8; 4] = [10, 0, 0, 2];
+
+        for _ in 0..(AUTH_ATTEMPT_BURST + 5) {
+            post_from(app.clone(), "/pause", "guess", ATTACKER).await;
+        }
+        // Premise: the attacker really did exhaust a bucket — even the right token
+        // from its address is not evaluated.
+        assert_eq!(
+            post_from(app.clone(), "/pause", "s3cret", ATTACKER).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // The operator, from another address, can still halt the validator.
+        assert_eq!(post_from(app.clone(), "/pause", "s3cret", OPERATOR).await, StatusCode::OK);
         let _ = std::fs::remove_file(&p);
     }
 

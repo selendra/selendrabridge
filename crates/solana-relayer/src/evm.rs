@@ -180,7 +180,8 @@ impl GateReader {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
-                .unwrap_or_default(),
+                // Never a default client: that silently drops the timeout above.
+                .map_err(|e| anyhow::anyhow!("building the evm rpc client: {e}"))?,
         })
     }
 

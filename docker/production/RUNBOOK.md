@@ -659,8 +659,14 @@ INFO solana_relayer::refund: solana refund attester started (destination-side)
      validator=0x364f… chain_id=7565164
 INFO solana_relayer::source: solana source scanner started validator=0x364f…
      program=HvGQ… bridge_domain=619244a6… commitment=finalized resume_after=None
-INFO solana_relayer::source: no cursor — starting from the current tip, not replaying history
+INFO solana_relayer::source: no cursor — replaying the program's full history (signing is idempotent). …
 ```
+
+On first start (or after the state volume is lost) the relayer walks the
+program's whole history and signs anything not yet signed — a lost cursor no
+longer skips transfers. A history deeper than 10,000 signatures stops the
+relayer with an error: restore the state file, or set
+`[source].start_at_tip = true` only if every older transfer is known settled.
 
 The `bridge_domain` here must equal the one your EVM validators log. On a live
 mesh it does — same value across both VMs.
@@ -715,7 +721,9 @@ that file is mounted into the container. `preflight.sh` rejects it.
 
 **No operator API.** There is no `/status`, `/pause`, `/resume` or `/rescan`. To
 rewind the cursor, stop the container and edit the state file on the
-`solana-relayer-state` volume, or `down -v` to restart from the tip.
+`solana-relayer-state` volume. `down -v` deletes the cursor, so the relayer
+replays the program's history on the next start (see above) — it does not jump
+to the tip unless `[source].start_at_tip = true`.
 
 ### Failures
 

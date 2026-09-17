@@ -971,4 +971,92 @@ contract SwapRouterTest is Test {
         assertEq(tt.balanceOf(finalReceiver), 1590e18, "unblocked swap runs even for the receiver");
         assertEq(usdB.balanceOf(finalReceiver), 0);
     }
+
+    // ------------------------------------------------------------------
+    // MIN_DELIVER_GAS covers every path that can start the grace clock
+    // ------------------------------------------------------------------
+
+    /// The floor used to be checked only AFTER `_swapBlocked`, so a blocked
+    /// transfer could be deferred — its grace clock started — by a call carrying
+    /// far less than the floor, contradicting the {MIN_DELIVER_GAS} natspec
+    /// ("this floor keeps it from doing even that"). `_swapBlocked` also reads
+    /// `quote` under try/catch, which reports "blocked" for ANY revert, out-of-gas
+    /// included, so an unguarded blockage check is itself a starvation target.
+    function test_Finalize_AStarvedCallCannotStartTheGraceClock() public {
+        Leg memory leg = _claimedAndBlocked();
+
+        vm.prank(address(0xBAD));
+        vm.expectPartialRevert(SwapRouter.InsufficientGas.selector);
+        routerB.finalize{gas: 150_000}(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(routerB.deferredSince(leg.id), 0, "a starved call must not start the clock");
+        assertEq(routerB.owedStable(), 0);
+
+        // An adequately funded call on the same blockage still defers normally.
+        _finalizeAs(address(0xBAD), leg);
+        assertEq(routerB.deferredSince(leg.id), block.timestamp);
+    }
+
+    /// The property the floor exists for, checked across the whole gas range: on
+    /// a swap that CAN run, no amount of forwarded gas yields a deferral. Every
+    /// attempt either is refused (the floor, or a plain out-of-gas revert that
+    /// rolls everything back) or delivers the token. A deferral at any gas level
+    /// would be a stranger starting the grace clock on a healthy transfer.
+    /// Also records what each path really costs, for sizing the constant.
+    function test_MinDeliverGas_NoGasLevelTurnsAHealthySwapIntoADeferral() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+
+        uint256 cheapestSwap;
+        for (uint256 gas_ = 60_000; gas_ <= 700_000; gas_ += 2_000) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(address(0xBAD));
+            (bool ok,) = address(routerB).call{gas: gas_}(
+                abi.encodeCall(
+                    SwapRouter.finalize,
+                    (leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender)
+                )
+            );
+            if (ok) {
+                assertTrue(routerB.finalized(leg.id), "a successful call on a healthy swap must deliver");
+                assertEq(routerB.deferredSince(leg.id), 0, "a healthy swap was deferred");
+                if (cheapestSwap == 0) cheapestSwap = gas_;
+            }
+            vm.revertToState(snap);
+        }
+        assertGt(cheapestSwap, 0, "no gas level completed the swap");
+        emit log_named_uint("cheapest successful finalize (swap path), gas", cheapestSwap);
+    }
+
+    /// What a deferral really costs, logged next to the floor: the floor is
+    /// checked before the blockage test, so a call below it cannot defer at all.
+    function test_MinDeliverGas_BlockedPathCost() public {
+        Leg memory blocked = _claimedAndBlocked();
+        uint256 cheapest;
+        for (uint256 gas_ = 60_000; gas_ <= 700_000; gas_ += 2_000) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(address(0xBAD));
+            (bool ok,) = address(routerB).call{gas: gas_}(
+                abi.encodeCall(
+                    SwapRouter.finalize,
+                    (blocked.debridgeId, blocked.amount, CHAIN_A, blocked.nonce, blocked.receiver, blocked.autoParams, blocked.nativeSender)
+                )
+            );
+            bool deferred = routerB.deferredSince(blocked.id) != 0;
+            vm.revertToState(snap);
+            if (ok) {
+                assertTrue(deferred, "a successful call on a blocked swap must defer");
+                cheapest = gas_;
+                break;
+            }
+        }
+        assertGt(cheapest, 0, "no gas level deferred");
+        emit log_named_uint("cheapest successful finalize (blocked path), gas", cheapest);
+        assertGe(cheapest, routerB.MIN_DELIVER_GAS(), "deferred below the floor");
+    }
 }

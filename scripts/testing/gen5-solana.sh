@@ -35,7 +35,11 @@ SO=crates/solana-gate/target/deploy/solana_gate.so
 PROGRAM_KP=.solana/gen5/program-keypair.json
 PAYER="$SOLANA_PAYER_KEYPAIR"
 ADMIN="$ROOT/crates/solana-relayer/target/debug/gate-admin"
-RUN_DIR="${RUN_DIR:-/tmp/bridge-gen5}"
+# Run-dir files are PARSED, not sourced, and only from a dir this user owns
+# (audit round 5, LOW: the old fixed /tmp default could be pre-created by any
+# local user). See _rundir.sh.
+source "$ROOT/scripts/testing/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/gen5}"
 
 [[ "$BRIDGE_DOMAIN" =~ ^0x[0-9a-fA-F]{64}$ ]] || { echo "bad BRIDGE_DOMAIN" >&2; exit 1; }
 [[ -f "$PROGRAM_KP" ]] || { echo "missing $PROGRAM_KP" >&2; exit 1; }
@@ -71,7 +75,7 @@ deploy)
 configure)
   [[ -x "$ADMIN" ]] || { echo "build it: (cd crates/solana-relayer && cargo build --bin gate-admin)" >&2; exit 1; }
   # shellcheck disable=SC1091
-  source "$RUN_DIR/addresses.env"
+  load_env_file "$RUN_DIR/addresses.env"
   SEP_TOKEN="${TOKEN_TST_11155111:?Gen-5 Sepolia token missing from $RUN_DIR/addresses.env}"
   DID=$(cast keccak "$(cast abi-encode --packed 'f(uint256,address)' 11155111 "$SEP_TOKEN")")
 
@@ -124,7 +128,7 @@ configure)
   # setBridgeDecimals for $TOKEN_TST_11155111 — run.sh registers it when it wires
   # TST, and the value must equal the --bridge-decimals given to the Solana gate.
   bash -c 'source scripts/gen5.config.local >/dev/null 2>&1
-    source "'"$RUN_DIR"'/addresses.env"
+    source scripts/testing/_rundir.sh; load_env_file "'"$RUN_DIR"'/addresses.env" || exit 1
     rpc(){ local w=$1 e c n r; for e in "${CHAINS[@]}"; do IFS="|" read -r c n r _ <<<"$e"; [ "${c// /}" = "$w" ] && { printf "%s" "${r// /}"; return; }; done; }
     # M-3: every EVM gate must list the Solana chain id before an EVM->Solana
     # `send` is accepted (run.config: EXTRA_SUPPORTED_CHAINS=('"$SOLANA_CHAIN_ID"')).

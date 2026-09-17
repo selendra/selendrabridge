@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowRight, Glyph, Help } from "./icons";
-import { chainViz, formatUnits, formatUnitsRaw, isAddress, isSolanaAccount, parseUnits, shortHex, receiverProblem } from "../data/format";
+import {
+  chainViz,
+  formatUnits,
+  formatUnitsRaw,
+  isAddress,
+  isNonEvmChain,
+  isSolanaAccount,
+  parseUnits,
+  shortHex,
+  receiverProblem,
+} from "../data/format";
 import { fetchSolanaGateContext, fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
 import { useDebounced, usePoll } from "../api/hooks";
 import { debridgeId } from "../wallet/keccak";
@@ -35,12 +45,6 @@ import { SolanaBridgePanel } from "./SolanaBridgePanel";
 
 const eqAddr = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const SLIPPAGE_OPTS = [10, 50, 100]; // bps: 0.1%, 0.5%, 1%
-
-/** A registry entry with no EVM RPC is a non-EVM chain — today, Solana. */
-// The registry tells the VMs apart by address form: an EVM gate is `0x…`, a
-// Solana gate is its base58 program id. A row with neither url nor gate (the
-// older "listed, not polled" form) is Solana too.
-const isNonEvmChain = (c: Chain) => (c.gate ? !c.gate.startsWith("0x") : !c.rpcUrl);
 
 interface Props {
   chains: Chain[];
@@ -278,7 +282,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // L-4: validate the receiver against the DESTINATION VM, not just as an EVM
   // address. A Solana destination needs a base58 SPL token account; a wallet
   // pubkey there produces a transfer the gate can never release.
-  const receiverIssue = receiverProblem(receiver, toChainId);
+  const receiverIssue = receiverProblem(receiver, toReg);
   const receiverOk = receiverIssue === null;
   const routerOk = isAddress(router);
   const finalTokenOk = isAddress(finalToken);
@@ -293,11 +297,25 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // "no trustworthy read yet" and blocks the submit button — never fall back to
   // a stale value, and never to a guessed 18.
   const [readFor, setReadFor] = useState<string | null>(null);
+  // The key a read FAILED for, so the button can say so instead of "Reading…".
+  const [readFailedFor, setReadFailedFor] = useState<string | null>(null);
   const readKey = `${fromChainId ?? "?"}:${token.toLowerCase()}:${spender.toLowerCase()}:${gate.toLowerCase()}`;
   const onchainStale = readFor !== readKey;
 
   // On-chain reads (decimals/balance/allowance) against the connected chain.
+  //
+  // Only the LATEST call may write (audit round 5, LOW). Reads for a token the
+  // user has since switched away from used to land whenever they resolved, so an
+  // older call finishing last left `readFor` naming the old token — the form sat
+  // on "Reading token…" until something else triggered a refresh — or, worse,
+  // its `decimals` landed between the newer call's `setDecimals` and its
+  // `setReadFor`, pairing one token's scale with the other's key. Now each call
+  // takes a sequence number, bails after every await once superseded, and
+  // commits all four values together.
+  const refreshSeq = useRef(0);
   const refreshOnchain = useCallback(async () => {
+    const seq = ++refreshSeq.current;
+    const current = () => seq === refreshSeq.current;
     if (!wallet.address || !tokenOk) {
       setReadFor(null);
       setBalance(null);
@@ -307,26 +325,36 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     // Invalidate first: everything below describes the PREVIOUS token until the
     // awaits resolve, and a submit in that window is the bug.
     setReadFor(null);
+    setReadFailedFor(null);
     setBalance(null);
     setAllowance(null);
     setBridgeUnit(null);
     try {
-      const dec = await readDecimals(wallet.request, token).catch(() => 18);
-      setDecimals(Number.isFinite(dec) && dec > 0 && dec <= 36 ? dec : 18);
+      // No guessed 18 on failure (audit round 5, LOW): `decimals` scales the
+      // typed amount into base units, so a token that is really 6 decimals would
+      // be sent at 10^12 times the intended amount. An unreadable or implausible
+      // value leaves `readFor` null, which keeps the submit button disabled.
+      const dec = await readDecimals(wallet.request, token);
+      if (!current()) return;
+      if (!Number.isInteger(dec) || dec < 0 || dec > 36) throw new Error(`implausible decimals() = ${dec}`);
       const [b, a, unit] = await Promise.all([
         readBalance(wallet.request, token, wallet.address),
         spenderOk ? readAllowance(wallet.request, token, wallet.address, spender) : Promise.resolve(0n),
         // A revert here means the gate cannot convert this token's amounts.
         gateOk ? readBridgeUnit(wallet.request, gate, token).catch(() => null) : Promise.resolve(null),
       ]);
+      if (!current()) return;
+      setDecimals(dec);
       setBalance(b);
       setAllowance(a);
       setBridgeUnit(unit);
       setReadFor(readKey);
     } catch {
+      if (!current()) return;
       setBalance(null);
       setAllowance(null);
       setReadFor(null);
+      setReadFailedFor(readKey);
     }
   }, [wallet.address, wallet.request, token, spender, tokenOk, spenderOk, gate, gateOk, readKey]);
 
@@ -707,6 +735,8 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   else if (!receiverOk) button = { label: receiverIssue ?? "Enter a valid receiver", disabled: true };
   // Until the reads match the selected token, `decimals` may still describe the
   // previous one — refuse to encode an amount with it rather than guess.
+  else if (onchainStale && readFailedFor === readKey)
+    button = { label: "Couldn't read this token on the connected network", disabled: true };
   else if (onchainStale) button = { label: "Reading token…", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
   else if (!crossSwap && bridgeUnit == null)

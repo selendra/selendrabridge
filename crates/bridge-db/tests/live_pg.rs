@@ -251,3 +251,52 @@ async fn load_page_walks_the_same_order_as_load_all() {
     );
     assert_eq!(db.history_page(1, 0).await.unwrap().len(), 1);
 }
+
+// --- audit 2026-09-16, LOW: bounds and parked-marker GC -------------------------
+
+/// A parked marker whose row never arrives is collected once aged, and ONLY once
+/// aged: a fresh one survives the same sweep and is still applied.
+#[tokio::test]
+async fn an_aged_orphan_marker_is_collected_and_a_fresh_one_is_kept() {
+    let Some((db, _g)) = live_db().await else { return };
+    let chain_to = 810_000 + (std::process::id() as u64 % 90_000);
+
+    // Fresh marker, generous TTL: kept, and applied when the row arrives.
+    let kept = record(chain_to);
+    db.mark_claimed(&kept.submission_id, "0xkept").await.unwrap();
+    db.gc_parked_markers(std::time::Duration::from_secs(24 * 3600)).await.unwrap();
+    db.observe_submission(kept.clone()).await.unwrap();
+
+    // Orphan marker, zero TTL: collected, so a row that shows up afterwards is
+    // NOT retro-claimed by it.
+    let orphan = record(chain_to);
+    db.mark_claimed(&orphan.submission_id, "0xorphan").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let removed = db.gc_parked_markers(std::time::Duration::ZERO).await.unwrap();
+    assert!(removed >= 1, "the orphan marker must be collected");
+    db.observe_submission(orphan.clone()).await.unwrap();
+
+    let h = db.history_page(1000, 0).await.unwrap();
+    let status = |id: &str| h.iter().find(|r| r.submission_id == id).unwrap().status.clone();
+    assert_eq!(status(&kept.submission_id), "claimed");
+    assert_eq!(status(&orphan.submission_id), "signed");
+}
+
+/// The bounds reach the real write paths, as 4xx-class errors.
+#[tokio::test]
+async fn oversized_or_hostile_text_is_refused_at_the_db_layer() {
+    let Some((db, _g)) = live_db().await else { return };
+    let rec = record(820_000);
+    let e = db.mark_claimed(&rec.submission_id, &"a".repeat(10_000)).await.unwrap_err();
+    assert!(e.is_client_error(), "{e}");
+    let e = db.mark_cancelled(&rec.submission_id, "0xab\nforged").await.unwrap_err();
+    assert!(e.is_client_error(), "{e}");
+    let e = db
+        .add_allowed_token(1, &format!("{:#x}", token()), Some(&"S".repeat(1000)))
+        .await
+        .unwrap_err();
+    assert!(e.is_client_error(), "{e}");
+    let mut wide = record(820_001);
+    wide.auto_params = format!("0x{}", "ee".repeat(bridge_db::MAX_AUTO_PARAMS_BYTES + 1));
+    assert!(db.observe_submission(wide).await.unwrap_err().is_client_error());
+}

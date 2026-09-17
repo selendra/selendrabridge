@@ -26,7 +26,11 @@ source scripts/solana-devnet.config.local
 # shellcheck disable=SC1090
 source scripts/gen5.config.local
 
-RUN_DIR="${RUN_DIR:-/tmp/bridge-gen5}"
+# Run-dir files are PARSED, not sourced, and only from a dir this user owns
+# (audit round 5, LOW: the old fixed /tmp default could be pre-created by any
+# local user). See _rundir.sh.
+source "scripts/testing/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/gen5}"
 BIN="$ROOT/crates/solana-relayer/target/debug/solana-relayer"
 PROGRAM_KP=.solana/gen5/program-keypair.json
 PID=$(solana-keygen pubkey "$PROGRAM_KP")
@@ -36,9 +40,10 @@ case "${1:-status}" in
 start)
   [[ -x "$BIN" ]] || cargo build --manifest-path crates/solana-relayer/Cargo.toml --bin solana-relayer
   mkdir -p "$RUN_DIR"
+  rundir_trusted "$RUN_DIR" || exit 1
 
   # Scoped sig-store credential: a relayer signs, so `Sign` is all it needs.
-  [[ -f "$RUN_DIR/tokens.env" ]] && { set -a; . "$RUN_DIR/tokens.env"; set +a; }
+  [[ -f "$RUN_DIR/tokens.env" ]] && { load_env_file "$RUN_DIR/tokens.env" || exit 1; }
 
   # The EVM gates the scanner cross-checks before signing (H-2, audit
   # 2026-09-16). The submissionId does not commit to the asset's scale, so a
@@ -52,8 +57,7 @@ start)
     echo "     addresses the relayers can verify nothing and would sign nothing." >&2
     exit 1
   }
-  # shellcheck disable=SC1090
-  source "$ADDR_ENV"
+  load_env_file "$ADDR_ENV" || exit 1
 
   # The RPC URLs carry the Alchemy key, so they reach the process through the
   # environment like the signing keys do — never inlined into a world-readable

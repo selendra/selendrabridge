@@ -994,11 +994,11 @@ impl GateView {
         let mut resolved = Vec::with_capacity(authentic.len());
         for (addr, s) in authentic {
             let member = match self.members.get(&addr) {
-                Some(&m) => m,
+                Some(&m) => Membership::Cached(m),
                 None => match gate.isValidator(addr).call().await {
                     Ok(m) => {
                         self.members.insert(addr, m);
-                        m
+                        Membership::Fresh(m)
                     }
                     Err(e) => {
                         warn!(signer = %s.signer, error = %e, "isValidator read failed; dropping this signer for this tick");
@@ -1007,6 +1007,30 @@ impl GateView {
                 },
             };
             resolved.push((addr, member, s));
+        }
+        // More distinct members than the gate has validators can only mean the
+        // memo still counts someone removed on-chain. Ask the gate again about
+        // every memoised answer before choosing whom to cap; a read that fails
+        // stays `Cached`, which `filter_members` ranks below a fresh one.
+        let members = resolved.iter().filter(|(_, m, _)| m.is_member()).count();
+        if members > self.validator_count {
+            warn!(
+                submission_id,
+                members,
+                validator_count = self.validator_count,
+                "more member signatures than validators: membership memo is stale; re-reading it"
+            );
+            for (addr, m, _) in resolved.iter_mut() {
+                if let Membership::Cached(_) = m {
+                    match gate.isValidator(*addr).call().await {
+                        Ok(v) => {
+                            self.members.insert(*addr, v);
+                            *m = Membership::Fresh(v);
+                        }
+                        Err(e) => warn!(signer = %addr, error = %e, "isValidator re-read failed; ranking the memo below fresh reads"),
+                    }
+                }
+            }
         }
         filter_members(resolved, self.validator_count)
     }
@@ -1047,7 +1071,8 @@ fn authenticate_signatures(id: B256, kind: SigKind, sigs: &[SignerSig]) -> Vec<(
     out
 }
 
-/// Keep only member signatures, then cap the result at `validator_count`.
+/// Keep only member signatures, then cap the result at `validator_count`,
+/// dropping memo-derived members before freshly read ones.
 ///
 /// Split from the I/O so the rule is unit-testable. The cap is belt-and-braces:
 /// distinct members can only exceed `validator_count` when the memo is stale
@@ -1057,17 +1082,34 @@ fn authenticate_signatures(id: B256, kind: SigKind, sigs: &[SignerSig]) -> Vec<(
 /// `NotEnoughSignatures`, which is retryable, rather than `TooManySignatures`,
 /// which was not.
 fn filter_members(
-    resolved: Vec<(Address, bool, SignerSig)>,
+    resolved: Vec<(Address, Membership, SignerSig)>,
     validator_count: usize,
 ) -> Vec<SignerSig> {
-    let mut kept: Vec<(Address, SignerSig)> = resolved
-        .into_iter()
-        .filter(|(_, member, _)| *member)
-        .map(|(addr, _, s)| (addr, s))
-        .collect();
-    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut kept: Vec<(Address, Membership, SignerSig)> =
+        resolved.into_iter().filter(|(_, m, _)| m.is_member()).collect();
+    // Only an overflow needs a choice, and an overflow means the memo is stale
+    // — so what the gate said THIS tick outranks what it said earlier. Ranking
+    // purely by address kept a removed validator with a low address and dropped
+    // a live member with a high one (audit 2026-09-16, LOW).
+    kept.sort_by_key(|(addr, m, _)| (matches!(m, Membership::Cached(_)), *addr));
     kept.truncate(validator_count);
-    kept.into_iter().map(|(_, s)| s).collect()
+    kept.sort_by_key(|(addr, _, _)| *addr);
+    kept.into_iter().map(|(_, _, s)| s).collect()
+}
+
+/// How a signer's membership was established this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    /// Read from the gate during this tick.
+    Fresh(bool),
+    /// Taken from the memo, which may predate an on-chain removal.
+    Cached(bool),
+}
+
+impl Membership {
+    fn is_member(self) -> bool {
+        matches!(self, Membership::Fresh(true) | Membership::Cached(true))
+    }
 }
 
 /// Signatures ordered by recovered signer ascending, as every Gate entry point
@@ -1128,10 +1170,10 @@ mod tests {
     }
 
     /// What `member_signatures` hands to `filter_members` after its RPC reads.
-    fn resolved(pairs: &[(&SignerSig, bool)]) -> Vec<(Address, bool, SignerSig)> {
+    fn resolved(pairs: &[(&SignerSig, bool)]) -> Vec<(Address, Membership, SignerSig)> {
         pairs
             .iter()
-            .map(|(s, member)| (Address::from_str(&s.signer).unwrap(), *member, (*s).clone()))
+            .map(|(s, member)| (Address::from_str(&s.signer).unwrap(), Membership::Fresh(*member), (*s).clone()))
             .collect()
     }
 
@@ -1186,6 +1228,27 @@ mod tests {
         let kept = filter_members(resolved(&pairs), 2);
 
         assert_eq!(kept.len(), 2, "must not exceed the gate's validatorCount");
+    }
+
+    /// Audit 2026-09-16 (LOW): the cap kept the LOWEST addresses, so a validator
+    /// removed on-chain inside the refresh window — still `true` in the memo —
+    /// with a low address pushed a live member with a high one out of the array.
+    /// The quorum then fell one short and the claim waited out the memo, although
+    /// every signature it needed was in hand. Rotating an old key out while a
+    /// transfer is mid-flight is exactly that shape.
+    #[test]
+    fn the_cap_drops_a_stale_member_not_a_live_one() {
+        let (stale, live1, live2) = (sig(0x01), sig(0xE1), sig(0xE2));
+        // A 3-validator gate lost `stale` on-chain; the memo still says member.
+        // `validatorCount` is now 2. live1/live2 were read this tick.
+        let resolved = vec![
+            (Address::from_str(&stale.signer).unwrap(), Membership::Cached(true), stale.clone()),
+            (Address::from_str(&live1.signer).unwrap(), Membership::Fresh(true), live1.clone()),
+            (Address::from_str(&live2.signer).unwrap(), Membership::Fresh(true), live2.clone()),
+        ];
+        let kept = filter_members(resolved, 2);
+        let signers: Vec<&str> = kept.iter().map(|s| s.signer.as_str()).collect();
+        assert_eq!(signers, [live1.signer.as_str(), live2.signer.as_str()], "the removed validator is the one dropped");
     }
 
     /// The Gate requires strictly ascending signers; capping must not disturb the
@@ -1385,8 +1448,8 @@ mod tests {
         let authentic = authenticate_signatures(id, SigKind::Transfer, &rows);
         assert_eq!(authentic.len(), 3, "v1 once, v2 once, outsider once");
 
-        let resolved: Vec<(Address, bool, SignerSig)> =
-            authentic.into_iter().map(|(a, s)| (a, members.contains(&a), s)).collect();
+        let resolved: Vec<(Address, Membership, SignerSig)> =
+            authentic.into_iter().map(|(a, s)| (a, Membership::Fresh(members.contains(&a)), s)).collect();
         let kept = filter_members(resolved, 3);
         let addrs: Vec<Address> = kept.iter().map(|s| Address::from_str(&s.signer).unwrap()).collect();
         let mut expect = vec![v1.address(), v2.address()];

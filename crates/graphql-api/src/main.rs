@@ -34,6 +34,7 @@ mod chain;
 mod solana_pool;
 mod schema;
 mod swap;
+mod upstream;
 
 use std::sync::Arc;
 

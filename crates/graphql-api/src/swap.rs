@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
+use std::time::Duration;
 
 use alloy::primitives::{Address, U256, U512};
 use alloy::providers::{DynProvider, Provider};
@@ -19,7 +20,8 @@ use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use bridge_core::abi::{IERC20Mintable, SwapPool};
 
-use crate::chain::{provider_for, split_spec, ChainInfo};
+use crate::chain::{provider_for, redact_spec, split_spec, ChainInfo};
+use crate::upstream::Upstream;
 
 /// One listed token in a pool, flattened for the wire. Numeric fields are
 /// decimal strings (uint256) to avoid JSON precision loss, mirroring how
@@ -98,6 +100,9 @@ pub struct Swaps {
     cache: Arc<Mutex<BTreeMap<u64, TokenListState>>>,
     /// Chains whose listing backfill is running in the background right now.
     backfilling: Arc<Mutex<std::collections::BTreeSet<u64>>>,
+    /// The meter on the fields that proxy straight to the (keyed) RPC — see
+    /// [`crate::upstream`].
+    upstream: Upstream,
 }
 
 /// A configured pool. The EVM side reads through alloy; the Solana side reads
@@ -141,9 +146,17 @@ impl Default for Swaps {
             max_range: DEFAULT_MAX_BLOCK_RANGE,
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             backfilling: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            upstream: Upstream::default(),
         }
     }
 }
+
+/// How long a quote or a balance answer is shared between callers.
+const READ_TTL: Duration = Duration::from_secs(2);
+/// How long one finalized blockhash is handed out.
+const BLOCKHASH_TTL: Duration = Duration::from_secs(2);
+/// How long a settled (`finalized`/`failed`) signature status is kept.
+const SETTLED_TTL: Duration = Duration::from_secs(600);
 
 /// Suits a local node. Live deployments behind a hosted RPC must lower this.
 const DEFAULT_MAX_BLOCK_RANGE: u64 = 1000;
@@ -173,13 +186,15 @@ impl Swaps {
     /// global default.
     pub fn add_spec(&mut self, spec: &str) -> anyhow::Result<u64> {
         let (chain_id, rpc, rest) = split_spec(spec, "--swap")?;
+        // Never the spec itself in an error: it carries the keyed RPC.
+        let shown = redact_spec(spec);
         let mut parts = rest.splitn(3, ',');
         let pool_s = parts.next().unwrap_or(rest);
         let from_block = match parts.next() {
             Some(blk) => blk
                 .trim()
                 .parse::<u64>()
-                .with_context(|| format!("bad FROM_BLOCK in --swap {spec:?}"))?,
+                .with_context(|| format!("bad FROM_BLOCK in --swap {shown:?}"))?,
             None => 0,
         };
         let max_range = match parts.next() {
@@ -187,13 +202,13 @@ impl Swaps {
                 let r = r
                     .trim()
                     .parse::<u64>()
-                    .with_context(|| format!("bad MAX_RANGE in --swap {spec:?}"))?;
-                anyhow::ensure!(r > 0, "MAX_RANGE must be > 0 in --swap {spec:?}");
+                    .with_context(|| format!("bad MAX_RANGE in --swap {shown:?}"))?;
+                anyhow::ensure!(r > 0, "MAX_RANGE must be > 0 in --swap {shown:?}");
                 r
             }
             None => self.max_range,
         };
-        self.insert(chain_id, rpc, pool_s, from_block, max_range, &format!("--swap {spec:?}"))?;
+        self.insert(chain_id, rpc, pool_s, from_block, max_range, &format!("--swap {shown:?}"))?;
         Ok(chain_id)
     }
 
@@ -566,7 +581,15 @@ impl Swaps {
     /// a transaction. `None` for an EVM chain (a wallet supplies its own nonce).
     pub async fn solana_blockhash(&self, chain_id: u64) -> Option<String> {
         match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => sol.latest_blockhash().await.ok(),
+            // A finalized hash stays valid for ~60s; every browser can share one
+            // for a couple of seconds.
+            Backend::Solana(sol) => {
+                self.upstream
+                    .cached(format!("blockhash:{chain_id}"), |_| BLOCKHASH_TTL, async {
+                        sol.latest_blockhash().await.ok()
+                    })
+                    .await
+            }
             Backend::Evm { .. } => None,
         }
     }
@@ -574,7 +597,14 @@ impl Swaps {
     /// SPL balance of a token account on the Solana chain.
     pub async fn solana_token_balance(&self, chain_id: u64, account: &str) -> Option<String> {
         match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => sol.token_balance(account).await.ok(),
+            Backend::Solana(sol) => {
+                let account = crate::solana_pool::valid_pubkey(account).ok()?;
+                self.upstream
+                    .cached(format!("balance:{chain_id}:{account}"), |_| READ_TTL, async {
+                        sol.token_balance(account).await.ok()
+                    })
+                    .await
+            }
             Backend::Evm { .. } => None,
         }
     }
@@ -582,9 +612,24 @@ impl Swaps {
     /// Confirmation state of a Solana signature.
     pub async fn solana_signature_status(&self, chain_id: u64, signature: &str) -> Option<String> {
         match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => sol.signature_status(signature).await.ok(),
+            Backend::Solana(sol) => {
+                let signature = crate::solana_pool::valid_signature(signature).ok()?;
+                // `finalized` and `failed` never change, so they are kept; any
+                // other state is about to, so it is only metered.
+                let ttl = |s: &str| if matches!(s, "finalized" | "failed") { SETTLED_TTL } else { Duration::ZERO };
+                self.upstream
+                    .cached(format!("sigstatus:{chain_id}:{signature}"), ttl, async {
+                        sol.signature_status(signature).await.ok()
+                    })
+                    .await
+            }
             Backend::Evm { .. } => None,
         }
+    }
+
+    /// The meter for other proxy-shaped fields (`solanaGateContext`).
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
     }
 
     /// The Solana view of [`pools`](Self::pools): one `getProgramAccounts` and
@@ -702,6 +747,24 @@ impl Swaps {
         token_out: &str,
         amount_in: &str,
     ) -> Option<String> {
+        let key = format!(
+            "quote:{chain_id}:{}:{}:{}",
+            token_in.trim().to_ascii_lowercase(),
+            token_out.trim().to_ascii_lowercase(),
+            amount_in.trim()
+        );
+        self.upstream
+            .cached(key, |_| READ_TTL, self.quote_uncached(chain_id, token_in, token_out, amount_in))
+            .await
+    }
+
+    async fn quote_uncached(
+        &self,
+        chain_id: u64,
+        token_in: &str,
+        token_out: &str,
+        amount_in: &str,
+    ) -> Option<String> {
         let (provider, pool_addr) = match self.pools.get(&chain_id)? {
             Backend::Solana(sol) => {
                 return self.solana_quote(sol, token_in, token_out, amount_in).await
@@ -799,5 +862,122 @@ mod tests {
             swaps.add_from_registry(c).unwrap();
         }
         assert_eq!(swaps.evm_params(1337), Some((12, DEFAULT_MAX_BLOCK_RANGE)));
+    }
+
+    /// Same rule as `--gate`: a malformed `--swap` names the problem without
+    /// printing the keyed endpoint.
+    #[test]
+    fn swap_spec_errors_never_carry_the_rpc_key() {
+        let secret = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        let url = format!("https://eth-sepolia.g.alchemy.com/v2/{secret}");
+        let pool = "0x0000000000000000000000000000000000000009";
+        for spec in [
+            format!("1337={url},{pool},notablock"),
+            format!("1337={url},{pool},12,notarange"),
+            format!("1337={url},{pool},12,0"),
+            format!("1337={url},0xbad"),
+            format!("1337={url},not-base58-!!"),
+            format!("{url},{pool}"),
+        ] {
+            let err = Swaps::new().add_spec(&spec).unwrap_err();
+            for shown in [err.to_string(), format!("{err:#}"), format!("{err:?}")] {
+                assert!(!shown.contains(secret), "key leaked for {spec:?}: {shown}");
+            }
+        }
+    }
+
+    /// A mock Solana JSON-RPC: `getLatestBlockhash` and `getSignatureStatuses`
+    /// (reporting `status` for every signature), counting calls. Returns its URL.
+    async fn mock_solana(status: &'static str, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let result = match req["method"].as_str().unwrap() {
+                        "getLatestBlockhash" => serde_json::json!({
+                            "context": {"slot": 1},
+                            "value": {"blockhash": "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N", "lastValidBlockHeight": 9}
+                        }),
+                        "getSignatureStatuses" => serde_json::json!({
+                            "context": {"slot": 1},
+                            "value": [{"slot": 1, "confirmations": null, "err": null, "confirmationStatus": status}]
+                        }),
+                        m => panic!("unexpected {m}"),
+                    };
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn schema_over(swaps: Swaps) -> async_graphql::Schema<crate::schema::Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription> {
+        let dir = std::env::temp_dir().join(format!("graphql-api-upstream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        async_graphql::Schema::build(crate::schema::Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .limit_complexity(8000)
+            .data(crate::schema::ApiState {
+                backend: Arc::new(bridge_core::backend::StoreBackend::file(&dir).unwrap()),
+                threshold: None,
+                chains: crate::chain::Chains::new(),
+                registry: vec![],
+                swaps,
+            })
+            .finish()
+    }
+
+    /// Audit 2026-09-16 (LOW): the `solana*` fields and `swapQuote` were an
+    /// unmetered proxy to the operator's keyed RPC — one anonymous POST of
+    /// aliases became one upstream call per alias. Identical questions now share
+    /// one answer.
+    #[tokio::test]
+    async fn aliased_proxy_reads_share_one_upstream_call() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana("confirmed", calls.clone()).await;
+        let mut swaps = Swaps::new();
+        swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
+        let schema = schema_over(swaps);
+
+        let body: String = (0..100).map(|i| format!("a{i}: solanaBlockhash(chainId: 9) ")).collect();
+        let res = schema.execute(format!("{{ {body} }}")).await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["a99"], "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "100 aliases, one RPC call");
+    }
+
+    /// A settled signature status is kept; an unsettled one is re-asked, since a
+    /// UI polls it precisely to see it change.
+    #[tokio::test]
+    async fn only_a_settled_signature_status_is_kept() {
+        let sig = bs58::encode([7u8; 64]).into_string();
+        for (status, want_calls) in [("finalized", 1), ("confirmed", 3)] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let url = mock_solana(status, calls.clone()).await;
+            let mut swaps = Swaps::new();
+            swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
+            for _ in 0..3 {
+                assert_eq!(swaps.solana_signature_status(9, &sig).await.as_deref(), Some(status));
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), want_calls, "{status}");
+        }
+    }
+
+    /// A malformed argument is refused before it reaches the RPC or the cache.
+    #[tokio::test]
+    async fn malformed_proxy_arguments_never_reach_upstream() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana("finalized", calls.clone()).await;
+        let mut swaps = Swaps::new();
+        swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
+        assert_eq!(swaps.solana_signature_status(9, "not-a-signature").await, None);
+        assert_eq!(swaps.solana_token_balance(9, "0xnope").await, None);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

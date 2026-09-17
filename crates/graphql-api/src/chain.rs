@@ -16,6 +16,7 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::client::RpcClient;
 use anyhow::Context;
 use bridge_core::abi::Gate;
+use bridge_core::config::redact_url;
 use serde::{Deserialize, Serialize};
 
 /// Time to establish a TCP/TLS connection to any upstream (RPC node, Solana
@@ -285,17 +286,33 @@ pub fn chains_without_public_rpc(registry: &[ChainInfo]) -> Vec<u64> {
         .collect()
 }
 
+/// A `CHAINID=RPC,ADDR[,…]` spec as it may appear in an error: the RPC cut down
+/// to scheme + host by [`redact_url`]. The RPC is the operator's keyed provider
+/// URL, and a startup error goes to stderr and every log shipper behind it —
+/// quoting the spec verbatim put the key there (audit 2026-09-16, LOW). A spec
+/// too malformed to locate the RPC in is withheld whole.
+pub(crate) fn redact_spec(spec: &str) -> String {
+    let Some((id, rest)) = spec.split_once('=') else {
+        return if spec.contains("://") { "<redacted>".into() } else { spec.to_owned() };
+    };
+    match rest.split_once(',') {
+        Some((rpc, tail)) => format!("{id}={},{tail}", redact_url(rpc.trim())),
+        None => format!("{id}={}", redact_url(rest.trim())),
+    }
+}
+
 /// Split a `CHAINID=RPC,ADDR` spec (the shape both `--gate` and `--swap` use)
 /// into its parts. `flag` names the flag in error messages.
 pub(crate) fn split_spec<'s>(spec: &'s str, flag: &str) -> anyhow::Result<(u64, &'s str, &'s str)> {
+    let shown = || redact_spec(spec);
     let (id_s, rest) = spec
         .split_once('=')
-        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {spec:?}"))?;
+        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {:?}", shown()))?;
     let (rpc, addr_s) = rest
         .split_once(',')
-        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {spec:?}"))?;
+        .with_context(|| format!("{flag} must be CHAINID=RPC,ADDR, got {:?}", shown()))?;
     let chain_id: u64 =
-        id_s.trim().parse().with_context(|| format!("bad chainId in {flag} {spec:?}"))?;
+        id_s.trim().parse().with_context(|| format!("bad chainId in {flag} {:?}", shown()))?;
     Ok((chain_id, rpc, addr_s))
 }
 
@@ -398,6 +415,37 @@ impl TerminalCache {
     }
 }
 
+/// What an EVM gate says about one of its tokens' bridge decimals — the scale
+/// every transfer amount of that asset is denominated in on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateScale {
+    /// `bridgeDecimalsOf(token)` is set, to this.
+    Registered(u8),
+    /// The gate answered and has no scale for the token: `set == false`, or the
+    /// call reverted (a gate that predates the function).
+    Unregistered,
+    /// Nothing to ask (no EVM gate configured for the chain) or the request
+    /// failed in transit. Says nothing about the gate.
+    Unknown,
+}
+
+/// Did the gate ANSWER (a revert, or a reply that is not this function's
+/// shape), as opposed to the request failing in transit? The validator's rule
+/// (`crates/validator/src/scale.rs`), so the API and the signer classify a
+/// read the same way.
+fn gate_answered(e: &alloy::contract::Error) -> bool {
+    use alloy::contract::Error as E;
+    if e.as_revert_data().is_some() {
+        return true;
+    }
+    match e {
+        E::ZeroData(..) | E::AbiError(_) | E::UnknownFunction(_) | E::UnknownSelector(_) => true,
+        // Some nodes report a data-less revert only in the message.
+        E::TransportError(_) => e.to_string().to_ascii_lowercase().contains("execution reverted"),
+        _ => false,
+    }
+}
+
 /// Destination gates the API can read execution status from. Cheap to clone
 /// (each `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone, Default)]
@@ -409,6 +457,14 @@ pub struct Chains {
     /// Settled `executed`/`cancelled` answers, so a delivered transfer costs
     /// zero `eth_call`s on every later request.
     terminal: TerminalCache,
+    /// Registered bridge decimals per `(chain, token)`. A registration is
+    /// write-once on the gate, so a `set` answer never changes and one read per
+    /// token serves every row of every later request. An unset one is not
+    /// kept — the token may be registered a block later.
+    scales: Arc<Mutex<HashMap<(u64, Address), u8>>>,
+    /// `(chain, token)`s already reported as disagreeing with the registry, so
+    /// the warning is one line per asset, not one per row per request.
+    scale_warned: Arc<Mutex<std::collections::HashSet<(u64, Address)>>>,
 }
 
 impl Chains {
@@ -432,7 +488,7 @@ impl Chains {
             );
             return Ok(chain_id);
         }
-        let (provider, gate) = provider_for(gate_s, rpc, &format!("--gate {spec:?}"))?;
+        let (provider, gate) = provider_for(gate_s, rpc, &format!("--gate {:?}", redact_spec(spec)))?;
         self.gates.insert(chain_id, (provider, gate));
         Ok(chain_id)
     }
@@ -526,6 +582,31 @@ impl Chains {
         let (provider, gate) = self.gates.get(&chain_id)?;
         let token = Gate::new(*gate, provider).tokenOf(debridge_id).call().await.ok()?;
         Some(token != Address::ZERO)
+    }
+
+    /// `bridgeDecimalsOf(token)` on `chain_id`'s EVM gate. See [`GateScale`].
+    pub async fn gate_bridge_decimals(&self, chain_id: u64, token: Address) -> GateScale {
+        if let Some(&d) = self.scales.lock().unwrap_or_else(|e| e.into_inner()).get(&(chain_id, token)) {
+            return GateScale::Registered(d);
+        }
+        let Some((provider, gate)) = self.gates.get(&chain_id) else { return GateScale::Unknown };
+        match Gate::new(*gate, provider).bridgeDecimalsOf(token).call().await {
+            Ok(r) if r.set => {
+                self.scales.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token), r.bridgeDecimals);
+                GateScale::Registered(r.bridgeDecimals)
+            }
+            Ok(_) => GateScale::Unregistered,
+            Err(e) if gate_answered(&e) => GateScale::Unregistered,
+            Err(e) => {
+                tracing::debug!(chain_id, %token, error = %e, "bridgeDecimalsOf unreadable");
+                GateScale::Unknown
+            }
+        }
+    }
+
+    /// True the first time it is asked about `(chain_id, token)`.
+    pub fn first_scale_warning(&self, chain_id: u64, token: Address) -> bool {
+        self.scale_warned.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token))
     }
 
     /// `cancelled(submissionId)` on the destination gate.
@@ -829,5 +910,31 @@ mod tests {
         c.note_executed(1, "0x02", true);
         c.note_cancelled(1, "0x02", false);
         assert_eq!(c.cancelled(1, "0x02"), Some(false), "claimed, so never cancelled");
+    }
+
+    /// A malformed `--gate` must not put the operator's provider key into the
+    /// startup error — which goes to stderr, the container log and whatever
+    /// ships that log (audit 2026-09-16, LOW).
+    #[test]
+    fn gate_spec_errors_never_carry_the_rpc_key() {
+        let secret = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+        for spec in [
+            format!("x1338=https://eth-sepolia.g.alchemy.com/v2/{secret},0x0000000000000000000000000000000000000001"),
+            format!("1338=https://eth-sepolia.g.alchemy.com/v2/{secret},0xnotanaddress"),
+            format!("1338=https://eth-sepolia.g.alchemy.com/v2/{secret}"),
+            format!("https://eth-sepolia.g.alchemy.com/v2/{secret}"),
+            format!("1338=not a url {secret},0x0000000000000000000000000000000000000001"),
+        ] {
+            let err = Chains::new().add_spec(&spec).unwrap_err();
+            for shown in [err.to_string(), format!("{err:#}"), format!("{err:?}")] {
+                assert!(!shown.contains(secret), "key leaked for {spec:?}: {shown}");
+            }
+        }
+        // Still says what was wrong, and where.
+        let err = Chains::new()
+            .add_spec(&format!("1338=https://eth-sepolia.g.alchemy.com/v2/{secret},0xnotanaddress"))
+            .unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("bad address") && shown.contains("eth-sepolia.g.alchemy.com"), "{shown}");
     }
 }

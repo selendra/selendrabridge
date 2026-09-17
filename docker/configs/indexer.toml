@@ -1,9 +1,13 @@
 # Indexer — records bridge history and marks stranded transfers refund-eligible
 # (finding H4: this is the component compose was previously missing, so the
 # validators' refund candidate list never became populated). Writes to the same
-# Postgres the sig-store and graphql-api use. DATABASE_URL (compose env) wins over
-# the value here via `resolved_database_url()`.
-database_url = "postgres://bridge:bridge@postgres:5432/bridge"
+# Postgres the sig-store and graphql-api use.
+#
+# No `database_url` here on purpose: `resolved_database_url()` prefers a value in
+# this file over the DATABASE_URL env var, so a credential written here would
+# silently override the one compose builds from POSTGRES_PASSWORD (and a tracked
+# `bridge:bridge` would be both a published password and a broken login).
+# Compose supplies DATABASE_URL; set it in the environment when running by hand.
 
 # A transfer unclaimed for this long is eligible for the two-phase refund. Short
 # for local bring-up; use hours in production (must exceed real claim latency).

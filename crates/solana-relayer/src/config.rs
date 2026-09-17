@@ -166,10 +166,32 @@ pub struct SourceChain {
     /// Where the resumable cursor (last processed signature) is persisted.
     #[serde(default = "default_state_file")]
     pub state_file: String,
-    /// Cap on signatures fetched per tick.
+    /// Signatures fetched per `getSignaturesForAddress` page, `1..=1000`.
+    ///
+    /// Bounded because the pagination rule reads a page SHORTER than this as "the
+    /// walk reached the cursor". The RPC caps `limit` at 1000, so a larger value
+    /// came back short on every call and a backlog was read as complete — the
+    /// rest silently skipped; `0` asked for nothing and could never finish.
     #[serde(default = "default_batch")]
     pub max_batch: usize,
+    /// What to do when `state_file` does not exist.
+    ///
+    /// `false` (default): walk the program's history back to its first
+    /// transaction and sign everything in it. Right for a fresh deployment (the
+    /// history is short) and for a LOST cursor (a wiped volume), where starting
+    /// at the tip used to skip — silently and for good — every transfer sent
+    /// since the last save. Signing is idempotent, so a replay only costs reads;
+    /// a history deeper than the pagination limit fails loudly instead.
+    ///
+    /// `true`: start at the current tip and never sign anything older. An explicit
+    /// operator decision, for a long-lived program whose old transfers are known
+    /// to be settled. Has no effect once a cursor exists.
+    #[serde(default)]
+    pub start_at_tip: bool,
 }
+
+/// `getSignaturesForAddress` refuses a `limit` above this.
+pub const MAX_SIGNATURES_PAGE: usize = 1000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +321,14 @@ impl Config {
         }
         if !matches!(cfg.source.commitment.as_str(), "finalized" | "confirmed" | "processed") {
             anyhow::bail!("unknown commitment {:?}", cfg.source.commitment);
+        }
+        if cfg.source.max_batch == 0 || cfg.source.max_batch > MAX_SIGNATURES_PAGE {
+            anyhow::bail!(
+                "[source].max_batch = {} — must be 1..={MAX_SIGNATURES_PAGE}: the RPC truncates a \
+                 larger page, and a truncated page is read as the end of the backlog, skipping \
+                 the rest",
+                cfg.source.max_batch
+            );
         }
         // The observer's reports are authoritative (they retire a transfer from
         // every work queue), so its read depth gets the same fail-closed rule.
@@ -536,5 +566,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown"), "{err}");
+    }
+
+    /// `max_batch` was unvalidated. Above the RPC's 1000 cap every page came back
+    /// short and was read as "reached the cursor"; at 0 no page could end the walk.
+    #[test]
+    fn max_batch_outside_the_rpc_page_limit_is_refused() {
+        for bad in [0usize, MAX_SIGNATURES_PAGE + 1, 5000] {
+            let err = Config::from_toml(&cfg(&format!("max_batch = {bad}"))).unwrap_err().to_string();
+            assert!(err.contains("max_batch"), "{bad}: {err}");
+        }
+        for ok in [1usize, 100, MAX_SIGNATURES_PAGE] {
+            Config::from_toml(&cfg(&format!("max_batch = {ok}"))).expect("in range");
+        }
+    }
+
+    /// Starting at the tip is opt-in, never the silent default.
+    #[test]
+    fn a_missing_cursor_replays_history_unless_the_operator_opts_out() {
+        assert!(!Config::from_toml(&cfg("")).unwrap().source.start_at_tip);
+        assert!(Config::from_toml(&cfg("start_at_tip = true")).unwrap().source.start_at_tip);
     }
 }

@@ -79,7 +79,7 @@ for i in $(seq 1 40); do curl -s "http://$API_BIND/health" >/dev/null 2>&1 && br
 curl -s "http://$API_BIND/health" | grep -q ok || fail "graphql-api did not come up"
 
 echo "=== install web deps (if needed) ==="
-[[ -d "$WEB/node_modules/vite" ]] || ( cd "$WEB" && bun install >/dev/null 2>&1 ) || fail "bun install failed"
+[[ -d "$WEB/node_modules/vite" ]] || ( cd "$WEB" && bun install --frozen-lockfile >/dev/null 2>&1 ) || fail "bun install --frozen-lockfile failed (bun.lock out of date?)"
 
 echo "=== boot vite dev server (proxy -> $API_BIND) ==="
 # VITE_PROXY_TARGET is the name vite.config.ts actually reads. This used to

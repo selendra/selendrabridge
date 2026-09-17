@@ -830,7 +830,16 @@ info "graphql-api healthy"
 # 11. frontend (vite dev server)
 # ---------------------------------------------------------------------------
 say "starting frontend (vite on :$WEB_PORT)"
-[[ -d "$FRONTEND/node_modules" ]] || ( cd "$FRONTEND" && npm install --no-audit --no-fund )
+# From the lockfile, with the same command CI and docker/Dockerfile.frontend
+# use. The repo tracks only frontend/bun.lock — `npm install` ignores it and
+# resolves a fresh tree, so a launcher could run dependency versions nothing in
+# CI ever built or tested (audit round 5, LOW; the round-4 fix never reached
+# the launchers).
+if [[ ! -d "$FRONTEND/node_modules" ]]; then
+  export PATH="$PATH:$HOME/.bun/bin"
+  command -v bun >/dev/null 2>&1 || die "bun not found: the frontend installs from frontend/bun.lock (bun install --frozen-lockfile), as CI does — https://bun.sh"
+  ( cd "$FRONTEND" && bun install --frozen-lockfile ) || die "bun install --frozen-lockfile failed (frontend/bun.lock out of date with package.json?)"
+fi
 ( cd "$FRONTEND" && VITE_PROXY_TARGET="http://$BIND_HOST:$GQL_PORT" \
     spawn "npx vite --host $WEB_HOST --port $WEB_PORT --strictPort" web.log )
 for _ in $(seq 1 80); do curl -s "http://127.0.0.1:$WEB_PORT/" >/dev/null 2>&1 && break; sleep 0.3; done

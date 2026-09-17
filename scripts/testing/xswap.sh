@@ -93,25 +93,21 @@ STABLE_B=$STABLE; TT=$ALT; POOL_B=$POOL; GATE_B=$GATE; ROUTER_B=$ROUTER
 echo "  stableB=$STABLE_B TT=$TT poolB=$POOL_B gateB=$GATE_B routerB=$ROUTER_B"
 
 echo "=== wire corridor A<->B ==="
-# M-3: each gate must list the peer before `send` (and so swapAndBridge) works.
-cast send "$GATE_A" "setSupportedChain(uint256,bool)" $CHAIN_B true --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
-cast send "$GATE_B" "setSupportedChain(uint256,bool)" $CHAIN_A true --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
-cast send "$ROUTER_A" "setRemoteRouter(uint256,bytes)" $CHAIN_B "$ROUTER_B" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
-cast send "$ROUTER_B" "setRemoteRouter(uint256,bytes)" $CHAIN_A "$ROUTER_A" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
-
-# The stable bridges A->B as (native chain A, stableA) -> local stableB.
+# DeployXSwap.run() already set each stable's bridge decimals (write-once);
+# wire() maps the peer corridor (supported chain, remote router, local token)
+# and seals — the same order production uses. Doing it by hand here would
+# revert on the second setBridgeDecimals.
 PREFIX=$(printf '%064x' $CHAIN_A)
 DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${STABLE_A#0x}")
 echo "  debridgeId(stable A->B)=$DEBRIDGE_ID"
-# Bridge decimals must precede setLocalToken/send and seal (write-once, instant
-# only while unsealed). Identity: the DeployXSwap stable is 6-dec on both chains.
-# gate A sends stableA (via swapAndBridge); gate B maps + pays out stableB.
-cast send "$GATE_A" "setBridgeDecimals(address,uint8)" "$STABLE_A" 6 --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
-cast send "$GATE_B" "setBridgeDecimals(address,uint8)" "$STABLE_B" 6 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
-cast send "$GATE_B" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$STABLE_B" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
-# H-1: wiring done — seal both gates before funding, as production does.
-cast send "$GATE_A" "seal()" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
-cast send "$GATE_B" "seal()" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
+wire() { # rpc gate router stable peerChain peerStable peerRouter log
+  forge script script/DeployXSwap.s.sol:DeployXSwap \
+    --sig "wire(address,address,address,uint256,address,address)" "$2" "$3" "$4" "$5" "$6" "$7" \
+    --rpc-url "$1" --private-key $KEY0 --broadcast >"$LOGS/$8" 2>&1 \
+    || { echo "!! wire failed ($8)"; tail -30 "$LOGS/$8"; exit 1; }
+}
+wire "$SRC_RPC" "$GATE_A" "$ROUTER_A" "$STABLE_A" $CHAIN_B "$STABLE_B" "$ROUTER_B" wire-a.log
+wire "$DST_RPC" "$GATE_B" "$ROUTER_B" "$STABLE_B" $CHAIN_A "$STABLE_A" "$ROUTER_A" wire-b.log
 # pre-fund gate B with target-side stable liquidity for the claim
 cast send "$STABLE_B" "mint(address,uint256)" "$GATE_B" 10000000000000 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 

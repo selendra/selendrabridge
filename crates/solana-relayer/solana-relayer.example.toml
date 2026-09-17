@@ -19,6 +19,11 @@ commitment = "finalized"
 poll_interval_ms = 2000
 state_file = "/data/solana-relayer-state.json"
 max_batch = 100
+# max_batch must be 1..=1000 (the RPC's page cap; larger values are refused).
+# With no state_file yet the relayer replays the program's full history (signing
+# is idempotent; >10k signatures stops it with an error). Set this only when every
+# older transfer is known to be settled:
+# start_at_tip = false
 
 [signer]
 # The SAME secp256k1 key this validator uses on the EVM side: one validator set

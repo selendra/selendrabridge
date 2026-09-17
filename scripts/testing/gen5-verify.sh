@@ -22,9 +22,12 @@ export PATH="$HOME/.foundry/bin:$PATH"
 CFG="${1:-scripts/gen5.config.local}"
 # shellcheck disable=SC1090
 source "$CFG"
-RUN_DIR="${RUN_DIR:-/tmp/bridge-gen5}"
-# shellcheck disable=SC1091
-source "$RUN_DIR/addresses.env"
+# Run-dir files are PARSED, not sourced, and only from a dir this user owns
+# (audit round 5, LOW: the old fixed /tmp default could be pre-created by any
+# local user). See _rundir.sh.
+source "$ROOT/scripts/testing/_rundir.sh"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/gen5}"
+load_env_file "$RUN_DIR/addresses.env"
 
 GEN4_DOMAIN=0x619244a655e7383c05da63e9d66080952fcfe4fc48b40c61f566996006848055
 pass=0 fail=0

@@ -19,8 +19,10 @@ NODE_BIN="${NODE_BIN:-$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sor
 export PATH="${NODE_BIN:+$NODE_BIN:}$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
-LOG=/tmp/bridge-run
-mkdir -p "$LOG"
+# A private per-user dir, not the fixed /tmp/bridge-run (audit round 5, LOW): a
+# shared path can be pre-created or symlinked by another local user.
+source "$ROOT/scripts/testing/_rundir.sh"
+LOG="$(bridge_state_dir dev)"
 
 RPC=http://127.0.0.1:8545
 CHAIN=1337
@@ -64,7 +66,9 @@ disown || true
 
 # --- frontend: Vite dev server (proxies /graphql -> 127.0.0.1:8088) ---
 cd "$ROOT/frontend"
-[ -d node_modules ] || bun install
+# --frozen-lockfile, as CI does: a bare `bun install` may rewrite bun.lock and
+# run versions CI never tested (audit round 5, LOW).
+[ -d node_modules ] || bun install --frozen-lockfile
 setsid bash -c 'exec bunx vite --host 0.0.0.0 --port 5173 --strictPort' \
   >"$LOG/web.log" 2>&1 < /dev/null &
 disown || true

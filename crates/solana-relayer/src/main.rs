@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     // isolated the same way the EVM validator isolates its loops: a dead
     // submitter must never stop this node from signing.
     let submitter = match cfg.target.as_ref() {
-        Some(t) => Some(target::Submitter::new(&cfg.source, t, sig_store())?),
+        Some(t) => Some(target::Submitter::new(&cfg.source, t, sig_store()?)?),
         None => {
             info!("no [target] block — this relayer signs but never delivers claims");
             None
@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     // burnable and refundable only by hand: the EVM validators cannot read
     // Solana, so nobody else votes on these corridors.
     let attester =
-        refund::Attester::new(&cfg.source, cfg.refund.as_ref(), key, signer_address, sig_store())?;
+        refund::Attester::new(&cfg.source, cfg.refund.as_ref(), key, signer_address, sig_store()?)?;
 
     // The marker observer: the Solana gate's stand-in for the EVM indexer. It
     // reports observed claimed/cancelled/refunded markers to the store on the
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
             Some(observer::Observer::new(
                 &cfg.source,
                 &cfg.observer,
-                store::Store::new(&cfg.store.url, Some(token)),
+                store::Store::new(&cfg.store.url, Some(token))?,
             )?)
         }
         None => {
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
               "bridge-decimals cross-check active for these EVM destinations");
     }
 
-    let scanner = source::Scanner::new(cfg.source, key, sig_store(), evm_gates)?;
+    let scanner = source::Scanner::new(cfg.source, key, sig_store()?, evm_gates)?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");
 
     // Each loop is isolated: a dead submitter, attester or observer must never

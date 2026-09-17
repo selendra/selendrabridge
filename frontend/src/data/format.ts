@@ -3,6 +3,8 @@
 // derived deterministically for unknown ids). No fake token registry, no fake
 // USD prices — token metadata now comes live from the swap pool.
 
+import type { Chain } from "../api/types";
+
 /** deBridge's chain id for Solana — the value the gates hash into a submissionId. */
 export const SOLANA_CHAIN_ID = 7565164;
 
@@ -114,6 +116,17 @@ export function isSolanaAccount(v: string): boolean {
 }
 
 /**
+ * Whether a registry entry is a non-EVM chain — today, Solana — decided by the
+ * REGISTRY, not by a chain id baked into the bundle. The API routes on the
+ * gate's address form: an EVM gate is `0x…`, a Solana gate is its base58
+ * program id. A row with neither url nor gate (the older "listed, not polled"
+ * form) is Solana too.
+ */
+export function isNonEvmChain(c: Pick<Chain, "gate" | "rpcUrl">): boolean {
+  return c.gate ? !c.gate.startsWith("0x") : !c.rpcUrl;
+}
+
+/**
  * Validate a bridge receiver for the destination chain (finding L-4).
  *
  * The two VMs want different things, and getting it wrong is expensive:
@@ -126,13 +139,22 @@ export function isSolanaAccount(v: string): boolean {
  *    recoverable — the Solana gate finally has cancel/refund — but it still
  *    costs the user the round trip, and nothing upstream used to say so.
  *
+ * The destination's VM comes from its registry entry (`isNonEvmChain`). It used
+ * to be `chainId === SOLANA_CHAIN_ID`, so a Solana gate registered under any
+ * other id (a local validator, a devnet mesh) was validated as EVM: a base58
+ * token account was refused and a 20-byte address ACCEPTED — a receiver the
+ * Solana gate can never release to (audit round 5, LOW).
+ *
  * Returns `null` when valid, or a message explaining what is wrong.
  */
-export function receiverProblem(receiver: string, destinationChainId: number | null): string | null {
+export function receiverProblem(
+  receiver: string,
+  destination: Pick<Chain, "gate" | "rpcUrl"> | null
+): string | null {
   const v = receiver.trim();
   if (!v) return "Enter a receiver";
 
-  if (destinationChainId === SOLANA_CHAIN_ID) {
+  if (destination && isNonEvmChain(destination)) {
     if (isAddress(v)) {
       return "That is an EVM address. A Solana destination needs a base58 account key.";
     }

@@ -45,6 +45,64 @@ need jq "reading the JSON config"
 j()  { jq -r "$1" "$CONFIG"; }
 jr() { jq -r "$1 // empty" "$CONFIG"; }
 
+# --- values crossing into generated files (audit round 5, LOW) ---------------
+# Config values used to be pasted between literal quotes, so a `"` or a newline
+# in any of them — a private_key, an rpc url, a token symbol — closed the string
+# and wrote whatever followed as the next TOML key (or YAML/.env line).
+#
+# tstr: a TOML basic string. jq's JSON string encoding only uses escapes TOML
+# also defines (\" \\ \b \f \n \r \t \uXXXX) and escapes every control
+# character and DEL, so any value round-trips exactly and cannot end the line.
+tstr() { jq -n --arg v "$1" '$v'; }
+
+# Everything interpolated WITHOUT quoting — numbers, booleans, names that become
+# file names / compose service names / jq filters, the compose image and
+# Postgres identifiers, and urls written to an unquoted .env — is checked here,
+# once, by type. A die inside `$(…)` cannot stop the script, so this is done up
+# front instead of at each emit site.
+config_problems() {
+  jq -r '
+    def ints: ["chain_id","start_block","block_confirmation","poll_interval_ms",
+               "catchup_poll_interval_ms","max_block_range","timeout_secs","max_batch",
+               "refund_timeout_secs","sweep_interval_secs","poll_interval_secs",
+               "refresh_margin_secs","threshold","port"];
+    def bools: ["enabled","allow_zero_confirmation","allow_unfinalized","deliver",
+                "allow_mutations","build","install","include_in_registry",
+                "generate_if_unset","allow_unauthenticated"];
+    def where($p): $p | map(tostring) | join(".");
+    def name_ok: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$");
+    def url_ok: type == "string" and test("^[A-Za-z][A-Za-z0-9+.-]*://[^\\s\"\u0027`$\\\\<>]+$");
+    . as $root
+    # every path, not just scalar leaves: an object where a number belongs must fail too
+    | ( [paths][] | select((.[-1] | type) == "string") | . as $p | ($root | getpath($p)) as $v
+        | if (ints | index($p[-1])) and $v != null
+             and (($v | type) != "number" or $v != ($v | floor) or $v < 0)
+          then "\(where($p)) must be a non-negative integer"
+          elif (bools | index($p[-1])) and $v != null and ($v | type) != "boolean"
+          then "\(where($p)) must be true or false"
+          else empty end ),
+      ( if (.name | name_ok) then empty else "name must match [A-Za-z0-9][A-Za-z0-9_.-]*" end ),
+      ( [.validators[]?, .keepers[]?, .solana.relayers[]?] | .[] | select((.name | name_ok) | not)
+        | "validator/keeper/relayer name \(.name | tojson) must match [A-Za-z0-9][A-Za-z0-9_.-]*" ),
+      ( .chains[]? | select((.rpcs | type) != "array" or (.rpcs | length) == 0 or any(.rpcs[]; url_ok | not))
+        | "chains[chain_id=\(.chain_id | tojson)].rpcs must be a non-empty array of urls (no spaces, quotes or $)" ),
+      ( .chains[]? | select(.public_rpc != null and (.public_rpc | url_ok | not))
+        | "chains[chain_id=\(.chain_id | tojson)].public_rpc is not a plain url" ),
+      ( .solana | select(. != null and .enabled == true)
+        | (.rpc, .public_rpc) | select(. != null and (url_ok | not)) | "solana rpc \(tojson) is not a plain url" ),
+      ( .database.docker // {} | (.user, .db) | select(. != null and (type != "string" or (test("^[A-Za-z_][A-Za-z0-9_]{0,62}$") | not)))
+        | "database.docker.user/db \(tojson) must be a plain identifier" ),
+      ( .database.docker.image | select(. != null and (type != "string" or (test("^[A-Za-z0-9][A-Za-z0-9./:@_-]*$") | not)))
+        | "database.docker.image \(tojson) is not an image reference" ),
+      # Goes into a URL, a SQL statement and an env file: URL-unreserved only.
+      ( .database.docker.password | select(. != null and (type != "string" or (test("^[A-Za-z0-9._~-]+$") | not)))
+        | "database.docker.password may only use [A-Za-z0-9._~-] (or set it to null for a generated one)" ),
+      ( .sig_store.tokens // {} | to_entries[] | select(.key != "generate_if_unset" and .value != null
+          and ((.value | type) != "string" or (.value | test("^[A-Za-z0-9._~+/=-]+$") | not)))
+        | "sig_store.tokens.\(.key) may only use [A-Za-z0-9._~+/=-]" )
+  ' "$CONFIG"
+}
+
 NAME="$(j '.name')"
 # Not /tmp (M-11): the generated TOMLs carry private keys and the validator
 # cursors live here; systemd-tmpfiles sweeps /tmp daily. Same root as run.sh.
@@ -63,17 +121,28 @@ PG_NAME="$(jr '.database.docker.container')"; PG_NAME="${PG_NAME:-bridge-json-pg
 if [[ "$MODE" == "stop" ]]; then
   say "stopping $NAME"
   if [[ -f "$PIDS" ]]; then
+    # A recorded pid is only signalled while /proc still shows it running the
+    # command it was recorded for (the same check as stop.sh's `ours`). The pid
+    # file outlives reboots and crashes, and the kernel reuses pids: an unchecked
+    # `kill -9` here once meant killing whatever unrelated process of this user
+    # had since been handed that number (audit round 5, LOW). Every pattern is
+    # specific to this stack — a generated config path, a bind address.
+    ours() { # $1 pid, $2 pattern
+      [[ "$1" =~ ^[0-9]+$ && -n "$2" && -r "/proc/$1/cmdline" ]] || return 1
+      tr '\0' ' ' <"/proc/$1/cmdline" | grep -qF -- "$2"
+    }
     # pid first, then a match pattern: `setsid` may fork, in which case the
     # recorded pid is the wrapper and the service itself outlives the kill.
     while IFS=$'\t' read -r pid name pattern; do
       [[ -n "${pid:-}" ]] || continue
-      kill "$pid" 2>/dev/null || true
+      if ours "$pid" "${pattern:-}"; then kill "$pid" 2>/dev/null || true
+      elif kill -0 "$pid" 2>/dev/null; then warn "$name: pid $pid is alive but is not '$pattern' (pid reused?) — left alone"; fi
       [[ -n "${pattern:-}" ]] && pkill -f -- "$pattern" 2>/dev/null || true
-      info "stopped $name"
+      info "stopped $name (if it was running)"
     done < "$PIDS"
     sleep 1
     while IFS=$'\t' read -r pid _ pattern; do
-      kill -9 "$pid" 2>/dev/null || true
+      ours "$pid" "${pattern:-}" && kill -9 "$pid" 2>/dev/null || true
       [[ -n "${pattern:-}" ]] && pkill -9 -f -- "$pattern" 2>/dev/null || true
     done < "$PIDS"
     rm -f "$PIDS"
@@ -106,6 +175,8 @@ fi
 rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 say "validating $CONFIG"
+problems="$(config_problems)" || die "could not read $CONFIG as JSON"
+[[ -z "$problems" ]] || die "invalid config values:"$'\n'"$(sed 's/^/  - /' <<<"$problems")"
 # per-chain field with fallback to .defaults
 cf() { # $1 chain_id, $2 field
   local v; v="$(jq -r ".chains[] | select(.chain_id == $1) | .$2 // empty" "$CONFIG")"
@@ -132,7 +203,7 @@ emit_signer() { # $1 jq path
   for k in private_key private_key_env keystore keystore_password keystore_password_env keystore_password_file; do
     local v; v="$(jq -r "$1.$k // empty" "$CONFIG")"
     [[ -n "$v" ]] || continue
-    echo "$k = \"$v\""; any=true
+    echo "$k = $(tstr "$v")"; any=true
   done
   $any || die "signer at $1 has no key source (private_key / private_key_env / keystore)"
 }
@@ -292,7 +363,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "[[sources]]"
       echo "chain_id = $cid"
       echo "rpcs = $rpcs"
-      echo "gate = \"$(cf "$cid" gate)\""
+      echo "gate = $(tstr "$(cf "$cid" gate)")"
       echo "start_block = $(cf "$cid" start_block)"
       echo "block_confirmation = $(cf "$cid" block_confirmation)"
       echo "allow_zero_confirmation = $(cbool "$cid" allow_zero_confirmation)"
@@ -300,21 +371,26 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       cu="$(cf "$cid" catchup_poll_interval_ms)"
       [[ -n "$cu" ]] && echo "catchup_poll_interval_ms = $cu"
       echo "max_block_range = $(cf "$cid" max_block_range)"
-      echo "state_file = \"$STATE_DIR/validator-$vname-$cid.json\""
+      echo "state_file = $(tstr "$STATE_DIR/validator-$vname-$cid.json")"
       echo
     done
     echo "[signer]"
     emit_signer "($vjson).signer"
     echo
     echo "[store]"
-    echo "url = \"$STORE_URL\""
+    echo "url = $(tstr "$STORE_URL")"
     if [[ "$(jq -r "($vjson).api.enabled // false" "$CONFIG")" == "true" ]]; then
       echo
       echo "[api]"
-      echo "bind = \"$(jq -r "($vjson).api.bind" "$CONFIG")\""
+      echo "bind = $(tstr "$(jq -r "($vjson).api.bind" "$CONFIG")")"
       tok="$(jq -r "($vjson).api.token // empty" "$CONFIG")"
+      tok_env="$(jq -r "($vjson).api.token_env // empty" "$CONFIG")"
       if [[ -n "$tok" ]]; then
-        echo "token = \"$tok\""
+        echo "token = $(tstr "$tok")"
+      elif [[ -n "$tok_env" ]]; then
+        # The variable NAME; the validator resolves it at startup, so the token
+        # itself never lands in this file.
+        echo "token_env = $(tstr "$tok_env")"
       elif [[ "$(jq -r "($vjson).api.allow_unauthenticated // false" "$CONFIG")" == "true" ]]; then
         # Opt-in only. Without a token (and without this) the validator serves
         # read-only /status and leaves pause/resume/rescan unmounted, because an
@@ -330,7 +406,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "[[destinations]]"
       echo "chain_id = $cid"
       echo "rpcs = $(jq -c ".chains[] | select(.chain_id == $cid) | .rpcs" "$CONFIG")"
-      echo "gate = \"$(cf "$cid" gate)\""
+      echo "gate = $(tstr "$(cf "$cid" gate)")"
     done
     # An EVM reader can never vouch for a Solana payout, and the check fails
     # closed — so without this block the validator refuses EVM->Solana outright
@@ -340,8 +416,8 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo
       echo "[[solana_destinations]]"
       echo "chain_id = $SOL_CHAIN_ID"
-      echo "program_id = \"$SOL_PROGRAM\""
-      echo "rpc = \"$(j '.solana.rpc')\""
+      echo "program_id = $(tstr "$SOL_PROGRAM")"
+      echo "rpc = $(tstr "$(j '.solana.rpc')")"
     fi
     if [[ "$REFUND_ON" == "true" ]]; then
       # No [refund] block => this validator never votes on cancels/refunds, and
@@ -358,7 +434,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
         echo "[[refund.destinations]]"
         echo "chain_id = $cid"
         echo "rpcs = $(jq -c ".chains[] | select(.chain_id == $cid) | .rpcs" "$CONFIG")"
-        echo "gate = \"$(cf "$cid" gate)\""
+        echo "gate = $(tstr "$(cf "$cid" gate)")"
       done
     fi
   } > "$cfg"
@@ -376,8 +452,8 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
     for cid in $(select_chains "$(printf '(%s).targets' "$kjson")" destination); do
       echo "[[targets]]"
       echo "chain_id = $cid"
-      echo "rpc = \"$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")\""
-      echo "gate = \"$(cf "$cid" gate)\""
+      echo "rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"
+      echo "gate = $(tstr "$(cf "$cid" gate)")"
       echo "poll_interval_ms = $poll"
       echo
     done
@@ -385,7 +461,7 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
     emit_signer "($kjson).signer"
     echo
     echo "[store]"
-    echo "url = \"$STORE_URL\""
+    echo "url = $(tstr "$STORE_URL")"
     if [[ "$REFUND_ON" == "true" ]]; then
       # Refunds pay out where the funds were LOCKED, i.e. on the source chain —
       # hence their own blocks, separate from the claim targets.
@@ -393,8 +469,8 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
         echo
         echo "[[sources]]"
         echo "chain_id = $cid"
-        echo "rpc = \"$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")\""
-        echo "gate = \"$(cf "$cid" gate)\""
+        echo "rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"
+        echo "gate = $(tstr "$(cf "$cid" gate)")"
         echo "poll_interval_ms = $poll"
       done
     fi
@@ -413,15 +489,15 @@ if [[ "$SOLANA_ON" == "true" ]]; then
     {
       echo "[source]"
       echo "chain_id = $SOL_CHAIN_ID"
-      echo "rpc = \"$(j '.solana.rpc')\""
-      echo "program_id = \"$SOL_PROGRAM\""
-      echo "commitment = \"$SOL_COMMITMENT\""
+      echo "rpc = $(tstr "$(j '.solana.rpc')")"
+      echo "program_id = $(tstr "$SOL_PROGRAM")"
+      echo "commitment = $(tstr "$SOL_COMMITMENT")"
       echo "allow_unfinalized = $(j '.solana.allow_unfinalized')"
       echo "poll_interval_ms = $(j '.solana.poll_interval_ms')"
       echo "max_batch = $(j '.solana.max_batch')"
       # Its own cursor file: two relayers sharing one would resume from each
       # other's position and skip signatures neither has signed.
-      echo "state_file = \"$STATE_DIR/solana-relayer-$rname-state.json\""
+      echo "state_file = $(tstr "$STATE_DIR/solana-relayer-$rname-state.json")"
       echo
       echo "[signer]"
       # secp256k1, and the SAME key this validator uses on the EVM side: one
@@ -429,13 +505,13 @@ if [[ "$SOLANA_ON" == "true" ]]; then
       # relayer only reads `private_key` / `private_key_env`.
       kenv="$(jq -r "($rjson).signer.private_key_env // empty" "$CONFIG")"
       key="$(jq -r "($rjson).signer.private_key // empty" "$CONFIG")"
-      if [[ -n "$kenv" ]]; then echo "private_key_env = \"$kenv\""
-      elif [[ -n "$key" ]]; then echo "private_key = \"$key\""
+      if [[ -n "$kenv" ]]; then echo "private_key_env = $(tstr "$kenv")"
+      elif [[ -n "$key" ]]; then echo "private_key = $(tstr "$key")"
       else die "solana relayer $rname has no signing key"; fi
       echo
       deliver="$(jq -r "($rjson).deliver // false" "$CONFIG")"
       echo "[store]"
-      echo "url = \"$STORE_URL\""
+      echo "url = $(tstr "$STORE_URL")"
       echo "token_env = \"SIG_STORE_VALIDATOR_TOKEN\""
       if [[ "$deliver" == "true" ]]; then
         # The marker observer: the Solana gate's stand-in for the EVM indexer.
@@ -457,7 +533,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         echo
         echo "[[evm_destinations]]"
         echo "chain_id = $cid"
-        echo "gate = \"$(cf "$cid" gate)\""
+        echo "gate = $(tstr "$(cf "$cid" gate)")"
         echo "rpc_env = \"RPC_$cid\""
         echo "block_confirmation = $(rbc_for_scale)"
       done
@@ -482,7 +558,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
           echo
           echo "[[refund.evm]]"
           echo "chain_id = $cid"
-          echo "gate = \"$(cf "$cid" gate)\""
+          echo "gate = $(tstr "$(cf "$cid" gate)")"
           echo "rpc_env = \"RPC_$cid\""
           echo "block_confirmation = $rbc"
         done
@@ -495,7 +571,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         elif [[ "$kp" != /* ]]; then kp="$ROOT/$kp"; fi
         echo
         echo "[target]"
-        echo "payer_keypair = \"$kp\""
+        echo "payer_keypair = $(tstr "$kp")"
         echo "poll_interval_ms = $(jq -r "($rjson).poll_interval_ms // 2000" "$CONFIG")"
       fi
     } > "$cfg"
@@ -510,17 +586,17 @@ if [[ "$(j '.indexer.enabled')" == "true" ]]; then
   {
     # `database_url` in the file beats the DATABASE_URL env var, so under compose
     # it is omitted deliberately: the credential belongs in the environment.
-    [[ "$MODE" == "compose" ]] || echo "database_url = \"$DATABASE_URL\""
+    [[ "$MODE" == "compose" ]] || echo "database_url = $(tstr "$DATABASE_URL")"
     echo "refund_timeout_secs = $(j '.indexer.refund_timeout_secs')"
     echo "sweep_interval_secs = $(j '.indexer.sweep_interval_secs')"
     for cid in $(select_chains '.indexer.chains' source); do
       echo
       echo "[[chains]]"
       echo "chain_id = $cid"
-      echo "rpc = \"$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")\""
-      echo "gate = \"$(cf "$cid" gate)\""
-      pool="$(jr ".chains[] | select(.chain_id == $cid) | .pool")"; [[ -n "$pool" ]] && echo "pool = \"$pool\""
-      router="$(jr ".chains[] | select(.chain_id == $cid) | .router")"; [[ -n "$router" ]] && echo "router = \"$router\""
+      echo "rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"
+      echo "gate = $(tstr "$(cf "$cid" gate)")"
+      pool="$(jr ".chains[] | select(.chain_id == $cid) | .pool")"; [[ -n "$pool" ]] && echo "pool = $(tstr "$pool")"
+      router="$(jr ".chains[] | select(.chain_id == $cid) | .router")"; [[ -n "$router" ]] && echo "router = $(tstr "$router")"
       echo "start_block = $(cf "$cid" start_block)"
       echo "block_confirmation = $(cf "$cid" block_confirmation)"
       echo "allow_zero_confirmation = $(cbool "$cid" allow_zero_confirmation)"
@@ -560,13 +636,13 @@ if [[ "$(j '.price_keeper.enabled // false')" == "true" ]]; then
       [[ -n "$sym" ]] || continue
       price="$(pk_target "$cid" "$sym")"
       [[ -n "$price" ]] || continue
-      toks+=$'\n'"[[pools.tokens]]"$'\n'"symbol = \"$sym\""$'\n'"address = \"$addr\""$'\n'"price = \"$price\""$'\n'
+      toks+=$'\n'"[[pools.tokens]]"$'\n'"symbol = $(tstr "$sym")"$'\n'"address = $(tstr "$addr")"$'\n'"price = $(tstr "$price")"$'\n'
     done < <(jq -r ".chains[] | select(.chain_id == $cid) | .tokens[]? | [.symbol, .address] | @tsv" "$CONFIG")
     if [[ -z "$toks" ]]; then
       warn "price keeper: chain $cid has pool $pool but no token with a target price — it will go stale"
       continue
     fi
-    pools_toml+=$'\n'"[[pools]]"$'\n'"chain_id = $cid"$'\n'"rpc = \"$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")\""$'\n'"pool = \"$pool\""$'\n'"$toks"
+    pools_toml+=$'\n'"[[pools]]"$'\n'"chain_id = $cid"$'\n'"rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"$'\n'"pool = $(tstr "$pool")"$'\n'"$toks"
   done
   if [[ -n "$pools_toml" ]]; then
     [[ "$(j '.price_keeper.signer != null')" == "true" ]] || die "price_keeper.signer is required: the key must be each EVM pool's oracle"
@@ -596,14 +672,14 @@ if [[ "$(j '.price_keeper.enabled // false')" == "true" ]]; then
         [[ -n "$sym" ]] || continue
         price="$(pk_target "$SOL_CHAIN_ID" "$sym" "$fallback")"
         [[ -n "$price" ]] || continue
-        toks+=$'\n'"[[tokens]]"$'\n'"symbol = \"$sym\""$'\n'"mint = \"$mint\""$'\n'"price = \"$price\""$'\n'
+        toks+=$'\n'"[[tokens]]"$'\n'"symbol = $(tstr "$sym")"$'\n'"mint = $(tstr "$mint")"$'\n'"price = $(tstr "$price")"$'\n'
       done < <(j '.solana.swap.tokens[]? | [.symbol, .mint, (.price // "")] | @tsv')
       if [[ -n "$toks" ]]; then
         SPK_CFG="$CFG_DIR/solana-price-keeper.toml"
         {
-          echo "rpc = \"$(j '.solana.rpc')\""
-          echo "program = \"$SOL_SWAP_PROGRAM\""
-          echo "oracle_keypair = \"$kp\""
+          echo "rpc = $(tstr "$(j '.solana.rpc')")"
+          echo "program = $(tstr "$SOL_SWAP_PROGRAM")"
+          echo "oracle_keypair = $(tstr "$kp")"
           echo "poll_interval_secs = $PK_POLL"
           echo "refresh_margin_secs = $PK_MARGIN"
           printf '%s' "$toks"
@@ -1073,7 +1149,14 @@ if [[ "$(j '.frontend.enabled // false')" == "true" ]]; then
   need node "the frontend"; need npm "the frontend"
   if [[ ! -d "$FE_DIR/node_modules" ]]; then
     [[ "$(j '.frontend.install')" == "true" ]] || die "no $FE_DIR/node_modules and frontend.install = false"
-    ( cd "$FE_DIR" && npm install --no-audit --no-fund ) || die "npm install failed"
+    # From the lockfile, with the same command CI and docker/Dockerfile.frontend
+    # use. The repo tracks only frontend/bun.lock — `npm install` ignores it and
+    # resolves a fresh tree, so a launcher could run dependency versions nothing in
+    # CI ever built or tested (audit round 5, LOW; the round-4 fix never reached
+    # the launchers).
+    export PATH="$PATH:$HOME/.bun/bin"
+    need bun "installing the frontend from frontend/bun.lock (bun install --frozen-lockfile, as CI does)"
+    ( cd "$FE_DIR" && bun install --frozen-lockfile ) || die "bun install --frozen-lockfile failed (bun.lock out of date with package.json?)"
   fi
   # The UI talks to the API through vite's proxy, so it needs no CORS and no
   # public API port — the same wiring scripts/run.sh uses.
@@ -1085,14 +1168,24 @@ if [[ "$(j '.frontend.enabled // false')" == "true" ]]; then
 fi
 
 say "$NAME is up"
+# Never echo a keyed url — terminal scrollback and CI logs are logs too, and the
+# header of this file promises rpcs[0] is never served. Same rule as run.sh:
+# a loopback endpoint as-is, else the configured public one, else a placeholder.
+shown_rpc() { # $1 private url, $2 public url (may be empty)
+  if is_local_rpc "$1"; then printf '%s' "$1"
+  elif [[ -n "$2" ]]; then printf '%s' "$2"
+  else printf '<private rpc, see %s>' "$(basename "$CONFIG")"; fi
+}
 for cid in "${CHAIN_IDS[@]}"; do
   printf '  %-14s %s  gate %s\n' "$(jq -r ".chains[] | select(.chain_id == $cid) | .name" "$CONFIG")" \
-    "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")" "$(cf "$cid" gate)"
+    "$(shown_rpc "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")" \
+                 "$(jr ".chains[] | select(.chain_id == $cid) | .public_rpc")")" "$(cf "$cid" gate)"
 done
 printf '  %-14s %s\n' "validators" "${VAL_NAMES[*]} (threshold $THRESHOLD)"
 printf '  %-14s %s\n' "keepers"    "${KEEP_NAMES[*]:-none}"
 [[ "$SOLANA_ON" == "true" ]] && printf '  %-14s %s  program %s (%s relayers, commitment %s)\n' \
-  "$(j '.solana.name')" "$(j '.solana.rpc')" "$SOL_PROGRAM" "${#SOL_FILES[@]}" "$SOL_COMMITMENT"
+  "$(j '.solana.name')" "$(shown_rpc "$(j '.solana.rpc')" "$(jr '.solana.public_rpc')")" \
+  "$SOL_PROGRAM" "${#SOL_FILES[@]}" "$SOL_COMMITMENT"
 printf '  %-14s %s\n' "sig-store"  "$STORE_URL"
 [[ "$(j '.graphql.enabled')" == "true" ]] && printf '  %-14s http://%s  (GraphiQL at /)\n' "graphql" "$(j '.graphql.bind')"
 [[ "$(j '.frontend.enabled // false')" == "true" ]] && printf '  %-14s http://%s:%s\n' "frontend" "$(j '.frontend.host')" "$(j '.frontend.port')"

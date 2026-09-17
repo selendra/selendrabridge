@@ -213,8 +213,109 @@ pub fn recovered_address(digest: &[u8; 32], sig65: &[u8]) -> Option<[u8; 20]> {
     Some(address_of(&public))
 }
 
+/// Size of the pre-decimals `["asset", id]` body: `debridge_id + mint + vault`.
+/// Mirrors `solana_gate::LEGACY_ASSET_CONFIG_LEN`; the program still accepts
+/// such a record (at 96 or 97 bytes) and so must every client that reads one.
+const LEGACY_ASSET_LEN: usize = 32 * 3;
+
+/// The vault an `["asset", debridge_id]` record binds, decoded through the shared
+/// Borsh mirror (`bridge_solana::account::AssetAccount`) rather than sliced at
+/// hardcoded byte offsets — the pattern that silently broke the config reads when
+/// `bridge_domain` was inserted.
+///
+/// Also refuses what the old `data[64..96]` slice accepted: an account the
+/// program does not own, and a record for a different `debridge_id`. The program
+/// re-checks the binding on-chain; this stops the submitter from paying fees to
+/// learn it.
+pub fn asset_vault(
+    owner_is_program: bool,
+    data: &[u8],
+    debridge_id: &[u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(owner_is_program, "asset account is not owned by the gate program");
+    let (recorded_id, vault) = if data.len() == LEGACY_ASSET_LEN || data.len() == LEGACY_ASSET_LEN + 1 {
+        #[derive(borsh::BorshDeserialize)]
+        struct Legacy {
+            debridge_id: [u8; 32],
+            _mint: [u8; 32],
+            vault: [u8; 32],
+        }
+        let l: Legacy = bridge_solana::account::decode(&data[..LEGACY_ASSET_LEN])
+            .ok_or_else(|| anyhow::anyhow!("legacy asset account does not decode"))?;
+        (l.debridge_id, l.vault)
+    } else {
+        let a: bridge_solana::account::AssetAccount = bridge_solana::account::decode(data)
+            .ok_or_else(|| anyhow::anyhow!("asset account does not decode ({} bytes)", data.len()))?;
+        (a.debridge_id, a.vault)
+    };
+    anyhow::ensure!(
+        &recorded_id == debridge_id,
+        "asset account records debridge_id 0x{}, not the requested 0x{}",
+        hex::encode(recorded_id),
+        hex::encode(debridge_id)
+    );
+    Ok(vault)
+}
+
+/// `10^(local - bridge)` for an `["asset", id]` record: the mint units per wire
+/// unit. `1` for a legacy record, exactly as the program reads one; `None` when
+/// the record does not decode or its decimals are invalid.
+pub fn asset_bridge_unit(data: &[u8]) -> Option<u64> {
+    if data.len() == LEGACY_ASSET_LEN || data.len() == LEGACY_ASSET_LEN + 1 {
+        return Some(1);
+    }
+    bridge_solana::account::decode::<bridge_solana::account::AssetAccount>(data)?.bridge_unit()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{asset_bridge_unit, asset_vault};
+
+    #[test]
+    fn asset_bridge_unit_matches_the_program() {
+        let mut data = asset_bytes([1; 32], [2; 32], [3; 32], &[6, 9]);
+        data.resize(130, 0);
+        assert_eq!(asset_bridge_unit(&data), Some(1_000));
+        assert_eq!(asset_bridge_unit(&data[..96]), Some(1), "legacy bridged 1:1");
+        assert_eq!(asset_bridge_unit(&asset_bytes([1; 32], [2; 32], [3; 32], &[9, 6])), None);
+    }
+
+    fn asset_bytes(id: [u8; 32], mint: [u8; 32], vault: [u8; 32], tail: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&id);
+        v.extend_from_slice(&mint);
+        v.extend_from_slice(&vault);
+        v.extend_from_slice(tail);
+        v
+    }
+
+    /// The current layout, with the program's slack, decodes to its vault.
+    #[test]
+    fn asset_vault_reads_the_current_layout() {
+        let mut data = asset_bytes([1; 32], [2; 32], [3; 32], &[6, 9]);
+        data.resize(98 + 32, 0);
+        assert_eq!(asset_vault(true, &data, &[1; 32]).unwrap(), [3; 32]);
+    }
+
+    /// Records written before the decimals fields (96 or 97 bytes) are still live
+    /// on-chain and the program still honours them.
+    #[test]
+    fn asset_vault_reads_legacy_records() {
+        for tail in [&[][..], &[0u8][..]] {
+            let data = asset_bytes([1; 32], [2; 32], [3; 32], tail);
+            assert_eq!(asset_vault(true, &data, &[1; 32]).unwrap(), [3; 32]);
+        }
+    }
+
+    /// The hardcoded `data[64..96]` slice accepted the first two of these.
+    #[test]
+    fn asset_vault_refuses_what_the_offset_slice_accepted() {
+        let data = asset_bytes([1; 32], [2; 32], [3; 32], &[6, 6]);
+        assert!(asset_vault(false, &data, &[1; 32]).is_err(), "foreign owner");
+        assert!(asset_vault(true, &data, &[9; 32]).is_err(), "another asset's record");
+        assert!(asset_vault(true, &data[..97 - 20], &[1; 32]).is_err(), "truncated");
+    }
+
     use super::*;
 
     /// Pinned against `BridgeHash.getCancelId`/`getRefundId` ground truth — the

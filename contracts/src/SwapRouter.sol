@@ -63,7 +63,9 @@ contract SwapRouter is ReentrancyGuard {
     ///         case; a real relayer forwards far more. Since the M-7 fix the catch
     ///         branch also only DEFERS for an unauthorised caller (see
     ///         {FALLBACK_GRACE}), so a starved call could at worst start the grace
-    ///         clock — this floor keeps it from doing even that.
+    ///         clock — this floor keeps it from doing even that. It is checked
+    ///         before the blockage test as well as before the swap, so it covers
+    ///         every path that can defer (audit 2026-09-16 LOW).
     uint256 public constant MIN_DELIVER_GAS = 250_000;
 
     // --- governance (mirrors Gate.sol two-step ownership) ---
@@ -572,6 +574,14 @@ contract SwapRouter is ReentrancyGuard {
             return true;
         }
 
+        // Refuse to even LOOK at the swap without enough gas to complete it. Both
+        // ways out of here can start the grace clock — `_swapBlocked` (whose
+        // `quote` try/catch reads any revert, out-of-gas included, as "blocked")
+        // and the swap's own catch — so the floor must precede both, or a starved
+        // call defers a transfer the floor exists to protect. Not at function
+        // entry: the degenerate stable intent above starts no clock.
+        if (gasleft() < MIN_DELIVER_GAS) revert InsufficientGas(gasleft(), MIN_DELIVER_GAS);
+
         // Is the swap blocked *at this instant*? Every condition tested there can
         // clear on its own, so a blockage is a reason to come back, not a reason to
         // hand the user a different asset than the one they signed for.
@@ -579,10 +589,9 @@ contract SwapRouter is ReentrancyGuard {
             return _deferOrFallBack(submissionId, amount, finalToken, finalReceiver, mayFallBack);
         }
 
-        // Refuse to *attempt* the swap without enough gas to complete it, so the
-        // catch below can only ever mean "this swap is impossible", never "the
-        // caller starved it". Checked here rather than at function entry so it
-        // covers exactly the call it protects.
+        // And again for the swap itself, so the catch below can only ever mean
+        // "this swap is impossible", never "the caller starved it" — the blockage
+        // check above spent some of what the first test saw.
         if (gasleft() < MIN_DELIVER_GAS) revert InsufficientGas(gasleft(), MIN_DELIVER_GAS);
 
         IERC20(stable).forceApprove(address(pool), amount);

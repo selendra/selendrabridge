@@ -65,19 +65,48 @@ pub struct Store {
     client: reqwest::Client,
 }
 
+/// Connect budget for one sig-store request. Mirrors `bridge_core::remote`,
+/// which this crate cannot import (see the dependency note in Cargo.toml).
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Total budget for one request, until the body is fully read.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Largest response body buffered before decoding. Mirrors
+/// `bridge_core::remote::MAX_RESPONSE_BYTES`.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 impl Store {
-    pub fn new(base: &str, token: Option<String>) -> Self {
+    /// The store is UNTRUSTED (round-4 M-9, ported here in the 2026-09-16 audit's
+    /// LOW list): without a timeout, a store that accepts the connection and never
+    /// answers blocks all four relayer loops forever, and without a body cap one
+    /// oversized answer OOMs every relayer at once.
+    ///
+    /// Fails rather than falling back to a default client: `unwrap_or_default()`
+    /// used to drop the bearer header (and the timeouts) silently, so a build
+    /// failure turned into a fleet of unauthenticated, unbounded clients.
+    pub fn new(base: &str, token: Option<String>) -> anyhow::Result<Self> {
+        Self::with_timeout(base, token, REQUEST_TIMEOUT)
+    }
+
+    #[doc(hidden)]
+    pub fn with_timeout(
+        base: &str,
+        token: Option<String>,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(token) = token.as_deref().filter(|t| !t.is_empty()) {
-            if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
-                v.set_sensitive(true);
-                headers.insert(reqwest::header::AUTHORIZATION, v);
-            }
+            let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("sig-store token is not a valid header value"))?;
+            v.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, v);
         }
-        Store {
-            base: base.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder().default_headers(headers).build().unwrap_or_default(),
-        }
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+            .timeout(timeout)
+            .build()
+            .map_err(|e| anyhow::anyhow!("building the sig-store HTTP client: {e}"))?;
+        Ok(Store { base: base.trim_end_matches('/').to_string(), client })
     }
 
     /// POST a record plus this validator's signature. The server enforces the
@@ -88,7 +117,7 @@ impl Store {
             self.client.post(format!("{}/submissions", self.base)).json(record).send().await?;
         if !res.status().is_success() {
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
+            let body = error_text(res).await;
             anyhow::bail!("sig-store rejected the submission ({status}): {body}");
         }
         Ok(())
@@ -115,7 +144,7 @@ impl Store {
         if !res.status().is_success() {
             anyhow::bail!("sig-store refund-candidates failed ({})", res.status());
         }
-        Ok(res.json().await?)
+        json_capped(res).await
     }
 
     /// Deposit one cancel/refund attestation. The server re-derives the digest
@@ -138,20 +167,10 @@ impl Store {
             .await?;
         if !res.status().is_success() {
             let status = res.status();
-            let text = res.text().await.unwrap_or_default();
+            let text = error_text(res).await;
             anyhow::bail!("sig-store rejected the {kind} attestation ({status}): {text}");
         }
         Ok(())
-    }
-
-    /// Every record the store holds. The keeper half filters these down to the
-    /// ones bound for Solana.
-    pub async fn list(&self) -> anyhow::Result<Vec<SubmissionRecord>> {
-        let res = self.client.get(format!("{}/submissions", self.base)).send().await?;
-        if !res.status().is_success() {
-            anyhow::bail!("sig-store list failed ({})", res.status());
-        }
-        Ok(res.json().await?)
     }
 
     /// The store's target-side work queue for `chain_id_to`: transfers it still
@@ -222,7 +241,7 @@ impl Store {
             .await?;
         if !res.status().is_success() {
             let status = res.status();
-            let text = res.text().await.unwrap_or_default();
+            let text = error_text(res).await;
             anyhow::bail!("sig-store rejected the observed-{} report ({status}): {text}", what.route());
         }
         Ok(())
@@ -302,8 +321,39 @@ impl Store {
         if !res.status().is_success() {
             anyhow::bail!("sig-store {path} failed ({})", res.status());
         }
-        Ok(res.json().await?)
+        json_capped(res).await
     }
+}
+
+/// An error body for a log line: capped, and cut to something printable.
+async fn error_text(res: reqwest::Response) -> String {
+    match read_capped(res, 64 * 1024).await {
+        Ok(b) => String::from_utf8_lossy(&b[..b.len().min(512)]).into_owned(),
+        Err(_) => "<oversized error body>".into(),
+    }
+}
+
+/// Buffer a response body up to [`MAX_RESPONSE_BYTES`], failing as soon as the
+/// cap is crossed — from `Content-Length` when declared, otherwise from the
+/// running total, so a chunked or lying server cannot bypass it.
+async fn read_capped(mut res: reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = res.content_length() {
+        if len > cap as u64 {
+            anyhow::bail!("sig-store response body exceeds {cap} bytes (declared {len})");
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if buf.len() + chunk.len() > cap {
+            anyhow::bail!("sig-store response body exceeds {cap} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+async fn json_capped<T: serde::de::DeserializeOwned>(res: reqwest::Response) -> anyhow::Result<T> {
+    Ok(serde_json::from_slice(&read_capped(res, MAX_RESPONSE_BYTES).await?)?)
 }
 
 #[cfg(test)]
@@ -363,6 +413,65 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "the store requires `{key}`, and it is not on the wire");
         }
+    }
+
+    // --- untrusted-store bounds (audit 2026-09-16 LOW) -----------------------
+
+    /// A one-connection HTTP server on a loopback port that runs `respond` on the
+    /// accepted socket after reading the request head.
+    fn serve_once(respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut head = [0u8; 4096];
+                let _ = sock.read(&mut head);
+                respond(&mut sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A store that accepts and never answers used to hang every relayer loop
+    /// forever — the client had no timeout at all.
+    #[tokio::test]
+    async fn a_store_that_never_answers_times_out() {
+        let base = serve_once(|_sock| std::thread::sleep(std::time::Duration::from_secs(30)));
+        let store = Store::with_timeout(&base, None, std::time::Duration::from_millis(500)).unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), store.pending_claims(1)).await;
+        let inner = outcome.expect("the request itself must give up, not hang");
+        assert!(inner.is_err(), "a hung store is an error, not an answer");
+    }
+
+    /// The store's own client also refuses an oversized body. A valid `[]` padded
+    /// past the cap parses fine, which is exactly why the cap has to be explicit.
+    #[tokio::test]
+    async fn an_oversized_store_response_is_refused() {
+        let base = serve_once(|sock| {
+            use std::io::Write;
+            let mut body = b"[".to_vec();
+            body.resize(MAX_RESPONSE_BYTES + 16, b' ');
+            body.push(b']');
+            // No Content-Length: the running total has to catch it.
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            );
+            let _ = sock.write_all(&body);
+        });
+        let store = Store::new(&base, None).unwrap();
+        let err = store.pending_claims(1).await.expect_err("oversized body must be refused");
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+
+    /// A token that cannot be a header value used to be dropped silently, sending
+    /// every request unauthenticated.
+    #[test]
+    fn an_unusable_token_fails_loudly_instead_of_being_dropped() {
+        assert!(Store::new("http://127.0.0.1:1", Some("bad\ntoken".into())).is_err());
+        assert!(Store::new("http://127.0.0.1:1", Some("good-token".into())).is_ok());
+        assert!(Store::new("http://127.0.0.1:1", None).is_ok());
     }
 
     // --- allowlist ----------------------------------------------------------
