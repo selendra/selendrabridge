@@ -26,6 +26,41 @@ import type { Page } from "@playwright/test";
 
 const run = promisify(execFile);
 
+type Runner = (file: string, args: string[], opts: { timeout?: number }) => Promise<{ stdout: string }>;
+
+/** Replace every occurrence of `secret` — with and without its `0x` — in `text`. */
+export function scrubSecret(text: string, secret: string): string {
+  if (!secret) return text;
+  let out = text.split(secret).join("<redacted>");
+  const bare = secret.replace(/^0x/i, "");
+  if (bare.length >= 16) out = out.split(bare).join("<redacted>");
+  return out;
+}
+
+/**
+ * Run `cast` with a private key on its command line WITHOUT letting the key escape
+ * through a failure. `cast` has no environment variable for `--private-key`, so it
+ * must be an argument — and `execFile` then rejects with
+ * `Command failed: cast … --private-key <KEY> …`, on an error whose `cmd` repeats
+ * it. That error is rethrown into the page by `exposeFunction` and printed by
+ * Playwright, into logs and traces. So a failure is rebuilt as a fresh Error with
+ * the key scrubbed and nothing else attached (found during the live testnet run).
+ */
+export async function runCastWithKey(
+  args: string[],
+  key: string,
+  opts: { timeout?: number } = {},
+  runner: Runner = run as unknown as Runner
+): Promise<{ stdout: string }> {
+  try {
+    return await runner("cast", args, opts);
+  } catch (e) {
+    const err = e as { message?: string; stderr?: unknown };
+    const detail = `${err.message ?? "cast failed"}${err.stderr ? `\n${String(err.stderr)}` : ""}`;
+    throw new Error(scrubSecret(detail, key));
+  }
+}
+
 export interface LiveEnv {
   evmKey: string;
   evmAddress: string;
@@ -41,7 +76,7 @@ export async function liveEnv(): Promise<LiveEnv | null> {
   const rpcsRaw = process.env.LIVE_RPCS;
   if (!evmKey || !rpcsRaw) return null;
   const rpcs = JSON.parse(rpcsRaw) as Record<string, string>;
-  const { stdout } = await run("cast", ["wallet", "address", "--private-key", evmKey]);
+  const { stdout } = await runCastWithKey(["wallet", "address", "--private-key", evmKey], evmKey);
   let solanaSecret: Uint8Array | null = null;
   let solanaAddress: string | null = null;
   const kp = process.env.LIVE_SOLANA_KEYPAIR;
@@ -159,7 +194,7 @@ export async function installLiveWallets(page: Page, env: LiveEnv, chainId: numb
       if (!url) throw new Error(`no RPC for chain ${cid} in LIVE_RPCS`);
       const args = ["send", tx.to, tx.data ?? "0x", "--rpc-url", url, "--private-key", env.evmKey, "--async"];
       if (tx.value && BigInt(tx.value) > 0n) args.push("--value", BigInt(tx.value).toString());
-      const { stdout } = await run("cast", args, { timeout: 120_000 });
+      const { stdout } = await runCastWithKey(args, env.evmKey, { timeout: 120_000 });
       const hash = stdout.trim().split(/\s+/).pop() ?? "";
       if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) throw new Error(`cast send gave no hash: ${stdout}`);
       return hash;

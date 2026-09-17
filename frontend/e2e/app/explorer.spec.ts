@@ -1,4 +1,5 @@
 import { test, expect, startApp, gotoView } from "../fixtures/app";
+import { CHAINS } from "../fixtures/backend";
 
 /** Explorer: stats, filters, both tabs, and the submission detail drawer. */
 
@@ -77,6 +78,38 @@ test("lists every submission with its route, amount, nonce and signature count",
   await expect(first).toContainText("Chain B");
   await expect(first.locator(".tbl__amount")).toHaveText("1.5");
   await expect(first.locator(".sig-count")).toContainText("2 / 2");
+});
+
+/**
+ * Seen on the live testnet: the explorer's per-chain decimals lookup sent an EVM
+ * `decimals()` eth_call to EVERY registry chain with an rpcUrl — including Solana,
+ * whose token is a base58 mint and whose RPC does not speak eth_call. It could
+ * only ever fail back to 18, after a request to that endpoint.
+ */
+test("never sends an EVM decimals() call to a non-EVM chain's RPC", async ({ page }) => {
+  const SOLANA_RPC = "http://127.0.0.1:8899";
+  const hits: string[] = [];
+  await page.route(`${SOLANA_RPC}/**`, (route) => {
+    hits.push(route.request().postData() ?? "");
+    return route.fulfill({ status: 200, contentType: "application/json", body: '{"jsonrpc":"2.0","id":1,"result":"0x"}' });
+  });
+  await openExplorer(page, {
+    chains: [
+      ...CHAINS,
+      {
+        chainId: 7565164,
+        name: "Solana Devnet",
+        rpcUrl: SOLANA_RPC,
+        gate: "Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1",
+        token: "8T2cxAqp8mDNkdTTb5giew9eYgZ7NmHdEWz6kMeE7WFV",
+        tokens: [{ symbol: "TST", address: "8T2cxAqp8mDNkdTTb5giew9eYgZ7NmHdEWz6kMeE7WFV" }],
+        router: null,
+      },
+    ],
+  });
+  await expect(page.locator(".tbl__row").first()).toBeVisible();
+  await page.waitForTimeout(1_500); // give the decimals lookup time to (not) fire
+  expect(hits.filter((b) => b.includes("eth_call"))).toHaveLength(0);
 });
 
 test("formats an amount in the bridge decimals the API reports, not the token's", async ({ page }) => {

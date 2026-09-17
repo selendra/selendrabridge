@@ -332,6 +332,17 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "rpcs = $(jq -c ".chains[] | select(.chain_id == $cid) | .rpcs" "$CONFIG")"
       echo "gate = \"$(cf "$cid" gate)\""
     done
+    # An EVM reader can never vouch for a Solana payout, and the check fails
+    # closed — so without this block the validator refuses EVM->Solana outright
+    # (found replaying live mesh8 traffic). It reads the gate program's
+    # ["asset", debridgeId] account to learn the scale Solana pays out at.
+    if [[ "$SOLANA_ON" == "true" ]]; then
+      echo
+      echo "[[solana_destinations]]"
+      echo "chain_id = $SOL_CHAIN_ID"
+      echo "program_id = \"$SOL_PROGRAM\""
+      echo "rpc = \"$(j '.solana.rpc')\""
+    fi
     if [[ "$REFUND_ON" == "true" ]]; then
       # No [refund] block => this validator never votes on cancels/refunds, and
       # stranded transfers stay stranded. That is the safe default: a node that

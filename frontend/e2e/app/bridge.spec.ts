@@ -292,6 +292,36 @@ test.describe("H-2: source and destination must agree on the scale", () => {
     await expect(notice).toContainText("times too much");
   });
 
+  /**
+   * Seen on the live testnet: the check re-ran on every ~15 s registry poll —
+   * the registry objects are rebuilt each time even when nothing changed — so it
+   * invalidated a good answer and flashed "Checking destination decimals…". A
+   * registered scale is write-once; nothing but a different corridor should
+   * trigger another read.
+   */
+  test("a registry poll does not re-read the destination or flash the check", async ({ page }) => {
+    await page.clock.install();
+    const reads: number[] = [];
+    await openBridge(page, APPROVED, {}, { bridgeDecimals: 18 });
+    await page.route("**/127.0.0.1:8546/**", (route) => {
+      const data = (JSON.parse(route.request().postData() ?? "{}") as { params?: [{ data?: string }] }).params?.[0]
+        ?.data;
+      if (data?.startsWith("0x93b06e9d")) reads.push(Date.now());
+      return route.fallback();
+    });
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).toHaveText("Bridge");
+    const before = reads.length;
+
+    // Four registry polls (App polls the chain registry every 15 s).
+    await page.clock.runFor(61_000);
+    // Let the polls' fetches (and any re-read they would trigger) actually land
+    // before counting — otherwise this could pass just by looking too early.
+    await page.waitForTimeout(2_000);
+    await expect(primaryButton(page)).toHaveText("Bridge");
+    expect(reads.length).toBe(before);
+  });
+
   test("sends normally when both ends agree", async ({ page }) => {
     await openBridge(page, APPROVED, {}, { bridgeDecimals: 18 });
     await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");

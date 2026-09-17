@@ -21,6 +21,15 @@ reqwest = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
+# H-2, EVM->Solana: read the Solana gate's ["asset", debridgeId] account to learn
+# the scale it pays out at. Same crates and features graphql-api already uses for
+# the same read, so the PDA derivation and the account layout are the tested ones
+# (swap-math's `pda` is parity-tested against the program's own derivation, and
+# its curve25519-dalek 4 is the version that links alongside alloy).
+swap-math = { workspace = true, features = ["pda"] }
+bridge-solana = { workspace = true, default-features = false }
+base64 = "0.22"
+bs58 = "0.5"
 
 [dev-dependencies]
 # Drive the operator-API router in-process (no socket) via `oneshot`, so the

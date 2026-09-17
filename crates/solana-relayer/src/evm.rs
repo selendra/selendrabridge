@@ -106,6 +106,52 @@ pub fn decode_bridge_decimals_for(ret: &[u8]) -> anyhow::Result<Option<u8>> {
     Ok(Some(ret[63]))
 }
 
+/// Did the node report that the call REVERTED — a fact about the contract that
+/// will not change on retry — as opposed to the request failing in transit?
+pub fn reverted(e: &anyhow::Error) -> bool {
+    e.to_string().to_ascii_lowercase().contains("execution reverted")
+}
+
+/// Calldata for a `fn(address)` getter.
+pub fn encode_address_call(signature: &str, addr: &[u8; 20]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(36);
+    d.extend_from_slice(&selector(signature));
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(addr);
+    d
+}
+
+/// Decode an ABI `address` return word. `None` for the zero address.
+pub fn decode_address(ret: &[u8]) -> anyhow::Result<Option<[u8; 20]>> {
+    if ret.len() != 32 {
+        anyhow::bail!("expected a 32-byte address word, got {} bytes", ret.len());
+    }
+    if ret[..12].iter().any(|b| *b != 0) {
+        anyhow::bail!("return word is not an address");
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&ret[12..]);
+    Ok((a != [0u8; 20]).then_some(a))
+}
+
+/// Decode `bridgeDecimalsOf(address)`: `(bool set, uint8 bridgeDecimals, uint8
+/// localDecimals)` — three right-aligned words. `None` when `set` is false.
+pub fn decode_bridge_decimals_of(ret: &[u8]) -> anyhow::Result<Option<u8>> {
+    if ret.len() < 96 {
+        anyhow::bail!("bridgeDecimalsOf returned {} bytes, expected at least 96", ret.len());
+    }
+    if ret[..31].iter().any(|b| *b != 0) || ret[31] > 1 {
+        anyhow::bail!("bridgeDecimalsOf's first word is not a bool");
+    }
+    if ret[31] == 0 {
+        return Ok(None);
+    }
+    if ret[32..63].iter().any(|b| *b != 0) {
+        anyhow::bail!("bridgeDecimalsOf's bridgeDecimals word exceeds a uint8");
+    }
+    Ok(Some(ret[63]))
+}
+
 pub struct GateReader {
     pub chain_id: u64,
     gate: String,
@@ -207,11 +253,51 @@ impl GateReader {
     /// Read at the CONFIRMED block, like every other decision here: a
     /// registration seen only at the tip could be reorged away after we signed.
     pub async fn bridge_decimals_for(&self, debridge_id: &[u8; 32]) -> anyhow::Result<Option<u8>> {
+        // Three outcomes, kept apart on purpose:
+        //   Ok(Some(d)) — the gate registered scale `d`;
+        //   Ok(None)    — the gate ANSWERED that it cannot vouch (no corridor, a
+        //                 revert, a reply that is not this function's shape);
+        //   Err         — the request failed in transit (HTTP error, rate limit,
+        //                 timeout). Not a fact about the gate: the caller retries.
+        // Collapsing Err into None withheld a legitimate signature for good over
+        // a single rate-limited request — found replaying live mesh8 traffic.
         let block = self.confirmed_block().await?;
-        let ret = self
+
+        // A gate older than `bridgeDecimalsFor` reverts on it (and a non-contract
+        // answers empty, which does not decode). Fall back to the two reads that
+        // function is made of — every decimals-aware gate has both, and both
+        // registrations are write-once, so they cannot race. Without this every
+        // Solana->EVM transfer to a live pre-upgrade gate was refused, and those
+        // gates are sealed (48 h to upgrade first).
+        if let Ok(ret) = self
             .call(&encode_bytes32_call("bridgeDecimalsFor(bytes32)", debridge_id), block)
-            .await?;
-        decode_bridge_decimals_for(&ret)
+            .await
+        {
+            if let Ok(v) = decode_bridge_decimals_for(&ret) {
+                return Ok(v);
+            }
+        }
+
+        let local = match self
+            .call(&encode_bytes32_call("tokenOf(bytes32)", debridge_id), block)
+            .await
+        {
+            Ok(ret) => match decode_address(&ret) {
+                Ok(a) => a,
+                Err(_) => return Ok(None), // answered, but not with an address
+            },
+            Err(e) if reverted(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(local) = local else { return Ok(None) }; // no corridor here
+        match self
+            .call(&encode_address_call("bridgeDecimalsOf(address)", &local), block)
+            .await
+        {
+            Ok(ret) => Ok(decode_bridge_decimals_of(&ret).unwrap_or(None)),
+            Err(e) if reverted(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Source-side view at a confirmed block: did this gate lock `id`
@@ -257,6 +343,62 @@ impl GateReader {
             Some(block) => self.was_sent_by_block(id, block).await,
             None => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_fallback_decoders {
+    use super::*;
+
+    fn word(b: &[u8]) -> Vec<u8> {
+        let mut w = vec![0u8; 32 - b.len()];
+        w.extend_from_slice(b);
+        w
+    }
+
+    /// The fallback path's calldata must be what the gate ABI expects: selector
+    /// then the address left-padded to a word.
+    #[test]
+    fn address_calldata_is_selector_then_a_padded_word() {
+        let a = [0xab; 20];
+        let d = encode_address_call("bridgeDecimalsOf(address)", &a);
+        assert_eq!(d.len(), 36);
+        assert_eq!(&d[..4], &selector("bridgeDecimalsOf(address)"));
+        assert!(d[4..16].iter().all(|b| *b == 0));
+        assert_eq!(&d[16..], &a);
+    }
+
+    /// A revert is definitive; a rate limit or timeout is not, and must be retried.
+    #[test]
+    fn only_a_revert_counts_as_the_gate_answering() {
+        assert!(reverted(&anyhow::anyhow!("evm rpc eth_call on chain 1: {{\"code\":3,\"message\":\"execution reverted\"}}")));
+        assert!(!reverted(&anyhow::anyhow!("evm rpc eth_call on chain 1: HTTP 429 Too Many Requests")));
+        assert!(!reverted(&anyhow::anyhow!("operation timed out")));
+    }
+
+    #[test]
+    fn decode_address_distinguishes_unset_from_set() {
+        assert_eq!(decode_address(&[0u8; 32]).unwrap(), None);
+        let mut w = [0u8; 32];
+        w[31] = 1;
+        assert_eq!(decode_address(&w).unwrap(), Some({ let mut a = [0u8; 20]; a[19] = 1; a }));
+        let mut dirty = [0u8; 32];
+        dirty[0] = 1;
+        assert!(decode_address(&dirty).is_err(), "high bytes set: not an address");
+        assert!(decode_address(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_bridge_decimals_of_reads_the_second_word() {
+        let mut r = word(&[1]);
+        r.extend(word(&[6]));
+        r.extend(word(&[18]));
+        assert_eq!(decode_bridge_decimals_of(&r).unwrap(), Some(6));
+        let mut unset = word(&[0]);
+        unset.extend(word(&[0]));
+        unset.extend(word(&[0]));
+        assert_eq!(decode_bridge_decimals_of(&unset).unwrap(), None);
+        assert!(decode_bridge_decimals_of(&r[..95]).is_err());
     }
 }
 

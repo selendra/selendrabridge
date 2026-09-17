@@ -121,15 +121,25 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|d| Ok((d.chain_id, d.gate.clone(), d.endpoints()?)))
         .collect::<anyhow::Result<_>>()?;
-    if scale_peers.is_empty() {
+    // Solana peers are separate: an EVM gate reader can never vouch for a Solana
+    // payout, so without these every EVM->Solana transfer is refused.
+    let solana_peers: Vec<(u64, [u8; 32], String)> = cfg
+        .solana_destinations
+        .iter()
+        .map(|d| Ok((d.chain_id, d.program_key()?, d.rpc.clone())))
+        .collect::<anyhow::Result<_>>()?;
+    if scale_peers.is_empty() && solana_peers.is_empty() {
         warn!(
-            "no [[destinations]] (and no [refund.destinations]) — this validator cannot \
-             verify that a peer gate agrees on an asset's bridge decimals, so it will \
-             sign NOTHING. Add each peer's chain_id/gate/rpcs (audit 2026-09-16, H-2)."
+            "no [[destinations]], [refund.destinations] or [[solana_destinations]] — this \
+             validator cannot verify that a peer agrees on an asset's bridge decimals, so it \
+             will sign NOTHING. Add each peer (audit 2026-09-16, H-2)."
         );
     } else {
-        info!(peers = ?scale_peers.iter().map(|(c, _, _)| *c).collect::<Vec<_>>(),
-              "bridge-decimals cross-check active for these destination chains");
+        info!(
+            evm_peers = ?scale_peers.iter().map(|(c, _, _)| *c).collect::<Vec<_>>(),
+            solana_peers = ?solana_peers.iter().map(|(c, _, _)| *c).collect::<Vec<_>>(),
+            "bridge-decimals cross-check active for these destination chains"
+        );
     }
 
     for source in cfg.sources {
@@ -137,8 +147,9 @@ async fn main() -> anyhow::Result<()> {
         let sink = sink.clone();
         let runtime = runtimes.get(&source.chain_id).unwrap().clone();
         let peers = scale_peers.clone();
+        let sol_peers = solana_peers.clone();
         tasks.spawn(async move {
-            scan_source(source, signer, signer_addr, sink, runtime, peers).await
+            scan_source(source, signer, signer_addr, sink, runtime, peers, sol_peers).await
         });
     }
 
@@ -163,6 +174,7 @@ async fn scan_source(
     sink: Arc<StoreBackend>,
     runtime: Arc<Mutex<Runtime>>,
     scale_peers: Vec<(u64, String, Vec<String>)>,
+    solana_peers: Vec<(u64, [u8; 32], String)>,
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
@@ -208,7 +220,15 @@ async fn scan_source(
             };
             dests.push(scale::Destination { chain_id: *chain_id, gate: gate_addr, provider });
         }
-        scale::ScaleGuard::new(dests)
+        let solana = solana_peers
+            .iter()
+            .map(|(chain_id, program_id, rpc)| scale::SolanaDestination {
+                chain_id: *chain_id,
+                program_id: *program_id,
+                rpc: rpc.clone(),
+            })
+            .collect();
+        scale::ScaleGuard::new(dests, solana)
     };
     if scale_guard.is_empty() {
         warn!(
@@ -559,7 +579,10 @@ async fn handle_log(
     // is the only thing that still stops it — see `scale`. Fails CLOSED: an
     // unverifiable far end is exactly the dangerous case. The nonce is consumed
     // either way (the transfer really happened), so the sequence stays intact.
-    match scale.verdict(source_provider, source_gate, ev.token, chain_to, ev.debridgeId).await {
+    // `?`: a read that failed in transit is not a verdict. Propagating it fails
+    // the batch, which leaves the cursor put and rolls the nonces back, so the
+    // transfer is re-examined next tick instead of being withheld for good.
+    match scale.verdict(source_provider, source_gate, ev.token, chain_to, ev.debridgeId).await? {
         scale::Verdict::Agree(_) => {}
         scale::Verdict::Mismatch { source, destination } => {
             warn!(

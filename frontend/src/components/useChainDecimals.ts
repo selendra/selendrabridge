@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { readDecimals, rpcRequest, type Eip1193Request } from "../wallet/eth";
 import type { Chain } from "../api/types";
 
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
 /** The connected wallet, reduced to what the fallback read needs. */
 export interface DecimalsProvider {
   chainId: number | null;
@@ -27,7 +29,14 @@ export function useChainDecimals(chains: Chain[], wallet?: DecimalsProvider | nu
   const targets = useMemo(
     () =>
       chains.filter(
-        (c): c is Chain & { token: string } => !!c.token && (!!c.rpcUrl || (walletChain !== null && walletChain === c.chainId))
+        (c): c is Chain & { token: string } =>
+          // EVM tokens only. `decimals()` is an ERC-20 eth_call: a non-EVM chain's
+          // token (a base58 SPL mint) cannot be encoded as its argument and its RPC
+          // does not speak eth_call, so asking always failed back to 18 — after a
+          // pointless request to that chain's endpoint (seen on the live testnet).
+          !!c.token &&
+          EVM_ADDRESS.test(c.token) &&
+          (!!c.rpcUrl || (walletChain !== null && walletChain === c.chainId))
       ),
     [chains, walletChain]
   );

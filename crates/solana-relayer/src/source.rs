@@ -617,14 +617,14 @@ impl Scanner {
                     );
                     return Ok(false);
                 }
+                // In transit, not an answer: propagate so the tick retries with
+                // the cursor unmoved, exactly as `origin_proof_holds` treats an
+                // unreadable record. Withholding here dropped a legitimate
+                // transfer's signature for good over one rate-limited request.
                 Err(e) => {
-                    warn!(
-                        chain_to,
-                        error = %e,
-                        "reading the destination's bridgeDecimalsFor failed (is that gate \
-                         older than the H-2 fix?) — withholding signature"
-                    );
-                    return Ok(false);
+                    return Err(e.context(format!(
+                        "reading chain {chain_to}'s bridge decimals for the H-2 check"
+                    )))
                 }
             },
         };

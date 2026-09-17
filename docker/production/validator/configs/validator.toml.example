@@ -74,10 +74,25 @@ bind = "0.0.0.0:9090"
 #
 # Omit this and the validator falls back to [[refund.destinations]] below, which
 # has the same shape. Configure one of the two.
+#
+# A gate deployed before `bridgeDecimalsFor(bytes32)` existed is still readable:
+# the validator falls back to `tokenOf` + `bridgeDecimalsOf`. A read that fails in
+# transit (rate limit, timeout) is RETRIED, not treated as a refusal — only a
+# definitive answer (a mismatch, no corridor) withholds the signature.
 [[destinations]]
 chain_id = 56
 rpcs = ["https://your-bsc-node.example.com"]
 gate = "0x0000000000000000000000000000000000000000"
+
+# EVM->Solana needs its own entry: an EVM gate reader can never vouch for a
+# Solana payout, and this check fails closed, so WITHOUT this block every
+# transfer from your sources to Solana is refused (found replaying live traffic).
+# The validator reads the gate program's ["asset", debridgeId] account to learn
+# the scale Solana pays out at. Omit only if no source here can send to Solana.
+[[solana_destinations]]
+chain_id = 7565164
+program_id = "YourSolanaGateProgramId111111111111111111111"
+rpc = "https://your-solana-rpc.example.com"
 
 # ── Refund attestation ────────────────────────────────────────────────────────
 # Omit this whole block and this validator never votes on whether a stranded

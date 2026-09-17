@@ -344,13 +344,24 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   ).toLowerCase()}`;
   const destScaleStale = destReadFor !== destScaleKey;
 
+  // The inputs the read actually uses, as PRIMITIVES. The effect used to depend on
+  // the registry objects `toReg`/`fromReg`, which are rebuilt on every registry
+  // poll even when nothing in them changed — so every ~15 s it re-ran, invalidated
+  // a perfectly good answer and flashed "Checking destination decimals…" (seen on
+  // the live testnet). A registered scale is write-once; only a change to one of
+  // these values can change the answer.
+  const destIsNonEvm = toReg ? isNonEvmChain(toReg) : false;
+  const destGate = toReg?.gate ?? "";
+  const destRpcUrl = toReg?.rpcUrl ?? "";
+  const srcSymbol = fromReg?.tokens?.find((t) => eqAddr(t.address, token))?.symbol ?? "";
+
   useEffect(() => {
     let alive = true;
     // Invalidate first: until the read lands we know nothing about the far end,
     // and "nothing" must not be allowed to look like agreement.
     setDestReadFor(null);
     setDestBridgeDecimals(null);
-    if (!tokenOk || fromChainId == null || toChainId == null || !toReg) return;
+    if (!tokenOk || fromChainId == null || toChainId == null || (!destIsNonEvm && !destGate)) return;
 
     const read = async (): Promise<number | null> => {
       // EVM -> Solana: the destination gate is a Solana program, not an EVM
@@ -358,21 +369,16 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
       // gate and reports its registered scale (graphql-api `solanaGateContext`).
       // Resolution there is by SYMBOL, so a token the registry doesn't list has
       // no way to be identified — UNKNOWN, which fails closed.
-      if (isNonEvmChain(toReg)) {
-        const symbol = fromReg?.tokens?.find((t) => eqAddr(t.address, token))?.symbol;
-        if (!symbol) return null;
-        const ctx = await fetchSolanaGateContext(toReg.chainId, symbol, fromChainId).catch(() => null);
+      if (destIsNonEvm) {
+        if (!srcSymbol) return null;
+        const ctx = await fetchSolanaGateContext(toChainId, srcSymbol, fromChainId).catch(() => null);
         return ctx ? ctx.bridgeDecimals : null;
       }
       // EVM -> EVM: ask the destination gate itself. It has to go through the
       // registry's RPC, not the wallet — the wallet is connected to the SOURCE
       // chain, where that address is a different contract or none at all.
-      if (!toReg.gate || !toReg.rpcUrl) return null;
-      return readBridgeDecimalsFor(
-        rpcRequest(toReg.rpcUrl),
-        toReg.gate,
-        debridgeId(BigInt(fromChainId), token)
-      );
+      if (!destGate || !destRpcUrl) return null;
+      return readBridgeDecimalsFor(rpcRequest(destRpcUrl), destGate, debridgeId(BigInt(fromChainId), token));
     };
 
     read()
@@ -385,7 +391,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     return () => {
       alive = false;
     };
-  }, [destScaleKey, tokenOk, token, fromChainId, toChainId, toReg, fromReg]);
+  }, [destScaleKey, tokenOk, token, fromChainId, toChainId, destIsNonEvm, destGate, destRpcUrl, srcSymbol]);
 
   // Only meaningful once the reads match the selected token (see `onchainStale`).
   const amountBase = tokenOk && !onchainStale ? parseUnits(amount, decimals) : 0n;

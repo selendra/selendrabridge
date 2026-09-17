@@ -41,6 +41,39 @@ pub struct Config {
     /// that already attests refunds gets the check without new configuration.
     #[serde(default)]
     pub destinations: Vec<RefundChain>,
+    /// Solana gate programs this validator reads for the same H-2 check on
+    /// EVM->Solana transfers. `[[destinations]]` can only describe an EVM gate,
+    /// so without an entry here every transfer to Solana is refused — the check
+    /// fails closed, and an EVM reader can never vouch for a Solana payout.
+    #[serde(default)]
+    pub solana_destinations: Vec<SolanaDestinationChain>,
+}
+
+/// One Solana gate program the H-2 check can read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SolanaDestinationChain {
+    pub chain_id: u64,
+    /// The gate program id, base58.
+    pub program_id: String,
+    /// Solana JSON-RPC URL.
+    pub rpc: String,
+}
+
+impl SolanaDestinationChain {
+    /// The program id as the 32 raw bytes PDA derivation hashes.
+    pub fn program_key(&self) -> anyhow::Result<[u8; 32]> {
+        let raw = bs58::decode(self.program_id.trim())
+            .into_vec()
+            .map_err(|e| anyhow::anyhow!("solana destination {}: program_id is not base58: {e}", self.chain_id))?;
+        raw.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "solana destination {}: program_id decodes to {} bytes, expected 32",
+                self.chain_id,
+                v.len()
+            )
+        })
+    }
 }
 
 impl Config {
@@ -280,6 +313,29 @@ impl Config {
             }
         }
 
+        // H-2 peers: each chain may be described once across both lists, and a
+        // Solana program id must actually be a 32-byte key. Caught here rather
+        // than as a refusal on the first transfer to that chain.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for id in cfg.destinations.iter().map(|d| d.chain_id)
+                .chain(cfg.solana_destinations.iter().map(|d| d.chain_id))
+            {
+                if !seen.insert(id) {
+                    anyhow::bail!(
+                        "destination chain_id {id} is listed more than once across \
+                         [[destinations]] and [[solana_destinations]]"
+                    );
+                }
+            }
+            for d in &cfg.solana_destinations {
+                d.program_key()?;
+                if d.rpc.trim().is_empty() {
+                    anyhow::bail!("solana destination {}: rpc is empty", d.chain_id);
+                }
+            }
+        }
+
         // A refund block with no destinations can never attest anything; that is
         // almost certainly a misconfiguration rather than an intent to disable.
         if let Some(refund) = &cfg.refund {
@@ -388,6 +444,48 @@ mod tests {
         assert!(c.destinations.is_empty(), "premise: no dedicated list");
         assert_eq!(c.scale_destinations().len(), c.refund.as_ref().unwrap().destinations.len());
         assert!(!c.scale_destinations().is_empty(), "the refund peers are used");
+    }
+
+    /// EVM->Solana: a Solana gate is described by its program id, and must load.
+    #[test]
+    fn a_solana_destination_loads_with_a_real_program_id() {
+        let toml = format!(
+            "{}[[solana_destinations]]\nchain_id = 7565164\n\
+             program_id = \"Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1\"\n\
+             rpc = \"https://api.devnet.solana.com\"\n",
+            cfg("block_confirmation = 12")
+        );
+        let c = Config::from_toml(&toml).expect("loads");
+        assert_eq!(c.solana_destinations.len(), 1);
+        assert_eq!(c.solana_destinations[0].program_key().unwrap().len(), 32);
+    }
+
+    /// A malformed program id is a startup error, not a refusal on the first
+    /// transfer to Solana hours later.
+    #[test]
+    fn a_bad_solana_program_id_is_refused_at_startup() {
+        for bad in ["not-base58-0OIl", "11111111111111111111111111111111111111111111111111"] {
+            let toml = format!(
+                "{}[[solana_destinations]]\nchain_id = 7565164\nprogram_id = \"{bad}\"\n\
+                 rpc = \"https://api.devnet.solana.com\"\n",
+                cfg("block_confirmation = 12")
+            );
+            assert!(Config::from_toml(&toml).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// One chain, one description: an id listed as both an EVM and a Solana peer
+    /// would make which reader answers depend on insertion order.
+    #[test]
+    fn a_chain_listed_as_both_evm_and_solana_is_refused() {
+        let toml = format!(
+            "{}[[destinations]]\n{PEER}[[solana_destinations]]\nchain_id = 1338\n\
+             program_id = \"Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1\"\n\
+             rpc = \"https://api.devnet.solana.com\"\n",
+            cfg("block_confirmation = 12")
+        );
+        let err = Config::from_toml(&toml).unwrap_err().to_string();
+        assert!(err.contains("more than once"), "got: {err}");
     }
 
     /// Neither configured => empty, and the caller withholds every signature.
