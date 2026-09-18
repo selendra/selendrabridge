@@ -105,7 +105,8 @@ submissionId computed on one side verify on the other.
 | `assets[].mint` / `.vault` | the SPL mint and the program-owned vault. **Supplied, never created here** — the vault must be an SPL account for that mint, owned by the program's `vault_authority` PDA, with no delegate and no close authority (the program rejects anything else) |
 | `assets[].from_chains` | which EVM chains this asset may arrive from (`"all"` or a list). One registration per source chain, exactly as the EVM side needs one `setLocalToken` per corridor — a claim commits only to the debridgeId, and that id differs per origin |
 | `assets[].swap_vault` | the SPL vault the SWAP pool uses for this mint — a different account from the bridge `vault`, owned by the swap program's own `vault_authority` PDA. The two programs share no liquidity |
-| `assets[].seed_from` | a token account holding balance to seed the swap pool's reserve from |
+| `assets[].seed_from` | a token account holding balance to seed the swap pool's reserve from, and the bridge vault when `vault_seed` is set |
+| `assets[].vault_seed` | whole tokens to move from `seed_from` into the bridge `vault` at deploy time. **A registered asset with an empty vault signs normally and then fails every claim**, so each inbound transfer runs the full cancel + refund lifecycle before the sender is repaid (seen on the mesh9 bring-up, 2026-09-18). Omit it only if the vault is already funded — the script warns when a vault ends up empty |
 | `assets[].debridge_id` | for a Solana-NATIVE asset, the id it is bridged under. It is registered on the program *and* mapped on every EVM gate that carries the symbol. Leave `null` for an EVM-native asset |
 
 ### the Solana swap pool

@@ -789,6 +789,23 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       done
       ids="$(jq -c --arg d "$native_did" '. + [{from_chain: "solana", debridge_id: $d}]' <<<"$ids")"
     fi
+    # Bridge liquidity. A registered asset whose VAULT IS EMPTY quotes and signs
+    # normally and then fails every claim on the destination, so each transfer
+    # runs the full cancel + refund lifecycle before the sender gets their funds
+    # back — the first EVM->Solana transfer of the mesh9 bring-up did exactly
+    # that (2026-09-18). `vault_seed` (whole tokens) tops the vault up from
+    # `seed_from`; with no seed configured an empty vault is at least called out.
+    seed_whole="$(j ".solana.assets[] | select(.symbol == \"$sym\") | .vault_seed // empty")"
+    seed_from="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .seed_from")"
+    if [[ -n "$seed_whole" && -n "$seed_from" ]]; then
+      spl-token transfer "$mint" "$seed_whole" "$vault" --from "$seed_from" \
+        --owner "$PAYER" --fee-payer "$PAYER" --url "$SOL_RPC" >/dev/null 2>&1 \
+        || die "seeding the $sym vault from $seed_from failed"
+      info "vault   : seeded $seed_whole $sym into $vault"
+    fi
+    vault_bal="$(spl-token balance --address "$vault" --url "$SOL_RPC" 2>/dev/null || echo 0)"
+    [[ "${vault_bal%%.*}" == "0" ]] && warn "the $sym vault ($vault) is EMPTY — every inbound claim will fail and refund until it is funded (set solana.assets[].vault_seed, or transfer in by hand)"
+
     SOL_ASSETS="$(jq -c --arg s "$sym" --arg m "$mint" --arg v "$vault" --argjson ids "$ids" \
       --argjson bd "${BRIDGE_DEC[$sym]:-null}" \
       '. + [{symbol: $s, mint: $m, vault: $v, bridge_decimals: $bd, registrations: $ids}]' <<<"$SOL_ASSETS")"

@@ -98,7 +98,13 @@ async function bridgeFromEvm(page: Page, to: Chain | { chainId: number; name: st
   await inputs.last().fill(receiver);
 
   const button = page.locator(".review-btn");
-  await expect(button).not.toHaveText(/Reading token/, { timeout: 30_000 });
+  // Both transient states must clear before the label is read: the token reads
+  // ("Reading token…") AND the H-2 destination-scale check ("Checking
+  // destination decimals…"), which is a SECOND settling state added after this
+  // spec was written. Reading the label in that window skipped the approve
+  // branch and asserted "Bridge" against a button still checking (live run,
+  // 2026-09-18).
+  await expect(button).not.toHaveText(/Reading token|Checking destination decimals/, { timeout: 60_000 });
   if (/Approve/.test((await button.textContent()) ?? "")) {
     await button.click();
     await expect(button).toHaveText("Bridge", { timeout: 180_000 });
