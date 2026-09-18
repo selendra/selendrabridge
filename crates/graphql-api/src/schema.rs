@@ -149,10 +149,19 @@ impl Token {
     /// `amount` of a submission or history row), NOT this token's own decimals.
     /// Null when the registry does not say, or when this chain's gate is
     /// registered at a different scale than the registry claims.
+    ///
+    /// Only an EVM token has one gate registration to check against. A Solana
+    /// mint does not: the program keys its asset records by the PEER corridor's
+    /// debridgeId, so one mint has a scale per corridor and none of its own.
+    /// Its registry figure is served as before rather than blanked — parsing
+    /// the base58 mint as an EVM address and giving up made every Solana
+    /// token `null` (caught replaying live mesh8, 2026-09-17).
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
         let listed = self.listed_bridge_decimals?;
-        let token: alloy_primitives::Address = self.address.parse().ok()?;
-        state(ctx).verified_bridge_decimals(self.chain_id, token, listed).await
+        match self.address.parse::<alloy_primitives::Address>() {
+            Ok(token) => state(ctx).verified_bridge_decimals(self.chain_id, token, listed).await,
+            Err(_) => Some(listed),
+        }
     }
 }
 
@@ -1379,6 +1388,38 @@ mod tests {
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         let json = res.data.into_json().unwrap();
         assert_eq!(json["chains"][0]["tokens"][0]["bridgeDecimals"], serde_json::Value::Null, "{json}");
+    }
+
+    /// A Solana mint is not an EVM address and has no single gate registration:
+    /// its registry figure must still be served, not dropped to `null`.
+    #[tokio::test]
+    async fn a_non_evm_token_keeps_its_registry_scale() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (mut st, _) = scale_state(&url, 6);
+        st.registry.push(ChainInfo {
+            chain_id: 7565164,
+            name: "Solana Devnet".into(),
+            rpc_url: None,
+            public_rpc_url: None,
+            gate: Some("Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1".into()),
+            token: None,
+            tokens: vec![crate::chain::TokenInfo {
+                symbol: "WRAP".into(),
+                address: "Bqt4xDpu6oEPgTgVLjZVQ56hFUGo2F4M8zFuK98NHe32".into(),
+                bridge_decimals: Some(9),
+            }],
+            router: None,
+            swap_pool: None,
+        });
+        let schema = async_graphql::Schema::build(Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .data(st)
+            .finish();
+        let res = schema.execute("{ chains { chainId tokens { symbol bridgeDecimals } } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        let sol = json["chains"].as_array().unwrap().iter().find(|c| c["chainId"] == 7565164).expect("solana chain");
+        assert_eq!(sol["tokens"][0]["bridgeDecimals"], 9, "{json}");
     }
 
     /// A log sink the tests can read back.
