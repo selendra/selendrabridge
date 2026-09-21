@@ -1,3 +1,4 @@
+use bridge_core::allow::AllowlistPolicy;
 use bridge_core::backend::StoreConfig;
 use bridge_core::config::ensure_unique;
 use bridge_core::signer::SignerConfig;
@@ -47,6 +48,11 @@ pub struct Config {
     /// fails closed, and an EVM reader can never vouch for a Solana payout.
     #[serde(default)]
     pub solana_destinations: Vec<SolanaDestinationChain>,
+    /// What this validator expects of the allowlist the store serves (audit
+    /// 2026-09-16, M-5). Absent => the legacy default: enforce whatever the
+    /// store says, and accept an empty list as "allow everything".
+    #[serde(default)]
+    pub allowlist: AllowlistPolicy,
 }
 
 /// One Solana gate program the H-2 check can read.

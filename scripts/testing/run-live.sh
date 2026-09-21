@@ -56,7 +56,15 @@ MINT=1000000000000000000000000   # 1,000,000e18
 deployed_to() { grep deployedTo | grep -oE '0x[0-9a-fA-F]{40}' | head -1; }
 
 # Run a long-lived service detached from this shell so it survives the tool call.
-spawn() { setsid bash -c "exec $1" >"$LOG/$2" 2>&1 < /dev/null & disown || true; }
+# `spawn <logfile> -- cmd args...` — argv, never a command STRING. The string
+# form (`bash -c "exec $1"`) re-parsed its argument as shell, which is the M-8
+# shape the launchers were fixed for; the inputs here are internal, but the
+# pattern is the bug.
+spawn() {
+  local log=$1; shift
+  [[ "${1:-}" == "--" ]] && shift
+  setsid "$@" >"$LOG/$log" 2>&1 < /dev/null & disown || true
+}
 
 echo "=== kill prior run (services don't all hold ports, so pkill by name too) ==="
 fuser -k 8545/tcp 8546/tcp 8080/tcp 8088/tcp 5173/tcp 2>/dev/null || true
@@ -72,8 +80,8 @@ echo "=== build rust services ==="
 ( cd "$ROOT" && cargo build -p validator -p keeper -p sig-store -p graphql-api >/dev/null 2>&1 )
 
 echo "=== boot anvil A (1337) + B (1338) ==="
-spawn "anvil --chain-id $SRC_CHAIN --port 8545 --host 127.0.0.1" anvil-src.log
-spawn "anvil --chain-id $DST_CHAIN --port 8546 --host 127.0.0.1" anvil-dst.log
+spawn anvil-src.log -- anvil --chain-id "$SRC_CHAIN" --port 8545 --host 127.0.0.1
+spawn anvil-dst.log -- anvil --chain-id "$DST_CHAIN" --port 8546 --host 127.0.0.1
 for url in $SRC_RPC $DST_RPC; do
   for _ in $(seq 1 60); do cast chain-id --rpc-url "$url" >/dev/null 2>&1 && break; sleep 0.2; done
 done
@@ -112,18 +120,29 @@ cast send "$TOKEN_SRC" "mint(address,uint256)" "$GATE_SRC" $MINT --rpc-url $SRC_
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_A" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_SRC" "setLocalToken(bytes32,address)" "$DEBRIDGE_B" "$TOKEN_SRC" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 echo "=== start Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+# M-9 (audit 2026-09-16): publish the database on LOOPBACK only. A docker `-p`
+# publish writes its own DNAT rule and bypasses ufw/firewalld, so a bare
+# `-p 5433:5432` with POSTGRES_PASSWORD=bridge hands this database — signatures,
+# allowlists, cursors — to anyone who can reach the host. The launchers were
+# fixed in round 4; these harnesses were not.
 docker run -d --name "$PG_NAME" \
   -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
-  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+  -p 127.0.0.1:${PG_PORT}:5432 postgres:16-alpine >/dev/null
 for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break; sleep 0.5; done
 
 echo "=== boot Postgres-backed sig-store + 2 validators + keeper ==="
 # sig-store retries the DB connection, so it tolerates Postgres still warming up.
 # --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
 # The binary now refuses to serve an open store without being told to.
-SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" SIG_STORE_ALLOW_UNAUTHENTICATED=1 spawn "$ROOT/target/debug/sig-store" sig-store.log
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" SIG_STORE_ALLOW_UNAUTHENTICATED=true spawn sig-store.log -- "$ROOT/target/debug/sig-store"
 for _ in $(seq 1 40); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
 # Each validator watches BOTH gates ([[sources]]), so either direction is signed.
@@ -196,12 +215,12 @@ private_key = "$KEEPER_KEY"
 [store]
 url = "$STORE_URL"
 CFG
-spawn "$ROOT/target/debug/validator $ROOT/.live-val1.toml" val1.log
-spawn "$ROOT/target/debug/validator $ROOT/.live-val2.toml" val2.log
-spawn "$ROOT/target/debug/keeper    $LOG/.live-keeper.toml" keeper.log
+spawn val1.log -- "$ROOT/target/debug/validator" "$ROOT/.live-val1.toml"
+spawn val2.log -- "$ROOT/target/debug/validator" "$ROOT/.live-val2.toml"
+spawn keeper.log -- "$ROOT/target/debug/keeper" "$LOG/.live-keeper.toml"
 
 echo "=== boot graphql-api (live store + BOTH gates + mutations) ==="
-spawn "$ROOT/target/debug/graphql-api --bind $GQL_BIND --store-url $STORE_URL --threshold 2 --gate $SRC_CHAIN=$SRC_RPC,$GATE_SRC --gate $DST_CHAIN=$DST_RPC,$GATE_DST --allow-mutations" graphql-api.log
+spawn graphql-api.log -- "$ROOT/target/debug/graphql-api" --bind "$GQL_BIND" --store-url "$STORE_URL" --threshold 2 --gate "$SRC_CHAIN=$SRC_RPC,$GATE_SRC" --gate "$DST_CHAIN=$DST_RPC,$GATE_DST" --allow-mutations
 for _ in $(seq 1 40); do curl -s "http://$GQL_BIND/health" >/dev/null 2>&1 && break; sleep 0.25; done
 
 echo "=== seed the frontend with the deployed addresses (frontend/.env.local) ==="
@@ -210,7 +229,7 @@ VITE_BRIDGE_CHAINS=[{"chainId":$SRC_CHAIN,"name":"Anvil A","rpcUrl":"$SRC_RPC","
 ENV
 
 echo "=== boot vite dev server ==="
-( cd "$WEB" && spawn "bunx vite --host 127.0.0.1 --port 5173 --strictPort" web.log )
+( cd "$WEB" && spawn web.log -- bunx vite --host 127.0.0.1 --port 5173 --strictPort )
 for _ in $(seq 1 80); do curl -s "http://127.0.0.1:5173/" >/dev/null 2>&1 && break; sleep 0.3; done
 
 echo

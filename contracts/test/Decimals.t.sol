@@ -86,6 +86,12 @@ contract DecimalsTest is Test {
         tst18.mint(user, 1_000e18);
         vm.prank(user);
         tst18.approve(address(gate18), type(uint256).max);
+
+        // Wiring complete. `claim` refuses an unsealed gate (M-1), and the
+        // registration tests below that need the setup phase deploy their own.
+        gate18.seal();
+        gate6.seal();
+        gate9.seal();
     }
 
     function _sign(bytes32 id) internal view returns (bytes[] memory sigs) {
@@ -225,9 +231,14 @@ contract DecimalsTest is Test {
     }
 
     function test_SetLocalToken_RefusesATokenWithNoBridgeDecimals() public {
+        // A gate still in its setup phase: the point is the decimals check, not
+        // the governance delay a sealed gate would hit first.
+        address[] memory vals = new address[](1);
+        vals[0] = vm.addr(v1pk);
+        Gate fresh = deployTestGate(vals, 1);
         DecToken raw = new DecToken("RAW", 18);
         vm.expectRevert(abi.encodeWithSelector(Gate.BridgeDecimalsUnset.selector, address(raw)));
-        gate18.setLocalToken(keccak256("corridor"), address(raw));
+        fresh.setLocalToken(keccak256("corridor"), address(raw));
     }
 
     function test_SetBridgeDecimals_IsWriteOnce() public {
@@ -253,7 +264,7 @@ contract DecimalsTest is Test {
     /// the schedule is bound to the exact value.
     function test_SetBridgeDecimals_AfterSeal_NeedsAMaturedScheduleForThatValue() public {
         DecToken t = new DecToken("T", 18);
-        gate18.seal();
+        // (setUp already sealed it.)
         bytes32 action = gate18.setBridgeDecimalsActionId(address(t), 6);
         vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
         gate18.setBridgeDecimals(address(t), 6);
@@ -318,6 +329,7 @@ contract DecimalsTest is Test {
         bad.setBridgeDecimals(address(tstBad), 3); // <-- the typo; the mesh uses 6
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_18, address(tst18));
         bad.setLocalToken(did, address(tstBad));
+        bad.seal();
         tstBad.mint(address(bad), 1_000_000e9);
 
         vm.chainId(CHAIN_18);
@@ -393,6 +405,8 @@ contract DecimalsRouterTest is Test {
         _seed(poolB, tt, 1_000_000e18);
         routerB = new SwapRouter(gateB, poolB);
         gateB.setLocalToken(BridgeHash.getDebridgeId(CHAIN_A, address(usdA)), address(usdB));
+        gateA.seal();
+        gateB.seal();
         usdB.mint(address(gateB), 10_000_000e6);
 
         routerA.setRemoteRouter(CHAIN_B, abi.encodePacked(address(routerB)));
@@ -499,6 +513,8 @@ contract DecimalsRouterScaledTest is Test {
         _seed(poolB, tt, 1_000_000e18);
         routerB = new SwapRouter(gateB, poolB);
         gateB.setLocalToken(BridgeHash.getDebridgeId(CHAIN_A, address(usdA)), address(usdB));
+        gateA.seal();
+        gateB.seal();
         usdB.mint(address(gateB), 10_000_000e18);
 
         routerA.setRemoteRouter(CHAIN_B, abi.encodePacked(address(routerB)));

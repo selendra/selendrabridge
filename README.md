@@ -226,6 +226,21 @@ bash docker/deploy.sh                                  # deploy + wire both chai
 docker compose up -d validator1 validator2 validator3 keeper
 ```
 
+Every published port binds `127.0.0.1` only, and `graphql-api` runs with
+`--production` (no GraphiQL, no introspection) — this file is the template people
+adapt for real deployments, so following it verbatim must not leave an open RPC
+or a schema-dumping endpoint (audit 2026-09-16, M-15). For the playground while
+developing locally, opt in:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# GraphiQL at http://localhost:8088
+```
+
+To reach the stack from another machine, put it behind the TLS + auth terminator
+in [`docker/production/`](docker/production/README.md) rather than republishing
+on `0.0.0.0`.
+
 > Not exercised in the WSL dev box used to build this (Docker Desktop WSL
 > integration was off); `scripts/testing/phase7.sh` covers the same topology with local
 > processes.

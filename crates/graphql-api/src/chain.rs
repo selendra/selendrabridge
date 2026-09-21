@@ -15,7 +15,7 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::client::RpcClient;
 use anyhow::Context;
-use bridge_core::abi::Gate;
+use bridge_core::abi::{Gate, IERC20Mintable};
 use bridge_core::config::redact_url;
 use serde::{Deserialize, Serialize};
 
@@ -446,6 +446,10 @@ fn gate_answered(e: &alloy::contract::Error) -> bool {
     }
 }
 
+/// Cached `decimals()` answers, including the negative ones — see
+/// [`Chains::token_decimals`].
+type TokenDecimalsCache = Arc<Mutex<HashMap<(u64, Address), Option<u8>>>>;
+
 /// Destination gates the API can read execution status from. Cheap to clone
 /// (each `DynProvider` is an `Arc` internally); share freely across resolvers.
 #[derive(Clone, Default)]
@@ -465,6 +469,10 @@ pub struct Chains {
     /// `(chain, token)`s already reported as disagreeing with the registry, so
     /// the warning is one line per asset, not one per row per request.
     scale_warned: Arc<Mutex<std::collections::HashSet<(u64, Address)>>>,
+    /// ERC-20 `decimals()` per `(chain, token)`. Immutable on-chain, so one read
+    /// serves every later request; `None` is cached too, so a token without the
+    /// function (or on a chain with no provider) is not re-asked per row.
+    token_decimals: TokenDecimalsCache,
 }
 
 impl Chains {
@@ -607,6 +615,65 @@ impl Chains {
     /// True the first time it is asked about `(chain_id, token)`.
     pub fn first_scale_warning(&self, chain_id: u64, token: Address) -> bool {
         self.scale_warned.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token))
+    }
+
+    /// Decimals of the LOCAL token `chain_id`'s gate pays `debridge_id` out in.
+    ///
+    /// `bridgeDecimalsFor` returns both scales of a corridor in one call, so
+    /// this is one cached read rather than a `tokenOf` + `decimals()` pair. A
+    /// gate deployed before that function (pre-H-2) falls back to the pair.
+    ///
+    /// Used for the `finalizeFallback` case (M-12): when the destination swap
+    /// fails the router delivers the bridged STABLE, which is exactly this local
+    /// token — a different token, and usually a different scale, from the
+    /// `finalToken` the user asked for.
+    pub async fn local_token_decimals(&self, chain_id: u64, debridge_id: B256) -> Option<u8> {
+        let (provider, gate) = self.gates.get(&chain_id)?;
+        let gate = Gate::new(*gate, provider);
+        match gate.bridgeDecimalsFor(debridge_id).call().await {
+            Ok(r) if r.set => return Some(r.localDecimals),
+            Ok(_) => return None,
+            Err(e) if !gate_answered(&e) => {
+                tracing::debug!(chain_id, %debridge_id, error = %e, "bridgeDecimalsFor unreadable");
+                return None;
+            }
+            // A pre-H-2 gate has no such function: ask the old way.
+            Err(_) => {}
+        }
+        let token = gate.tokenOf(debridge_id).call().await.ok()?;
+        if token == Address::ZERO {
+            return None;
+        }
+        self.token_decimals(chain_id, token).await
+    }
+
+    /// ERC-20 `decimals()` for `token` on `chain_id`.
+    ///
+    /// M-12: the swap legs of a transfer are recorded in LOCAL units of three
+    /// different tokens on two chains, and the API used to serve them beside a
+    /// wire `amount` with one `bridgeDecimals` label. Each of those figures now
+    /// declares its own scale, which means reading the token's decimals —
+    /// immutable, so cached forever, including the failure (a token that has no
+    /// `decimals()` will not grow one).
+    pub async fn token_decimals(&self, chain_id: u64, token: Address) -> Option<u8> {
+        if let Some(&d) = self.token_decimals.lock().unwrap_or_else(|e| e.into_inner()).get(&(chain_id, token)) {
+            return d;
+        }
+        let (provider, _) = self.gates.get(&chain_id)?;
+        let answer = match IERC20Mintable::new(token, provider).decimals().call().await {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::debug!(chain_id, %token, error = %e, "decimals() unreadable");
+                // A revert IS an answer: this address is not an ERC-20 we can
+                // scale. A transport failure is not, so it is not remembered.
+                if !gate_answered(&e) {
+                    return None;
+                }
+                None
+            }
+        };
+        self.token_decimals.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token), answer);
+        answer
     }
 
     /// `cancelled(submissionId)` on the destination gate.

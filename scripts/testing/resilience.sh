@@ -77,6 +77,12 @@ cast send "$TOKEN_B" "approve(address,uint256)" "$GATE_B" $AMOUNT --rpc-url $B_R
 cast send "$TOKEN_A" "mint(address,uint256)" "$GATE_A" $AMOUNT --rpc-url $A_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_A" "setLocalToken(bytes32,address)" "$DEBRIDGE_B" "$TOKEN_A" --rpc-url $A_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$A_RPC" "$KEY0" "$GATE_A"
+seal_gate "$B_RPC" "$KEY0" "$GATE_B"
+
 echo "=== ONE validator watching B+C; keeper -> A ==="
 rm -f "$LOGS"/res-*-state.json
 cat > "$LOGS/validator.toml" <<EOF

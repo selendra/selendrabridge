@@ -40,10 +40,18 @@
 # local anvil ids 1337/1338/1339 (plus 9999, which db-e2e.sh uses to prove the
 # validator allowlist blocks a chain the GATE accepts, and the Solana test id),
 # so every gate lists all of them — override with GATE_PEER_CHAINS="a b c".
-# Gates are left UNSEALED: every suite registers its corridors after deploy, and
-# they are throwaway. `seal_gate rpc key gate` is there for the ones that want
-# to exercise the sealed path. `set_bridge_decimals rpc key gate token` must run
-# for every token a gate will send or map, before setLocalToken / send / seal.
+# `deploy_gate` returns a gate in its SETUP PHASE: registration is instant, and
+# `claim` reverts with NotSealed (M-1, audit 2026-09-16). Every suite must
+# therefore call `seal_gate rpc key gate` as its LAST wiring step — after
+# set_bridge_decimals and setLocalToken, before any send/claim — which is the
+# order production uses (run.sh, deploy-from-json.sh). Suites that never claim
+# seal anyway: an unsealed destination makes a "claim reverts" assertion pass
+# for the wrong reason. `set_bridge_decimals rpc key gate token` must run for
+# every token a gate will send or map, before setLocalToken / send / seal.
+#
+# The setup phase also EXPIRES on its own (SETUP_WINDOW after deploy), so a gate
+# left unsealed does not keep one-block registration forever. That window is far
+# longer than any suite here runs.
 
 _GATE_CONTRACTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../contracts" && pwd)"
 

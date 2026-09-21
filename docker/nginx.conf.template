@@ -1,0 +1,70 @@
+# Serve the built SPA and proxy the backend calls to graphql-api same-origin.
+#
+# A TEMPLATE, not a plain conf: the nginx entrypoint runs envsubst over
+# /etc/nginx/templates/*.template at startup, which is how `connect-src` below
+# can be set per deployment without rebuilding the image.
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # --- security headers (audit 2026-09-16, M-16) ---------------------------
+    #
+    # This page hand-encodes `Gate.send` calldata and asks a wallet to sign it.
+    # One injected script could re-target a transfer to its own receiver, and
+    # nothing here set a single header. `always` so they are sent on error
+    # responses too, not just 200s.
+    #
+    # `script-src 'self'` is the directive that matters, and the Vite build is
+    # compatible with it as-is: `dist/index.html` references one module bundle
+    # by src and carries no inline script. Keep it that way — an inline script
+    # would need a hash or a nonce, never 'unsafe-inline'.
+    #
+    # `style-src 'self'` blocks remote and injected <style>, while
+    # `style-src-attr 'unsafe-inline'` allows the two `style={{…}}` attributes
+    # the UI uses for layout. Splitting them keeps stylesheet injection blocked;
+    # a style ATTRIBUTE cannot execute script in any browser this app supports.
+    #
+    # `connect-src` is the one directive a static policy cannot pin: the RPC
+    # endpoints come from the chain registry the API serves at runtime. The
+    # default allows any HTTPS/WSS origin plus loopback (local anvil/validator
+    # stacks), which stops plaintext exfiltration to an attacker's http:// host
+    # but not an https:// one. A deployment that knows its endpoints should
+    # narrow it — set BRIDGE_CSP_CONNECT_SRC to an explicit list, e.g.
+    #   BRIDGE_CSP_CONNECT_SRC="'self' https://eth-sepolia.example https://api.devnet.solana.com"
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ${BRIDGE_CSP_CONNECT_SRC}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'; manifest-src 'self'" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    # Matches the production Caddyfile, which sets this one at the edge — two
+    # topologies disagreeing about the same header is a debugging trap.
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=()" always;
+
+    # SPA history fallback — unknown routes serve index.html.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # GraphQL + health go to the API service on the compose network.
+    #
+    # Docker's embedded DNS, and the upstream held in a VARIABLE on purpose:
+    # with a literal host nginx resolves it once at startup and keeps the
+    # address forever, so recreating the API container (a new IP) leaves the UI
+    # serving 502s until someone restarts nginx too. A variable forces
+    # re-resolution per request, which is what makes the stack survive a
+    # redeploy of just the API.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    location /graphql {
+        set $api http://graphql-api:8088;
+        proxy_pass $api/graphql;
+        proxy_set_header Host $host;
+        proxy_http_version 1.1;
+    }
+    location /health {
+        set $api_health http://graphql-api:8088;
+        proxy_pass $api_health/health;
+    }
+}

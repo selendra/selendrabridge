@@ -175,6 +175,10 @@ contract SwapRouter is ReentrancyGuard {
         uint256 amount;
         address to;
         uint256 readyAt;
+        /// @dev The free stable (balance minus {owedStable}) at SCHEDULE time —
+        ///      the ceiling the execution is held to. See {executeStableRescue}
+        ///      and finding M-14.
+        uint256 freeAtSchedule;
     }
 
     StableRescue public pendingStableRescue;
@@ -508,15 +512,20 @@ contract SwapRouter is ReentrancyGuard {
     /// @dev    Stable strands here only when a transfer arrives with an intent that
     ///         can never `finalize` (malformed `autoParams`, zero receiver) — that
     ///         is what this is for. Schedule the amount identified as stranded, not
-    ///         the whole balance: the delay lets every claimed-but-unobserved
-    ///         transfer be finalized or deferred first, but a transfer claimed in
-    ///         the last moments before execution is still only protected by the
-    ///         owner checking the indexer for `Claimed`-without-`Finalized`.
+    ///         the whole balance.
+    /// @dev    The free balance is SNAPSHOT here and caps the payout (M-14): a
+    ///         transfer that lands after this moment can never be part of the
+    ///         sweep, however fat it is and however late in the window the owner
+    ///         fires. See {executeStableRescue}.
     function scheduleStableRescue(uint256 amount, address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         uint256 readyAt = block.timestamp + STABLE_RESCUE_DELAY;
-        pendingStableRescue = StableRescue({amount: amount, to: to, readyAt: readyAt});
+        uint256 balance = IERC20(stable).balanceOf(address(this));
+        uint256 freeNow = balance > owedStable ? balance - owedStable : 0;
+        if (amount > freeNow) revert RescueWouldTakeOwedFunds(amount, freeNow);
+        pendingStableRescue =
+            StableRescue({amount: amount, to: to, readyAt: readyAt, freeAtSchedule: freeNow});
         emit StableRescueScheduled(amount, to, readyAt);
     }
 
@@ -529,9 +538,31 @@ contract SwapRouter is ReentrancyGuard {
         emit StableRescueCancelled(msg.sender);
     }
 
-    /// @notice Execute the matured stable sweep. Pays at most what is not owed to
-    ///         a deferred delivery ({owedStable}) at THIS moment, and only inside
+    /// @notice Execute the matured stable sweep, inside
     ///         [readyAt, readyAt + {STABLE_RESCUE_WINDOW}].
+    ///
+    /// @dev    Pays at most the LESSER of what was free when the sweep was
+    ///         announced and what is free now.
+    ///
+    ///         FINDING M-14. Only the second test existed, and it is evaluated at
+    ///         execution time, so everything that arrived during the delay counted
+    ///         as sweepable: the owner held a matured schedule and fired it the
+    ///         instant a fat transfer landed. `gate.executed[submissionId]` is
+    ///         already set for that transfer, so `finalize` reverts for ever and
+    ///         the two-phase refund cannot recover it either — gone from both
+    ///         ends, which is precisely what {owedStable} exists to prevent. The
+    ///         snapshot bounds the sweep to funds that were already stranded when
+    ///         the notice became public, which is the only thing a rescue is for.
+    ///
+    ///         Which test actually bites: {scheduleStableRescue} already refuses
+    ///         an amount larger than the free balance AT THAT MOMENT, so that is
+    ///         the check that closes the hole, and it closes it early — while the
+    ///         owner can still correct the figure. The snapshot here is the same
+    ///         bound restated where the funds actually move, so the property
+    ///         survives a future change that loosens the announcement path; on
+    ///         today's code it is redundant rather than load-bearing. The live
+    ///         {owedStable} test is NOT redundant: it catches stable that became
+    ///         owed during the delay.
     function executeStableRescue() external onlyOwner {
         StableRescue memory r = pendingStableRescue;
         if (r.readyAt == 0) revert StableRescueNotScheduled();
@@ -541,6 +572,7 @@ contract SwapRouter is ReentrancyGuard {
 
         uint256 balance = IERC20(stable).balanceOf(address(this));
         uint256 free = balance > owedStable ? balance - owedStable : 0;
+        if (r.freeAtSchedule < free) free = r.freeAtSchedule;
         if (r.amount > free) revert RescueWouldTakeOwedFunds(r.amount, free);
 
         IERC20(stable).safeTransfer(r.to, r.amount);

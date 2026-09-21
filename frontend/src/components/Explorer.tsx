@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { StatusBadge, RefundBadge } from "./StatusBadge";
 import { Glyph, Refresh, ArrowRight, Search } from "./icons";
-import { chainViz, formatUnits, shortHex } from "../data/format";
+import { chainViz, formatWireAmount, shortHex, wireAmountTitle } from "../data/format";
 import { fetchHistory, fetchStats, fetchSubmissions, fetchSwapHistory } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type {
@@ -14,15 +14,19 @@ import type {
   SwapHistoryEntry,
 } from "../api/types";
 import { SubmissionDetail } from "./SubmissionDetail";
-import { useChainDecimals, type DecimalsProvider } from "./useChainDecimals";
 
 interface ExplorerProps {
   chains: Chain[];
   initialFilter?: SubmissionFilter;
-  /** Connected wallet, used to read token decimals on a chain the registry
-   *  publishes no `rpcUrl` for (H-4: the API never serves a keyed url). */
-  wallet?: DecimalsProvider | null;
 }
+
+/*
+ * No wallet, and no `decimals()` reads: every amount this view renders now
+ * arrives with its own scale from the API (M-11/M-12). The explorer used to
+ * read ERC-20 decimals per chain over RPC and apply them to amounts that were
+ * in a different scale entirely — the reads were both wrong and, on a non-EVM
+ * chain, impossible.
+ */
 
 const ANY = "any";
 
@@ -37,7 +41,7 @@ function ChainCell({ chains, id }: { chains: Chain[]; id: number }) {
   );
 }
 
-export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
+export function Explorer({ chains, initialFilter }: ExplorerProps) {
   const [from, setFrom] = useState<string>(
     initialFilter?.chainIdFrom != null ? String(initialFilter.chainIdFrom) : ANY
   );
@@ -67,7 +71,6 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
 
   const stats = usePoll<Stats>(() => fetchStats(), [], 5000);
   const subs = usePoll<Submission[]>(() => fetchSubmissions(filter), [from, to, readyOnly], 5000);
-  const decimalsByChain = useChainDecimals(chains, wallet);
 
   // Best-effort: the DB-backed history/swap views only exist when graphql-api
   // was started with --store-url. Swallow failures into an empty list instead of
@@ -86,7 +89,11 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
 
   const swapChainId = from === ANY ? undefined : Number(from);
   const swaps = usePoll<SwapHistoryEntry[]>(
-    () => (tab === "swaps" ? fetchSwapHistory(swapChainId, 100).catch(() => []) : Promise.resolve([])),
+    // No `.catch(() => [])` here: a failing query used to render as "no swaps
+    // recorded yet", which is what an API too old to serve the per-token scale
+    // fields looks like. An error must say so — an empty tab is a claim about
+    // the chain, not about the backend.
+    () => (tab === "swaps" ? fetchSwapHistory(swapChainId, 100) : Promise.resolve([])),
     [tab, swapChainId],
     5000
   );
@@ -210,8 +217,12 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
                         <ChainCell chains={chains} id={sub.chainIdTo} />
                       </span>
                     </td>
-                    <td className="tbl__amount">
-                      {formatUnits(sub.amount, sub.bridgeDecimals ?? decimalsByChain[sub.chainIdFrom] ?? 18)}
+                    <td
+                      className={"tbl__amount" + (sub.bridgeDecimals == null ? " tbl__amount--raw" : "")}
+                      title={wireAmountTitle(sub.amount, sub.bridgeDecimals)}
+                      data-testid="submission-amount"
+                    >
+                      {formatWireAmount(sub.amount, sub.bridgeDecimals)}
                     </td>
                     <td className="tbl__num">{sub.nonce}</td>
                     <td className="tbl__num">
@@ -275,8 +286,24 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
                     {shortHex(sw.tokenIn, 6, 4)} <ArrowRight size={11} className="route-cell__arrow" />{" "}
                     {shortHex(sw.tokenOut, 6, 4)}
                   </td>
-                  <td className="tbl__amount">{formatUnits(sw.amountIn, decimalsByChain[sw.chainId] ?? 18)}</td>
-                  <td className="tbl__amount">{formatUnits(sw.amountOut, decimalsByChain[sw.chainId] ?? 18)}</td>
+                  {/* A swap crosses two tokens, so each amount is scaled by its
+                      OWN token. The chain's default-token decimals used to
+                      scale both, which is right only when the pool happens to
+                      trade that token against another of equal width. */}
+                  <td
+                    className={"tbl__amount" + (sw.amountInDecimals == null ? " tbl__amount--raw" : "")}
+                    title={wireAmountTitle(sw.amountIn, sw.amountInDecimals, "this token's decimals")}
+                    data-testid="swap-amount-in"
+                  >
+                    {formatWireAmount(sw.amountIn, sw.amountInDecimals)}
+                  </td>
+                  <td
+                    className={"tbl__amount" + (sw.amountOutDecimals == null ? " tbl__amount--raw" : "")}
+                    title={wireAmountTitle(sw.amountOut, sw.amountOutDecimals, "this token's decimals")}
+                    data-testid="swap-amount-out"
+                  >
+                    {formatWireAmount(sw.amountOut, sw.amountOutDecimals)}
+                  </td>
                   <td className="tbl__mono">{shortHex(sw.txHash, 8, 6)}</td>
                   <td>{new Date(sw.createdAt).toLocaleString()}</td>
                 </tr>
@@ -284,7 +311,11 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
               {(swaps.data ?? []).length === 0 && (
                 <tr>
                   <td colSpan={7} className="tbl__empty">
-                    {swaps.loading ? "Loading…" : "No same-chain swaps recorded yet."}
+                    {swaps.loading
+                      ? "Loading…"
+                      : swaps.error
+                        ? `Couldn’t load swaps: ${swaps.error}`
+                        : "No same-chain swaps recorded yet."}
                   </td>
                 </tr>
               )}
@@ -294,7 +325,7 @@ export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
       )}
 
       {selected && (
-        <SubmissionDetail submissionId={selected} chains={chains} wallet={wallet} onClose={() => setSelected(null)} />
+        <SubmissionDetail submissionId={selected} chains={chains} onClose={() => setSelected(null)} />
       )}
     </section>
   );

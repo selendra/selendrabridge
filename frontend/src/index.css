@@ -1140,6 +1140,15 @@ body {
 .tbl__amount {
   font-weight: 600;
 }
+/* An amount whose scale the API could not name (M-11): shown as raw base units,
+   in the monospace the rest of the UI uses for unformatted values, so it does
+   not read as a token amount with a misplaced decimal point. */
+.tbl__amount--raw,
+.unit-unknown {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 500;
+  color: var(--muted);
+}
 .tbl__mono {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 13px;

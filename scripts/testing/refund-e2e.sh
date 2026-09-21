@@ -142,6 +142,15 @@ fi
 # before any conversion. The destination stays deliberately unregistered.
 set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
 
+# M-1: `claim` reverts on an unsealed gate. Sealing BOTH gates here is not
+# cosmetic: the destination is deliberately left with no `setLocalToken`, and an
+# UNSEALED destination would make the "claim() after cancel reverts" assertions
+# below pass for the wrong reason (NotSealed, not the burn). Sealed, the revert
+# is caused by the cancel — which is the property under test.
+echo "=== sealing gates (claim requires it; keeps the no-double-spend check honest) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 echo "=== locking funds on the source ==="
 cast send "$TOKEN_SRC" "mint(address,uint256)" "$ACC0" "$AMOUNT" \
   --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

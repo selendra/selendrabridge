@@ -52,6 +52,9 @@ contract ClaimTest is Test {
         // register the asset: claims of `debridgeId` release `token`
         debridgeId = BridgeHash.getDebridgeId(CHAIN_FROM, address(0x1234));
         gate.setLocalToken(debridgeId, address(token));
+        // Wiring done: production seals BEFORE liquidity, and `claim` now
+        // requires it (M-1).
+        gate.seal();
     }
 
     // --- helpers ---

@@ -138,6 +138,8 @@ contract SwapRouterTest is Test {
         // the mapping on B and pre-fund gateB with target-side stable liquidity.
         bytes32 stableDid = BridgeHash.getDebridgeId(CHAIN_A, address(usdA));
         gateB.setLocalToken(stableDid, address(usdB));
+        gateA.seal();
+        gateB.seal();
         usdB.mint(address(gateB), 10_000_000e6);
     }
 
@@ -604,13 +606,13 @@ contract SwapRouterTest is Test {
         vm.expectRevert(SwapRouter.StableRescueRequiresSchedule.selector);
         routerB.rescue(address(usdB), leg.amount, address(this));
 
-        // The scheduled path matures but still cannot touch the owed balance.
-        routerB.scheduleStableRescue(leg.amount, address(this));
-        vm.warp(block.timestamp + routerB.STABLE_RESCUE_DELAY());
+        // The scheduled path cannot even be ANNOUNCED for an owed balance: since
+        // M-14 the free balance is checked when the notice is filed, not only
+        // when it is fired.
         vm.expectRevert(
             abi.encodeWithSelector(SwapRouter.RescueWouldTakeOwedFunds.selector, leg.amount, 0)
         );
-        routerB.executeStableRescue();
+        routerB.scheduleStableRescue(leg.amount, address(this));
 
         // Genuine dust on top of the owed balance is sweepable — after its own delay.
         usdB.mint(address(routerB), 5e6);
@@ -651,7 +653,7 @@ contract SwapRouterTest is Test {
 
         // The owner mistakes the whole balance for dust.
         routerB.scheduleStableRescue(leg.amount, address(this));
-        (uint256 amt, address to, uint256 readyAt) = routerB.pendingStableRescue();
+        (uint256 amt, address to, uint256 readyAt,) = routerB.pendingStableRescue();
         assertEq(amt, leg.amount);
         assertEq(to, address(this));
         assertEq(readyAt, block.timestamp + 48 hours);
@@ -677,11 +679,74 @@ contract SwapRouterTest is Test {
         routerB.executeStableRescue();
     }
 
+    /// M-14. `free` was only ever evaluated at EXECUTION time, so everything that
+    /// landed during the 48 h delay counted as sweepable: the owner banks a
+    /// schedule sized for a transfer that has not arrived yet, waits, and fires
+    /// the moment it does. `gate.executed[submissionId]` is already set by then,
+    /// so `finalize` reverts for ever and the two-phase refund cannot recover it
+    /// either — the transfer is gone from both ends.
+    function test_Rescue_CannotBeSizedForATransferThatHasNotArrivedYet() public {
+        vm.chainId(CHAIN_B);
+        usdB.mint(address(routerB), 5e6); // the genuinely stranded dust
+
+        // The sweep the owner WANTS is the size of the incoming transfer, not of
+        // the dust in front of them. Before the fix this scheduled happily.
+        uint256 incoming = poolA.quote(address(weth), address(usdA), 1e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(SwapRouter.RescueWouldTakeOwedFunds.selector, incoming, 5e6)
+        );
+        routerB.scheduleStableRescue(incoming, address(this));
+
+        // Only what is demonstrably free right now can be announced.
+        routerB.scheduleStableRescue(5e6, address(this));
+    }
+
+    /// The outcome M-14 is about, from the user's side. A regression guard rather
+    /// than an exploit: it passes on the old code too, because the sweep is also
+    /// capped by the announced amount. What it pins is that the honest path still
+    /// works after the fix — the dust is swept, the transfer that landed during
+    /// the delay is untouched, and it still delivers.
+    function test_Rescue_PaysOnlyWhatWasFreeWhenTheNoticeWasFiled() public {
+        vm.chainId(CHAIN_B);
+        usdB.mint(address(routerB), 5e6);
+        routerB.scheduleStableRescue(5e6, address(this));
+        (,, uint256 readyAt,) = routerB.pendingStableRescue();
+
+        // A fat transfer is claimed into the router during the delay. Nobody has
+        // called `finalize`, so `owedStable` still knows nothing about it — the
+        // execution-time check alone would see it as free.
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+        assertEq(routerB.owedStable(), 0, "invisible to owedStable");
+        assertEq(usdB.balanceOf(address(routerB)), 5e6 + leg.amount, "and sitting in the balance");
+
+        vm.warp(readyAt);
+        uint256 before = usdB.balanceOf(address(this));
+        routerB.executeStableRescue();
+        assertEq(usdB.balanceOf(address(this)), before + 5e6, "only the announced dust");
+        assertEq(usdB.balanceOf(address(routerB)), leg.amount, "the transfer is untouched");
+
+        // And it still delivers, which is the outcome the sweep would have made
+        // impossible for ever. (The pool's price aged past `maxPriceAge` over the
+        // two days of delay, so the oracle refreshes it first, exactly as the
+        // keeper would.)
+        poolB.setPrice(address(tt), TT_PRICE);
+        vm.prank(address(0xDEAD));
+        routerB.finalize(
+            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(tt.balanceOf(finalReceiver), 1590e18, "user still paid in TT");
+    }
+
     function test_Rescue_ScheduledStable_ExpiresAfterTheWindow() public {
         vm.chainId(CHAIN_B);
         usdB.mint(address(routerB), 7e6); // genuine dust
         routerB.scheduleStableRescue(7e6, address(this));
-        (,, uint256 readyAt) = routerB.pendingStableRescue();
+        (,, uint256 readyAt,) = routerB.pendingStableRescue();
 
         vm.warp(readyAt + routerB.STABLE_RESCUE_WINDOW() + 1);
         vm.expectRevert(abi.encodeWithSelector(SwapRouter.StableRescueExpired.selector, readyAt));
@@ -692,7 +757,7 @@ contract SwapRouterTest is Test {
         vm.warp(block.timestamp + routerB.STABLE_RESCUE_DELAY());
         routerB.executeStableRescue();
         assertEq(usdB.balanceOf(address(routerB)), 0, "dust must be swept");
-        (,, uint256 cleared) = routerB.pendingStableRescue();
+        (,, uint256 cleared,) = routerB.pendingStableRescue();
         assertEq(cleared, 0, "schedule must be consumed");
 
         vm.expectRevert(SwapRouter.StableRescueNotScheduled.selector);
@@ -703,6 +768,8 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         address g = address(0x6A4D);
         routerB.setGuardian(g);
+        // Something must actually be free to schedule against (M-14).
+        usdB.mint(address(routerB), 1e6);
         routerB.scheduleStableRescue(1e6, address(this));
 
         vm.prank(address(0xBAD));
@@ -711,7 +778,7 @@ contract SwapRouterTest is Test {
 
         vm.prank(g);
         routerB.cancelStableRescue();
-        (,, uint256 readyAt) = routerB.pendingStableRescue();
+        (,, uint256 readyAt,) = routerB.pendingStableRescue();
         assertEq(readyAt, 0, "cancel must clear the schedule");
 
         vm.expectRevert(SwapRouter.StableRescueNotScheduled.selector);

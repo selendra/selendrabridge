@@ -97,11 +97,22 @@ cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $TWICE --rpc-url $
 cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" $TWICE --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 echo "=== starting Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+# M-9 (audit 2026-09-16): publish the database on LOOPBACK only. A docker `-p`
+# publish writes its own DNAT rule and bypasses ufw/firewalld, so a bare
+# `-p 5433:5432` with POSTGRES_PASSWORD=bridge hands this database — signatures,
+# allowlists, cursors — to anyone who can reach the host. The launchers were
+# fixed in round 4; these harnesses were not.
 docker run -d --name "$PG_NAME" \
   -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
-  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+  -p 127.0.0.1:${PG_PORT}:5432 postgres:16-alpine >/dev/null
 for i in $(seq 1 60); do
   docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break
   sleep 0.5; [[ $i == 60 ]] && fail "Postgres did not become ready"

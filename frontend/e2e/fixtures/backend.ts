@@ -70,6 +70,9 @@ export interface BackendOptions {
   history?: unknown[];
   submissions?: unknown[];
   swapHistory?: unknown[];
+  /** Make `swapHistory` answer with a GraphQL error, as an API too old to
+   *  serve the per-token scale fields does. */
+  swapHistoryError?: string;
   stats?: unknown;
 }
 
@@ -133,6 +136,15 @@ export async function mockBackend(page: Page, options: BackendOptions = {}): Pro
         body: JSON.stringify({ data: payload }),
       });
 
+    // A GraphQL error is served with HTTP 200 and an `errors` array — which is
+    // what an API too old for a field the UI asks for returns.
+    const errors = (message: string) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ errors: [{ message }] }),
+      });
+
     if (q.includes("chains {")) return data({ chains: o.chains ?? CHAINS });
     if (q.includes("stats {")) {
       return data({
@@ -178,7 +190,10 @@ export async function mockBackend(page: Page, options: BackendOptions = {}): Pro
     if (q.includes("solanaSignatureStatus(")) {
       return data({ solanaSignatureStatus: o.solanaSignatureStatus ?? "confirmed" });
     }
-    if (q.includes("swapHistory(")) return data({ swapHistory: o.swapHistory ?? [] });
+    if (q.includes("swapHistory(")) {
+      if (o.swapHistoryError) return errors(o.swapHistoryError);
+      return data({ swapHistory: o.swapHistory ?? [] });
+    }
     if (q.includes("submission(submissionId")) {
       const id = String(body.variables?.id ?? "");
       const status = o.submissionStatus?.[id.toLowerCase()];

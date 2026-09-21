@@ -163,6 +163,11 @@ export interface SwapHistoryEntry {
   tokenOut: string;
   amountIn: string;
   amountOut: string;
+  /** Decimals of `tokenIn`/`tokenOut` respectively — a swap crosses two tokens,
+   *  so the two amounts are in DIFFERENT scales and neither is "the chain's".
+   *  Null when the API could not read that token; show the raw integer then. */
+  amountInDecimals: number | null;
+  amountOutDecimals: number | null;
   blockNumber: number;
   createdAt: string;
 }

@@ -94,6 +94,29 @@ contract DeployProd is Script {
         console2.log("  guardian:", gate.guardian());
         console2.log("  pendingOwner (accept from multisig):", gate.pendingOwner());
         console2.log("  isSealed (seal() after wiring corridors, before funding):", gate.isSealed());
+        console2.log("  setupDeadline (instant registration ends here regardless):", gate.setupDeadline());
+        console2.log("  NEXT: wire corridors, seal(), THEN fund. `claim` refuses an unsealed gate.");
+    }
+
+    /// @notice Run this against the wired gate BEFORE provisioning liquidity, and
+    ///         again after funding. Reverts unless the gate is in the only state a
+    ///         funded gate may be in.
+    ///
+    /// @dev    Finding M-1. The deploy script asserted seven invariants and merely
+    ///         LOGGED this one, because {seal} necessarily happens later: ownership
+    ///         has already moved to the multisig, and corridors are wired after
+    ///         that. So the check belongs to a step the operator runs at funding
+    ///         time, which is the moment the property starts to matter. The Gate
+    ///         now enforces it too — `claim` refuses an unsealed gate — so this is
+    ///         the early, loud version of a failure the bridge would otherwise
+    ///         only show when the first transfer could not be paid out.
+    function assertReadyForLiquidity(Gate gate) public view {
+        require(gate.isSealed(), "pre-funding: gate is not sealed");
+        require(!gate.inSetupPhase(), "pre-funding: still in the setup phase");
+        require(gate.owner() != address(0), "pre-funding: no owner");
+        require(gate.pendingOwner() == address(0), "pre-funding: ownership handover incomplete");
+        require(gate.guardian() != address(0), "pre-funding: no guardian");
+        require(!gate.paused(), "pre-funding: gate is paused");
     }
 
     /// @dev Deploy + configure + assert. Public so tests can exercise it; the

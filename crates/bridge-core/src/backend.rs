@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::allow::Allowlist;
+use crate::allow::AllowlistView;
 use crate::remote::RemoteStore;
 use crate::store::{self, SigKind, SignerSig, SubmissionRecord};
 
@@ -187,13 +187,20 @@ impl StoreBackend {
         }
     }
 
-    /// The current allowlists, or `None` in legacy file mode (no central
-    /// allowlist ⇒ enforcement disabled). Refetched per tick by its callers, so
-    /// an operator's change applies without a restart.
-    pub async fn fetch_allowlist(&self) -> anyhow::Result<Option<Allowlist>> {
+    /// What the store currently serves for the allowlists. Refetched per tick by
+    /// its callers, so an operator's change applies without a restart.
+    ///
+    /// Returns the three cases apart (audit 2026-09-16, M-5): an EMPTY list from
+    /// the store is not the same fact as there being no central allowlist, even
+    /// though both end up meaning "allow everything" by default. The caller
+    /// applies its [`AllowlistPolicy`] to decide which of them it will act on.
+    pub async fn fetch_allowlist(&self) -> anyhow::Result<AllowlistView> {
         match self {
-            StoreBackend::File { .. } => Ok(None),
-            StoreBackend::Remote(remote) => Ok(Some(remote.allowlist().await?)),
+            StoreBackend::File { .. } => Ok(AllowlistView::NotConfigured),
+            StoreBackend::Remote(remote) => {
+                let list = remote.allowlist().await?;
+                Ok(if list.is_empty() { AllowlistView::Empty } else { AllowlistView::Enforcing(list) })
+            }
         }
     }
 

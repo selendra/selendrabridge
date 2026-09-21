@@ -23,6 +23,28 @@ FRONTEND="$ROOT/frontend"
 CONFIG="${1:-$ROOT/scripts/run.config}"
 
 [[ -f "$CONFIG" ]] || { echo "config file not found: $CONFIG" >&2; exit 1; }
+
+# M-8 (audit 2026-09-16): this config is BASH — it carries arrays (`CHAINS`,
+# `PUBLIC_RPCS`, `CONFIRMATIONS`), so sourcing it is the format, not an
+# oversight, and everything in it runs as you. The JSON-driven launcher is
+# scripts/bridge-from-json.sh; use that when the config is data you did not
+# write. What this checks is the thing that actually goes wrong: a config file
+# somewhere another user can write, which turns `run.sh` into their shell. Same
+# ownership rule as `scripts/testing/_rundir.sh:rundir_trusted`, inline because
+# run.sh does not depend on the test helpers.
+config_trusted() { # $1 file
+  local f="$1" d owner mode
+  [[ ! -L "$f" ]] || { echo "ERROR: $f is a symlink — refusing to source it" >&2; return 1; }
+  d="$(cd "$(dirname -- "$f")" && pwd)"
+  for target in "$f" "$d"; do
+    owner="$(stat -c %u -- "$target")"; mode="$(stat -c %a -- "$target")"
+    [[ "$owner" == "$(id -u)" || "$owner" == 0 ]] \
+      || { echo "ERROR: $target is owned by uid $owner, not you — refusing to source $f" >&2; return 1; }
+    (( (8#$mode & 8#022) == 0 )) \
+      || { echo "ERROR: $target is group/world-writable (mode $mode) — anyone who can write it runs code as you; refusing to source $f" >&2; return 1; }
+  done
+}
+config_trusted "$CONFIG" || exit 1
 # shellcheck disable=SC1090
 source "$CONFIG"
 
@@ -52,17 +74,30 @@ info() { printf '  %s\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Long-lived service, detached so it survives this shell. $1 command, $2 logfile.
+# Long-lived service, detached so it survives this shell.
 #
 # The pid is recorded by the process ITSELF (`$$` inside the setsid'd shell,
 # which then execs into the service), so the file names the real service pid
 # even when setsid had to fork. `stop.sh` kills exactly these process groups and
 # nothing else — no more `pkill -f vite` (audit round 4, LOW).
+# M-8 (audit 2026-09-16): takes ARGV, never a command string. It used to be
+# `bash -c "exec $1"` with $1 built from config values, so a host/port/name
+# carrying `$(…)` ran as the operator during expansion — the config file is
+# presented as pure data and is partly rewritten by deploy-from-json.sh.
+# The -c script below is a FIXED literal; every datum arrives as a positional.
+#
+#   spawn <logfile> -- <command> [args...]
 spawn() {
-  local name="${2%.log}"
+  local log="$1"; shift
+  [[ "${1:-}" == "--" ]] || die "spawn: expected -- before the command (internal error)"
+  shift
+  local name="${log%.log}"
   local pidfile="$RUN_DIR/pids/$name.pid"
-  printf '%s\n' "$1" > "$RUN_DIR/pids/$name.cmd"
-  setsid bash -c "echo \$\$ > '$pidfile'; exec $1" >"$RUN_DIR/$2" 2>&1 </dev/null & disown || true
+  # Recorded for stop.sh's `ours()`, which only ever TOKENISES this to match
+  # /proc/<pid>/cmdline. It is never executed.
+  printf '%s\n' "$*" > "$RUN_DIR/pids/$name.cmd"
+  setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pidfile" "$@" \
+    >"$RUN_DIR/$log" 2>&1 </dev/null & disown || true
 }
 need()  { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH (needed for: $2)"; }
 rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
@@ -261,7 +296,7 @@ if [[ "$LOCAL_ANVIL" == "true" ]]; then
   say "booting $N anvil chain(s)"
   for i in "${!CID[@]}"; do
     port="${CRPC[$i]##*:}"
-    spawn "anvil --chain-id ${CID[$i]} --port $port --host 127.0.0.1 --silent --block-time ${ANVIL_BLOCK_TIME:-1}" "anvil-${CID[$i]}.log"
+    spawn "anvil-${CID[$i]}.log" -- anvil --chain-id "${CID[$i]}" --port "$port" --host 127.0.0.1 --silent --block-time "${ANVIL_BLOCK_TIME:-1}"
     info "${CNAME[$i]} (${CID[$i]}) on :$port"
   done
 fi
@@ -500,6 +535,9 @@ if [[ "$SEAL_GATES" == "true" ]]; then
   done
 else
   warn "SEAL_GATES=false: gates stay in the setup phase (setLocalToken instant). Dev only."
+  warn "  NOTE (M-1): since the 2026-09-21 contracts, \`claim\` REVERTS on an unsealed gate, so a"
+  warn "  mesh left this way will sign transfers it can never pay out. The setup phase also"
+  warn "  expires on its own 7 days after deploy."
 fi
 
 # --- 4b-iv. assert the wiring, so a half-configured mesh never comes up ------
@@ -598,8 +636,13 @@ if [[ "$PG_DOCKER" == "true" ]]; then
   # one this run dir already generated (it must match the volume's), else fresh.
   PG_PASSWORD="${PG_PASSWORD:-$(prev_token PG_PASSWORD)}"
   [[ -n "$PG_PASSWORD" ]] || PG_PASSWORD="$(rand_token)"
+  # M-8: the password goes in through a 0600 --env-file, not on the command
+  # line. Every argv on this host is world-readable via /proc/*/cmdline, which
+  # this script already avoids for RPC keys and store tokens.
+  PG_ENV="$RUN_DIR/postgres.env"
+  ( umask 077; printf 'POSTGRES_USER=bridge\nPOSTGRES_DB=bridge\nPOSTGRES_PASSWORD=%s\n' "$PG_PASSWORD" > "$PG_ENV" )
   docker run -d --name "$PG_NAME" \
-    -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=bridge \
+    --env-file "$PG_ENV" \
     -v "${PG_NAME}-data:/var/lib/postgresql/data" \
     -p "127.0.0.1:${PG_PORT}:5432" postgres:16-alpine >/dev/null || die "failed to start Postgres container"
   ok=false
@@ -609,8 +652,14 @@ if [[ "$PG_DOCKER" == "true" ]]; then
   # from an earlier run (or from before this change, when the password was
   # `bridge`) keeps its old one, so set it explicitly over the container's local
   # socket (trust auth) — no more "password authentication failed" on upgrade.
-  docker exec "$PG_NAME" psql -q -U bridge -d bridge \
-    -c "ALTER USER bridge WITH PASSWORD '$PG_PASSWORD';" >/dev/null 2>&1 \
+  # M-8: the statement arrives on STDIN, so the password is in NO argv — not
+  # psql's, not docker's (`docker exec -e PGPW=…` would put it back on the host
+  # command line). The literal is quoted by doubling any `'`, which is all
+  # standard_conforming_strings needs, so a password of `x'; ALTER USER bridge
+  # SUPERUSER; --` can no longer close the literal and run its own statement.
+  pg_literal() { printf "'%s'" "${1//\'/\'\'}"; }
+  printf 'ALTER USER bridge WITH PASSWORD %s;\n' "$(pg_literal "$PG_PASSWORD")" \
+    | docker exec -i "$PG_NAME" psql -q -U bridge -d bridge -f - >/dev/null 2>&1 \
     || warn "could not set the Postgres password on the existing volume"
   DATABASE_URL="postgres://bridge:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/bridge?sslmode=disable"
   info "Postgres ready on 127.0.0.1:$PG_PORT (password in $TOKENS_ENV)"
@@ -646,7 +695,7 @@ chmod 600 "$TOKENS_ENV"
 
 say "starting sig-store ($STORE_URL)"
 SIG_STORE_BIND="$BIND_HOST:$STORE_PORT" DATABASE_URL="$DATABASE_URL" \
-  spawn "$ROOT/target/debug/sig-store" sig-store.log
+  spawn sig-store.log -- "$ROOT/target/debug/sig-store"
 ok=false
 for _ in $(seq 1 60); do curl -s "$STORE_URL/health" | grep -q ok && { ok=true; break; }; sleep 0.25; done
 $ok || die "sig-store did not come up (see $RUN_DIR/sig-store.log)"
@@ -720,7 +769,7 @@ for key in "${VALIDATOR_KEYS[@]}"; do
       done
     fi
   } > "$cfg"
-  spawn "$ROOT/target/debug/validator $cfg" "validator-$vi.log"
+  spawn "validator-$vi.log" -- "$ROOT/target/debug/validator" "$cfg"
 done
 
 # ---------------------------------------------------------------------------
@@ -740,7 +789,7 @@ kcfg="$RUN_DIR/keeper.toml"
     emit_sources sources
   fi
 } > "$kcfg"
-spawn "$ROOT/target/debug/keeper $kcfg" keeper.log
+spawn keeper.log -- "$ROOT/target/debug/keeper" "$kcfg"
 
 # ---------------------------------------------------------------------------
 # 9. indexer (history + refund eligibility) over ALL chains
@@ -768,7 +817,7 @@ if [[ "$ENABLE_INDEXER" == "true" ]]; then
       echo "max_block_range = $MAX_BLOCK_RANGE"
     done
   } > "$icfg"
-  spawn "$ROOT/target/debug/indexer $icfg" indexer.log
+  spawn indexer.log -- "$ROOT/target/debug/indexer" "$icfg"
 fi
 
 # ---------------------------------------------------------------------------
@@ -783,32 +832,39 @@ say "starting graphql-api ($GQL_BIND)"
 # after the listings, finds nothing, and the Swap view renders a pool with zero
 # tokens. Hence its own knob, defaulting to the chain's floor.
 : "${SWAP_FROM_BLOCK:=$(start_block_for "$SWAP_CHAIN" "${CRPC[$swap_idx]}")}"
+# M-8 (audit 2026-09-16): built with jq, never by pasting values between literal
+# quotes. A chain name, symbol or url containing a `"` used to close the string
+# and rewrite the registry the API and the UI both trust — and `--argjson` for
+# the numbers means a non-numeric chain_id/block fails here rather than being
+# emitted as bare JSON garbage.
 {
-  echo "["
   for i in "${!CID[@]}"; do
-    sep=","; [[ $i == $((N-1)) ]] && sep=""
     # per-chain token list from ASSETS (symbol + address), for the UI's picker
-    toks=""
-    for sym in "${ASYMS[@]}"; do
-      t="${ATOKEN[$sym|${CID[$i]}]:-}"
-      [[ -n "$t" ]] || continue
-      [[ -n "$toks" ]] && toks+=", "
-      toks+="{\"symbol\": \"$sym\", \"address\": \"$t\"}"
-    done
+    toks="$(
+      for sym in "${ASYMS[@]}"; do
+        t="${ATOKEN[$sym|${CID[$i]}]:-}"
+        [[ -n "$t" ]] || continue
+        jq -n --arg symbol "$sym" --arg address "$t" '{$symbol, $address}'
+      done | jq -s '.'
+    )"
     # `rpc_url` is what the API itself calls (server-side, may carry a key);
     # `public_rpc_url` is the only one it ever serves to a browser (H-4).
     pub="$(public_rpc_for "${CID[$i]}" "${CRPC[$i]}")"
-    pubf=""; [[ -n "$pub" ]] && pubf=", \"public_rpc_url\": \"$pub\""
+    args=(--argjson chain_id "${CID[$i]}" --arg name "${CNAME[$i]}"
+          --arg rpc_url "${CRPC[$i]}" --arg gate "${CGATE[$i]}"
+          --arg token "${CTOKEN[$i]}" --argjson tokens "$toks")
+    filter='{$chain_id, $name, $rpc_url, $gate, $token, $tokens}'
+    [[ -n "$pub" ]] && { args+=(--arg public_rpc_url "$pub"); filter+=' + {$public_rpc_url}'; }
     # The swap pool rides in the registry too (`swap_pool`, read over this
     # entry's rpc_url), so no RPC url has to go on the API's command line.
-    poolf=""
     if [[ "$ENABLE_SWAP" == "true" && $i == "$swap_idx" && -n "${SWAP_POOL:-}" ]]; then
-      poolf=", \"swap_pool\": {\"address\": \"$SWAP_POOL\", \"from_block\": $SWAP_FROM_BLOCK, \"max_block_range\": $MAX_BLOCK_RANGE}"
+      args+=(--arg pool "$SWAP_POOL" --argjson from_block "$SWAP_FROM_BLOCK"
+             --argjson max_block_range "$MAX_BLOCK_RANGE")
+      filter+=' + {swap_pool: {address: $pool, $from_block, $max_block_range}}'
     fi
-    echo "  {\"chain_id\": ${CID[$i]}, \"name\": \"${CNAME[$i]}\", \"rpc_url\": \"${CRPC[$i]}\"$pubf, \"gate\": \"${CGATE[$i]}\", \"token\": \"${CTOKEN[$i]}\", \"tokens\": [$toks]$poolf}$sep"
+    jq -n "${args[@]}" "$filter"
   done
-  echo "]"
-} > "$REG_JSON"
+} | jq -s '.' > "$REG_JSON"
 
 # No `--gate` / `--swap` flags: the API folds every registry chain's gate and
 # `swap_pool` into its maps itself, so the keyed RPC urls stay in the 0600
@@ -820,7 +876,7 @@ GQL_ARGS=(--bind "$GQL_BIND" --store-url "$STORE_URL" --threshold "$THRESHOLD"
 # to face the internet, so it gets no database credential of its own.
 
 export GRAPHQL_MAX_BLOCK_RANGE="$MAX_BLOCK_RANGE"
-spawn "$ROOT/target/debug/graphql-api ${GQL_ARGS[*]}" graphql-api.log
+spawn graphql-api.log -- "$ROOT/target/debug/graphql-api" "${GQL_ARGS[@]}"
 ok=false
 for _ in $(seq 1 60); do curl -s "http://$GQL_BIND/health" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.25; done
 $ok || die "graphql-api did not come up (see $RUN_DIR/graphql-api.log)"
@@ -841,7 +897,7 @@ if [[ ! -d "$FRONTEND/node_modules" ]]; then
   ( cd "$FRONTEND" && bun install --frozen-lockfile ) || die "bun install --frozen-lockfile failed (frontend/bun.lock out of date with package.json?)"
 fi
 ( cd "$FRONTEND" && VITE_PROXY_TARGET="http://$BIND_HOST:$GQL_PORT" \
-    spawn "npx vite --host $WEB_HOST --port $WEB_PORT --strictPort" web.log )
+    spawn web.log -- npx vite --host "$WEB_HOST" --port "$WEB_PORT" --strictPort )
 for _ in $(seq 1 80); do curl -s "http://127.0.0.1:$WEB_PORT/" >/dev/null 2>&1 && break; sleep 0.3; done
 
 # ---------------------------------------------------------------------------

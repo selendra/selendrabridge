@@ -121,14 +121,28 @@ echo "  dst: gate=$GATE_DST  (UNFUNDED, UNREGISTERED — every claim reverts)"
 # The destination stays deliberately unregistered, as above.
 set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
 
+# M-1: `claim` reverts on an unsealed gate. Sealing BOTH gates here is not
+# cosmetic: the destination is deliberately left with no `setLocalToken`, and an
+# UNSEALED destination would make the "claim() after cancel reverts" assertions
+# below pass for the wrong reason (NotSealed, not the burn). Sealed, the revert
+# is caused by the cancel — which is the property under test.
+echo "=== sealing gates (claim requires it; keeps the no-double-spend check honest) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$TOKEN_SRC" "approve(address,uint256)" "$GATE_SRC" $AMOUNT --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 
 echo "=== starting Postgres ($PG_NAME on :$PG_PORT) ==="
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+# M-9 (audit 2026-09-16): publish the database on LOOPBACK only. A docker `-p`
+# publish writes its own DNAT rule and bypasses ufw/firewalld, so a bare
+# `-p 5433:5432` with POSTGRES_PASSWORD=bridge hands this database — signatures,
+# allowlists, cursors — to anyone who can reach the host. The launchers were
+# fixed in round 4; these harnesses were not.
 docker run -d --name "$PG_NAME" \
   -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
-  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+  -p 127.0.0.1:${PG_PORT}:5432 postgres:16-alpine >/dev/null
 for i in $(seq 1 60); do
   docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break
   sleep 0.5; [[ $i == 60 ]] && fail "Postgres did not become ready"
