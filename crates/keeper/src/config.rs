@@ -1,3 +1,4 @@
+use bridge_core::allow::AllowlistPolicy;
 use bridge_core::backend::StoreConfig;
 use bridge_core::config::ensure_unique;
 use bridge_core::signer::SignerConfig;
@@ -23,6 +24,12 @@ pub struct Config {
     /// default) means this keeper never submits refunds.
     #[serde(default)]
     pub sources: Vec<ChainCfg>,
+    /// What this keeper expects of the allowlist the store serves (audit
+    /// 2026-09-16, M-5). Absent => the legacy default. The keeper is the second
+    /// enforcement gate after the validators, so an operator running with
+    /// `require = true` should set it in both.
+    #[serde(default)]
+    pub allowlist: AllowlistPolicy,
 }
 
 /// One chain the keeper submits transactions to.

@@ -218,18 +218,54 @@ contract CorridorGovernanceTest is Test {
         gate.setLocalToken(debridgeId, address(usdc));
     }
 
-    /// The control for the drain test: WITHOUT the seal the same sequence still
-    /// works in one block. That is what the setup phase is, and why {seal} must
-    /// run before a gate is funded.
-    function test_Drain_ControlAnUnsealedGateIsDrainableInOneBlock() public {
+    /// M-1. This was the control for the drain test, and it PASSED: an unsealed
+    /// funded gate could be re-registered and drained in one block, because
+    /// `seal()` was a runbook step no fund-moving function consulted. Now a gate
+    /// that was never sealed cannot pay out at all, so forgetting to seal costs
+    /// availability instead of the pot.
+    function test_Drain_AnUnsealedGateCannotPayOutAtAll() public {
         usdc.mint(address(gate), 1_000_000e18);
         uint256 amount = 1_000_000e18;
         bytes memory receiver = abi.encodePacked(attacker);
         bytes32 id = gate.computeSubmissionId(debridgeId, amount, CHAIN_A, block.chainid, 0, receiver, "", "");
 
+        // Registration is still instant during setup — that is the point of the phase.
         gate.setLocalToken(debridgeId, address(usdc));
+        assertTrue(gate.inSetupPhase(), "still wiring");
+
+        vm.expectRevert(Gate.NotSealed.selector);
         gate.claim(debridgeId, amount, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
-        assertEq(usdc.balanceOf(attacker), amount, "control: unsealed == the H-1 hole");
+        assertEq(usdc.balanceOf(attacker), 0, "the H-1 hole is closed");
+        assertEq(usdc.balanceOf(address(gate)), 1_000_000e18, "liquidity intact");
+
+        // HONEST RESIDUAL: the owner key can still seal and then claim. What the
+        // guard buys is that an operator cannot run a bridge that pays out while
+        // the registry is open, so the sealed state is reached by necessity
+        // rather than by memory. Post-seal registrations take GOVERNANCE_DELAY.
+        gate.seal();
+        gate.claim(debridgeId, amount, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
+        assertEq(usdc.balanceOf(attacker), amount, "owner key, three txs instead of two");
+    }
+
+    /// The other half of M-1: the setup phase ends on its own, so a gate nobody
+    /// sealed does not keep one-block registration for ever.
+    function test_SetupPhase_ExpiresOnItsOwnWithoutASeal() public {
+        assertTrue(gate.inSetupPhase(), "fresh gate is wiring");
+        assertEq(gate.setupDeadline(), block.timestamp + gate.SETUP_WINDOW());
+
+        vm.warp(gate.setupDeadline() + 1);
+        assertFalse(gate.inSetupPhase(), "window closed");
+        assertFalse(gate.isSealed(), "and nobody sealed it");
+
+        // Registration now takes the public delay, exactly as it would post-seal.
+        bytes32 action = gate.setLocalTokenActionId(debridgeId, address(usdc));
+        vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
+        gate.setLocalToken(debridgeId, address(usdc));
+
+        gate.scheduleGovernance(action);
+        vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
+        gate.setLocalToken(debridgeId, address(usdc));
+        assertEq(gate.tokenOf(debridgeId), address(usdc), "honest route still works");
     }
 
     // -----------------------------------------------------------------

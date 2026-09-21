@@ -24,11 +24,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
+#[cfg(test)]
+use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use alloy_sol_types::SolEvent;
 use anyhow::Context;
 use bridge_core::abi::{Gate, SwapPool, SwapRouter};
+use bridge_core::scan::clamp_scan_window;
 use bridge_core::store::SubmissionRecord;
 use bridge_db::Db;
 use config::{ChainCfg, Config};
@@ -168,31 +171,71 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
             // same range next tick — advancing past a failed range would drop
             // whatever events it held (history, a Claimed/Cancelled transition).
             let mut all_ok = true;
+            // How far the cursor may move: the LOWEST upper bound any scanner
+            // actually read (audit 2026-09-16, M-7). `None` means some endpoint
+            // had nothing confirmed at `from_block`, so nothing may advance.
+            // Starts at `to_block` so a chain with no contracts configured — and
+            // therefore no logs to miss — still makes progress.
+            let mut scanned_to = Some(to_block);
+            let window = Window { from_block, to_block, confirmations: chain.block_confirmation };
+            let mut narrow = |limit: Option<u64>| {
+                scanned_to = match (scanned_to, limit) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                };
+            };
             if let Some(addr) = gate {
                 let handler =
                     |db, cid, log| handle_gate_log(db, cid, log, gate_domain);
-                if let Err(e) =
-                    scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handler).await
+                match scan(&provider, &db, chain.chain_id, addr, window, handler).await
                 {
-                    warn!(chain_id = chain.chain_id, error = %e, "gate scan failed; will retry same range next tick");
-                    all_ok = false;
+                    Ok(limit) => narrow(limit),
+                    Err(e) => {
+                        warn!(chain_id = chain.chain_id, error = %e, "gate scan failed; will retry same range next tick");
+                        all_ok = false;
+                    }
                 }
             }
             if let Some(addr) = router {
-                if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_router_log).await
+                match scan(&provider, &db, chain.chain_id, addr, window, handle_router_log).await
                 {
-                    warn!(chain_id = chain.chain_id, error = %e, "router scan failed; will retry same range next tick");
-                    all_ok = false;
+                    Ok(limit) => narrow(limit),
+                    Err(e) => {
+                        warn!(chain_id = chain.chain_id, error = %e, "router scan failed; will retry same range next tick");
+                        all_ok = false;
+                    }
                 }
             }
             if let Some(addr) = pool {
-                if let Err(e) = scan(&provider, &db, chain.chain_id, addr, from_block, to_block, handle_pool_log).await {
-                    warn!(chain_id = chain.chain_id, error = %e, "pool scan failed; will retry same range next tick");
-                    all_ok = false;
+                match scan(&provider, &db, chain.chain_id, addr, window, handle_pool_log).await {
+                    Ok(limit) => narrow(limit),
+                    Err(e) => {
+                        warn!(chain_id = chain.chain_id, error = %e, "pool scan failed; will retry same range next tick");
+                        all_ok = false;
+                    }
                 }
             }
 
-            if all_ok {
+            // A scanner served by a node that lags `from_block` read nothing —
+            // which is indistinguishable from "no events here" in the response
+            // itself. Advancing on it walked the cursor past blocks nobody read,
+            // and nothing revisits them: the `Sent` in that window never reaches
+            // history and `sweep_refund_eligible` can never flag it. Re-read the
+            // same range next tick instead; `cached_latest` is dropped so the
+            // head is re-fetched rather than trusted from the endpoint that was
+            // ahead.
+            let advance_to = if all_ok { scanned_to } else { None };
+            if all_ok && scanned_to.is_none() {
+                warn!(
+                    chain_id = chain.chain_id,
+                    from_block,
+                    to_block,
+                    "an RPC endpoint lags this range; not advancing the cursor (retrying next tick)"
+                );
+                cached_latest = None;
+            }
+
+            if let Some(to_block) = advance_to {
                 if let Err(e) = db.set_cursor(chain.chain_id, to_block).await {
                     warn!(chain_id = chain.chain_id, error = %e, "failed to persist cursor");
                 } else {
@@ -216,23 +259,54 @@ async fn run_chain(chain: ChainCfg, db: Db) -> anyhow::Result<()> {
     }
 }
 
-/// Fetch `[from_block, to_block]` logs for one address and hand each, in chain
-/// order, to `handler`. A single bad log is logged and skipped, not fatal.
+/// The block range one scan is asked for, and how deep it must stay behind the
+/// serving endpoint's head. Grouped so the three scanners in a tick pass the
+/// identical window by construction.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    from_block: u64,
+    to_block: u64,
+    confirmations: u64,
+}
+
+/// Fetch logs for one address over `[from_block, to_block]` — clamped to what
+/// the serving endpoint itself has confirmed — and hand each, in chain order, to
+/// `handler`. A single bad log is logged and skipped, not fatal.
+///
+/// Returns the block the scan actually reached, which the caller uses as the
+/// cursor bound; `None` means this endpoint has nothing confirmed at
+/// `from_block` and read nothing at all.
+///
+/// ## Why the head is re-read here (audit 2026-09-16, M-7)
+///
+/// The loop's `cached_latest` and this `get_logs` are separate round trips, and
+/// behind a hosted URL sits a POOL of nodes at differing heights. A node that
+/// has not imported the range answers `Ok(vec![])` — success, no logs — which
+/// the loop could not tell from "nothing happened in these blocks", so the
+/// cursor moved past blocks nobody read. `block_confirmation` guards reorgs, not
+/// a peer being behind. Asking the same provider for its head and clamping to it
+/// makes the empty answer mean what it says. This is the rule the validator's
+/// scanner already applies, shared from `bridge_core::scan` so the two cannot
+/// drift.
 async fn scan<P, F, Fut>(
     provider: &P,
     db: &Db,
     chain_id: u64,
     address: Address,
-    from_block: u64,
-    to_block: u64,
+    window: Window,
     handler: F,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Option<u64>>
 where
     P: Provider,
     F: Fn(Db, u64, Log) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let filter = Filter::new().address(address).from_block(from_block).to_block(to_block);
+    let Window { from_block, to_block, confirmations } = window;
+    let head = provider.get_block_number().await.context("get_block_number (scan window)")?;
+    let Some(scanned_to) = clamp_scan_window(from_block, to_block, head, confirmations) else {
+        return Ok(None);
+    };
+    let filter = Filter::new().address(address).from_block(from_block).to_block(scanned_to);
     let mut logs = provider.get_logs(&filter).await.context("get_logs")?;
     logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
@@ -259,9 +333,9 @@ where
         // reprocessing already-handled logs in the range is safe.
         handler(db.clone(), chain_id, log)
             .await
-            .with_context(|| format!("handling log in blocks [{from_block},{to_block}]"))?;
+            .with_context(|| format!("handling log in blocks [{from_block},{scanned_to}]"))?;
     }
-    Ok(())
+    Ok(Some(scanned_to))
 }
 
 /// The log's transaction hash as `0x`-prefixed hex, or `""` if the RPC omitted
@@ -395,4 +469,90 @@ async fn handle_router_log(db: Db, chain_id: u64, log: Log) -> anyhow::Result<()
         info!(chain_id, submission_id = %id, "observed FinalizeFallback");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::transports::mock::Asserter;
+    use tokio::sync::Mutex;
+
+    /// `BRIDGE_TEST_DATABASE_URL`, or `None` with a note (CI has no Postgres —
+    /// audit item 7 on the recommended-order list).
+    fn live_db_url() -> Option<String> {
+        match std::env::var("BRIDGE_TEST_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => Some(u),
+            _ => {
+                eprintln!("BRIDGE_TEST_DATABASE_URL unset — skipping live-Postgres test");
+                None
+            }
+        }
+    }
+
+    /// Serialises the Postgres-backed tests in this crate.
+    static LIVE_DB: Mutex<()> = Mutex::const_new(());
+
+    async fn noop_handler(_db: Db, _chain_id: u64, _log: Log) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// M-7. A node that has not imported the range answers `Ok(vec![])` —
+    /// success, no logs — which used to look exactly like "nothing happened
+    /// here" and moved the cursor past blocks nobody read.
+    ///
+    /// Both halves matter: the lagging endpoint must scan NOTHING (so the
+    /// caller cannot advance), and a healthy-but-behind endpoint must scan only
+    /// as far as IT has confirmed.
+    #[tokio::test]
+    async fn a_lagging_endpoint_scans_nothing_and_a_behind_one_only_what_it_confirmed() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
+        let addr = Address::repeat_byte(0x11);
+
+        // (a) head 109, 10 confirmations => confirmed 99, below from_block 100.
+        // Nothing may be read, and no `eth_getLogs` may even be attempted: the
+        // asserter holds only the head reply, so a `get_logs` here panics.
+        let a = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+        a.push_success(&U256::from(109u64));
+        let reached = scan(&provider, &db, 1, addr, Window { from_block: 100, to_block: 199, confirmations: 10 }, noop_handler)
+            .await
+            .expect("a lagging endpoint is not an error");
+        assert_eq!(reached, None, "a lagging endpoint must scan nothing");
+
+        // (b) head 160 => confirmed 150: the window shrinks to 150, and the
+        // cursor bound is what was read, not the 199 that was asked for.
+        let a = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+        a.push_success(&U256::from(160u64));
+        a.push_success(&Vec::<Log>::new());
+        let reached = scan(&provider, &db, 1, addr, Window { from_block: 100, to_block: 199, confirmations: 10 }, noop_handler)
+            .await
+            .expect("scan");
+        assert_eq!(reached, Some(150), "may only advance as far as this endpoint confirmed");
+    }
+
+    /// The cursor bound for a tick is the LOWEST of what each scanner read, and
+    /// any scanner that read nothing (a lagging endpoint) pins the tick: gate,
+    /// router and pool are three separate `eth_getLogs`, each of which may be
+    /// served by a different node behind the same URL.
+    #[test]
+    fn one_lagging_scanner_holds_the_whole_tick_back() {
+        // Mirrors the loop's `narrow` fold.
+        fn advance_to(results: &[Option<u64>], requested_to: u64) -> Option<u64> {
+            let mut acc = Some(requested_to);
+            for r in results {
+                acc = match (acc, r) {
+                    (Some(a), Some(b)) => Some(a.min(*b)),
+                    _ => None,
+                };
+            }
+            acc
+        }
+        assert_eq!(advance_to(&[Some(199), Some(199), Some(199)], 199), Some(199));
+        assert_eq!(advance_to(&[Some(199), Some(150), Some(199)], 199), Some(150), "lowest wins");
+        assert_eq!(advance_to(&[Some(199), None, Some(199)], 199), None, "one lagging scanner pins it");
+        assert_eq!(advance_to(&[], 199), Some(199), "no contracts configured: nothing to miss");
+    }
 }

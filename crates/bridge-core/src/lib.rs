@@ -12,6 +12,8 @@ pub use submission::Submission;
 
 pub mod allow;
 pub mod config;
+/// Block-window arithmetic shared by the validator and indexer scanners.
+pub mod scan;
 pub mod store;
 
 #[cfg(feature = "abi")]

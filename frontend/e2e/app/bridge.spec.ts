@@ -373,7 +373,9 @@ test.describe("H-2: source and destination must agree on the scale", () => {
       page: import("@playwright/test").Page,
       bridgeDecimals: number,
       solanaChain: typeof SOLANA_CHAIN = SOLANA_CHAIN,
-      receiver: string = SOL_RECEIVER
+      receiver: string = SOL_RECEIVER,
+      calls: Record<string, string> = APPROVED,
+      amount = "1"
     ) {
       await startApp(page, {
         backend: {
@@ -390,12 +392,12 @@ test.describe("H-2: source and destination must agree on the scale", () => {
             paused: false,
           },
         },
-        wallet: { chainId: 1337, calls: APPROVED, receiptLogs: [SENT_LOG] },
+        wallet: { chainId: 1337, calls, receiptLogs: [SENT_LOG] },
       });
       await connectWallet(page);
       await gotoView(page, "Bridge");
       await field(page, "Receiver").fill(receiver);
-      await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+      await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill(amount);
     }
 
     test("refuses when the Solana gate is registered at another scale", async ({ page }) => {
@@ -408,6 +410,40 @@ test.describe("H-2: source and destination must agree on the scale", () => {
     test("sends when the Solana gate agrees", async ({ page }) => {
       await openToSolana(page, 18);
       await expect(primaryButton(page)).toHaveText("Bridge");
+    });
+
+    /**
+     * M-10. `Gate.send` applies its u64 width check to the WIRE amount, but the
+     * encoder capped the LOCAL one. At 18 local / 6 bridge decimals that put the
+     * ceiling at 2^64-1 local units — 18.446744073709551615 TST — for a corridor
+     * whose real limit is 18.4 trillion. The button read "Bridge", the click
+     * threw into the error banner, and the Solana corridor was unusable for any
+     * ordinary amount.
+     */
+    test("bridges an amount far above 2^64-1 local units to Solana", async ({ page }) => {
+      // 18-decimal token bridged at 6: unit 10^12, the live mesh's TST shape.
+      const UNIT_1E12 = { ...APPROVED, "4e3ff796": (10n ** 12n).toString(16) };
+      await openToSolana(page, 6, SOLANA_CHAIN, SOL_RECEIVER, UNIT_1E12, "1000");
+      await expect(primaryButton(page)).toHaveText("Bridge");
+
+      await primaryButton(page).click();
+      await expect(page.locator(".txbar--done")).toContainText(/Locked/, { timeout: 15_000 });
+
+      const [tx] = await sentTransactions(page);
+      expect(tx.data.slice(0, 10)).toBe("0x565443e9"); // send(...)
+      const words = tx.data.slice(10).match(/.{64}/g)!;
+      // The calldata carries the LOCAL amount — the gate converts it to the
+      // 1e9 wire units Solana will credit, which is nowhere near u64.
+      expect(BigInt("0x" + words[1])).toBe(1000n * 10n ** 18n);
+    });
+
+    test("still refuses an amount that overflows u64 once scaled", async ({ page }) => {
+      const UNIT_1E12 = { ...APPROVED, "4e3ff796": (10n ** 12n).toString(16) };
+      const huge = ((1n << 64n) + 1n).toString(); // whole tokens, > u64 at 6dp
+      await openToSolana(page, 6, SOLANA_CHAIN, SOL_RECEIVER, UNIT_1E12, huge);
+      await expect(primaryButton(page)).toHaveText("Amount too large for a Solana receiver");
+      await expect(primaryButton(page)).toBeDisabled();
+      expect(await sentTransactions(page)).toHaveLength(0);
     });
 
     /**

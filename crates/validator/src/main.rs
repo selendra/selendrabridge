@@ -31,6 +31,7 @@ use alloy_sol_types::SolEvent;
 use anyhow::Context;
 use bridge_core::abi::Gate;
 use bridge_core::allow::Allowlist;
+use bridge_core::allow::AllowlistPolicy;
 use bridge_core::backend::StoreBackend;
 use bridge_core::signer::encode_signature;
 use bridge_core::store::{SignerSig, SubmissionRecord};
@@ -48,6 +49,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "validator.toml".into());
     let cfg = Config::load(&cfg_path)?;
+
+    // Say so at startup: with this set, a store that serves an empty allowlist
+    // halts signing rather than falling back to "allow everything" (M-5).
+    if cfg.allowlist.required() {
+        info!(
+            pinned_tokens = cfg.allowlist.pinned_tokens.len(),
+            pinned_chains = cfg.allowlist.pinned_chains.len(),
+            "allowlist enforcement REQUIRED"
+        );
+    }
 
     let signer = cfg.signer.load("validator").context("loading validator signer")?;
     let signer_addr = signer.address();
@@ -145,8 +156,9 @@ async fn main() -> anyhow::Result<()> {
         let runtime = runtimes.get(&source.chain_id).unwrap().clone();
         let peers = scale_peers.clone();
         let sol_peers = solana_peers.clone();
+        let policy = cfg.allowlist.clone();
         tasks.spawn(async move {
-            scan_source(source, signer, signer_addr, sink, runtime, peers, sol_peers).await
+            scan_source(source, signer, signer_addr, sink, runtime, peers, sol_peers, policy).await
         });
     }
 
@@ -172,6 +184,7 @@ async fn scan_source(
     runtime: Arc<Mutex<Runtime>>,
     scale_peers: Vec<(u64, String, Vec<String>)>,
     solana_peers: Vec<(u64, [u8; 32], String)>,
+    policy: AllowlistPolicy,
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
@@ -377,8 +390,23 @@ async fn scan_source(
             // Allowlist for this batch. In sig-store mode a fetch failure is
             // fail-closed (skip the batch) so we never sign a now-disallowed
             // transfer on a stale view; in file mode it is None (no enforcement).
-            let allowlist = match sink.fetch_allowlist().await {
-                Ok(a) => a,
+            //
+            // A SUCCESSFUL fetch can also be refused (audit 2026-09-16, M-5):
+            // with `[allowlist] require = true` an empty served list is the
+            // kill-switch being turned off by whoever controls the store, and a
+            // list missing a locally pinned entry has been truncated. Both skip
+            // the batch rather than sign on it.
+            let allowlist = match sink.fetch_allowlist().await.map(|v| policy.check(v)) {
+                Ok(Ok(a)) => a,
+                Ok(Err(refusal)) => {
+                    warn!(
+                        chain_id = source.chain_id,
+                        reason = %refusal,
+                        "REFUSING to sign on the served allowlist; skipping batch"
+                    );
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
                 Err(e) => {
                     warn!(chain_id = source.chain_id, error = %e, "allowlist fetch failed; skipping batch");
                     tokio::time::sleep(retry).await;

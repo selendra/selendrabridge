@@ -132,6 +132,13 @@ cast send "$GATE_B" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_B" -
 cast send "$TOKEN_C" "mint(address,uint256)" "$GATE_C" $AMOUNT --rpc-url $C_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_C" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_C" --rpc-url $C_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$B_RPC" "$KEY0" "$GATE_B"
+seal_gate "$C_RPC" "$KEY0" "$GATE_C"
+
 echo "=== writing configs ==="
 rm -f "$LOGS/validator-state.json"
 cat > "$LOGS/validator.toml" <<EOF

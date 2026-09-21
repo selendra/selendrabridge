@@ -156,11 +156,25 @@ impl Token {
     /// Its registry figure is served as before rather than blanked — parsing
     /// the base58 mint as an EVM address and giving up made every Solana
     /// token `null` (caught replaying live mesh8, 2026-09-17).
+    ///
+    /// When the registry is SILENT, this asks the gate, exactly as the
+    /// per-transfer field does (`ApiState::amount_scale`). Returning `null`
+    /// there while the transfer field answered was an inconsistency worth
+    /// closing: `run.sh` never emits `bridge_decimals`, and
+    /// `docker/configs/chains.json` omits it, so the registry being silent is
+    /// the common case rather than the odd one (shadow run, 2026-09-21).
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
-        let listed = self.listed_bridge_decimals?;
-        match self.address.parse::<alloy_primitives::Address>() {
-            Ok(token) => state(ctx).verified_bridge_decimals(self.chain_id, token, listed).await,
-            Err(_) => Some(listed),
+        let st = state(ctx);
+        let token = self.address.parse::<alloy_primitives::Address>().ok();
+        match (self.listed_bridge_decimals, token) {
+            (Some(listed), Some(token)) => st.verified_bridge_decimals(self.chain_id, token, listed).await,
+            // A base58 mint has no single gate registration to check against.
+            (Some(listed), None) => Some(listed),
+            (None, Some(token)) => match st.chains.gate_bridge_decimals(self.chain_id, token).await {
+                GateScale::Registered(d) => Some(d),
+                GateScale::Unregistered | GateScale::Unknown => None,
+            },
+            (None, None) => None,
         }
     }
 }
@@ -388,9 +402,17 @@ impl Submission {
 impl Submission {
     /// The decimals `amount` is expressed in: the asset's bridge decimals, the
     /// same on every chain. Format `amount` with THIS, never with a local
-    /// token's decimals. Null when the registry cannot resolve `debridgeId`.
+    /// token's decimals — they differ by orders of magnitude, and the local
+    /// figure is the one a client can always get, which is how M-11 rendered a
+    /// 1,000-token transfer as `0`.
+    ///
+    /// Resolved from the registry, else from the source gate's
+    /// `bridgeDecimalsOf(token)`; see [`ApiState::amount_scale`]. Null when
+    /// neither can answer — then `amount` is raw units of an unknown scale and
+    /// must be shown as such.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
-        state(ctx).bridge_decimals_of(&self.debridge_id).await
+        state(ctx).amount_scale(&self.debridge_id, self.chain_id_from, &self.token).await
     }
 
     /// On-chain `executed(submissionId)` on the destination gate. `null` when the
@@ -499,6 +521,33 @@ impl ApiState {
         self.verified_bridge_decimals(chain_id, token, listed).await
     }
 
+    /// The scale one transfer's `amount` is in, for a record that also knows
+    /// which token it locked on which chain.
+    ///
+    /// The registry lookup above answers for an asset the operator listed with
+    /// `bridge_decimals`. When it cannot (M-11: `scripts/run.sh` never emits the
+    /// field, and the tracked `docker/configs/chains.json` omits it, so on those
+    /// stacks EVERY row came back null), this asks the source gate the same
+    /// question `Gate.send` asked when it produced the amount:
+    /// `bridgeDecimalsOf(token)` on `chainIdFrom`. That is the authoritative
+    /// answer — the registry is an operator-edited file, the gate is what did
+    /// the conversion — so it is also allowed to answer on its own.
+    ///
+    /// Still `None` when the row predates the refund path (empty `token`), the
+    /// source is Solana (no EVM gate to ask), or no `--gate` is configured for
+    /// the source chain. A client MUST then treat `amount` as raw units rather
+    /// than formatting it with some local token's decimals.
+    pub async fn amount_scale(&self, debridge_id: &str, chain_id_from: u64, token: &str) -> Option<u8> {
+        if let Some(d) = self.bridge_decimals_of(debridge_id).await {
+            return Some(d);
+        }
+        let token: alloy_primitives::Address = token.trim().parse().ok()?;
+        match self.chains.gate_bridge_decimals(chain_id_from, token).await {
+            GateScale::Registered(d) => Some(d),
+            GateScale::Unregistered | GateScale::Unknown => None,
+        }
+    }
+
     /// The registry's `listed` bridge decimals for `token` on `chain_id`, checked
     /// against that chain's gate. See [`served_bridge_decimals`].
     async fn verified_bridge_decimals(&self, chain_id: u64, token: alloy_primitives::Address, listed: u8) -> Option<u8> {
@@ -538,23 +587,107 @@ pub fn served_bridge_decimals(registry: u8, gate: GateScale) -> Option<u8> {
 
 /// The swap intent (and destination outcome, once known) of a
 /// `SwapRouter.swapAndBridge` transfer — a plain bridge send has none.
+///
+/// ## Every amount here is in a DIFFERENT scale (M-12)
+///
+/// The three figures below are LOCAL amounts of three different tokens on two
+/// chains, and they sit beside a `HistoryEntry.amount` that is a WIRE amount.
+/// One `bridgeDecimals` label used to be the only scale declared on the object,
+/// so a client had no way to render the rest except by guessing. Each now
+/// carries its own `…Decimals` field, resolved from the token it belongs to:
+///
+/// | field | token | chain |
+/// |---|---|---|
+/// | `amountIn` | `tokenIn` | source |
+/// | `stableOut` | the pool's stable (what the gate locked) | source |
+/// | `finalizeAmountOut` | `finalToken`, or the stable on a fallback | destination |
+/// | (`HistoryEntry.amount`) | bridge decimals, not local | — |
 #[derive(SimpleObject)]
+#[graphql(complex)]
 pub struct SwapIntent {
     pub token_in: String,
+    /// LOCAL amount of `tokenIn` the user put in — see `amountInDecimals`.
     pub amount_in: String,
+    /// LOCAL amount of the source chain's stable the swap produced, which is
+    /// what `Gate.send` then locked — see `stableOutDecimals`. NOT the wire
+    /// amount: the gate converts it, and `HistoryEntry.amount` is the result.
     pub stable_out: String,
     pub final_token: String,
     pub final_receiver: String,
     /// Destination-chain finalize tx, once the swap-back leg has run.
     pub finalize_tx: Option<String>,
+    /// LOCAL amount delivered on the destination — see
+    /// `finalizeAmountOutDecimals`, whose token depends on `finalizeFallback`.
     pub finalize_amount_out: Option<String>,
     /// True if the destination swap failed and the stable was delivered as-is.
     pub finalize_fallback: Option<bool>,
     pub finalized_at: Option<String>,
+    /// Source chain, for resolving the scales above. Not part of the schema —
+    /// the enclosing row already says it.
+    #[graphql(skip)]
+    pub chain_id_from: u64,
+    /// Destination chain, likewise.
+    #[graphql(skip)]
+    pub chain_id_to: u64,
+    /// The source ERC-20 the gate locked (the pool's stable), from the
+    /// enclosing row's `token`.
+    #[graphql(skip)]
+    pub locked_token: Option<String>,
+    /// The corridor id, for naming the destination's local token on a fallback.
+    #[graphql(skip)]
+    pub debridge_id: String,
 }
 
-impl From<SwapBridgeInfo> for SwapIntent {
-    fn from(i: SwapBridgeInfo) -> Self {
+#[ComplexObject]
+impl SwapIntent {
+    /// Decimals of `tokenIn` on the source chain. Null when it cannot be read
+    /// (no `--gate` for that chain, or the address is not an ERC-20).
+    #[graphql(complexity = "CHAIN_READ_COST")]
+    async fn amount_in_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        let token = self.token_in.trim().parse().ok()?;
+        state(ctx).chains.token_decimals(self.chain_id_from, token).await
+    }
+
+    /// Decimals of the stable `stableOut` is denominated in, on the source
+    /// chain — the token the gate locked.
+    #[graphql(complexity = "CHAIN_READ_COST")]
+    async fn stable_out_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        let token = self.locked_token.as_deref()?.trim().parse().ok()?;
+        state(ctx).chains.token_decimals(self.chain_id_from, token).await
+    }
+
+    /// Decimals `finalizeAmountOut` is in, on the DESTINATION chain.
+    ///
+    /// Which token that is depends on how the delivery went: normally
+    /// `finalToken`, but on `finalizeFallback` the destination swap failed and
+    /// the bridged stable was paid out instead — a different token, usually a
+    /// different scale. Null before the transfer finalises, or when the token
+    /// cannot be read.
+    #[graphql(complexity = "CHAIN_READ_COST")]
+    async fn finalize_amount_out_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        self.finalize_amount_out.as_ref()?;
+        let st = state(ctx);
+        if self.finalize_fallback == Some(true) {
+            // The stable that arrived is the destination gate's local token for
+            // this corridor — what it paid the claim out in.
+            let id: alloy_primitives::B256 = self.debridge_id.trim().parse().ok()?;
+            return st.chains.local_token_decimals(self.chain_id_to, id).await;
+        }
+        let token = self.final_token.trim().parse().ok()?;
+        st.chains.token_decimals(self.chain_id_to, token).await
+    }
+}
+
+impl SwapIntent {
+    /// `i` carries only what the router's event recorded; the scales need the
+    /// enclosing row's chains, locked token and corridor id.
+    fn from_info(
+        i: SwapBridgeInfo,
+        chain_id_from: u64,
+        chain_id_to: u64,
+        locked_token: Option<String>,
+        debridge_id: String,
+    ) -> Self {
         SwapIntent {
             token_in: i.token_in,
             amount_in: i.amount_in,
@@ -565,6 +698,10 @@ impl From<SwapBridgeInfo> for SwapIntent {
             finalize_amount_out: i.finalize_amount_out,
             finalize_fallback: i.finalize_fallback,
             finalized_at: i.finalized_at,
+            chain_id_from,
+            chain_id_to,
+            locked_token,
+            debridge_id,
         }
     }
 }
@@ -611,13 +748,21 @@ pub struct HistoryEntry {
 #[ComplexObject]
 impl HistoryEntry {
     /// The decimals `amount` is expressed in — see `Submission.bridgeDecimals`.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
-        state(ctx).bridge_decimals_of(&self.debridge_id).await
+        state(ctx)
+            .amount_scale(&self.debridge_id, self.chain_id_from, self.token.as_deref().unwrap_or_default())
+            .await
     }
 }
 
 impl From<SubmissionHistory> for HistoryEntry {
     fn from(h: SubmissionHistory) -> Self {
+        // The intent's scales are per-token and per-chain, so it needs what the
+        // row knows and the router's event did not record (M-12).
+        let swap_intent = h.swap_intent.map(|i| {
+            SwapIntent::from_info(i, h.chain_id_from, h.chain_id_to, h.token.clone(), h.debridge_id.clone())
+        });
         HistoryEntry {
             submission_id: h.submission_id,
             debridge_id: h.debridge_id,
@@ -638,7 +783,7 @@ impl From<SubmissionHistory> for HistoryEntry {
             token: h.token,
             cancel_signature_count: h.cancel_signature_count as u64,
             refund_signature_count: h.refund_signature_count as u64,
-            swap_intent: h.swap_intent.map(Into::into),
+            swap_intent,
         }
     }
 }
@@ -656,7 +801,14 @@ pub struct HistoryFilter {
 }
 
 /// One completed same-chain swap (`SwapPool.Swapped`), mirrored by the indexer.
+///
+/// `amountIn` and `amountOut` are LOCAL amounts of TWO DIFFERENT tokens — that
+/// is what a swap is. Neither is in "the chain's decimals": a pool trading an
+/// 18-decimal alt for a 6-decimal stable produces two figures that share a row
+/// and nothing else. Each declares its own scale below (same class as M-11: the
+/// right kind of units, read off the wrong token).
 #[derive(SimpleObject)]
+#[graphql(complex)]
 pub struct SwapHistoryEntry {
     pub chain_id: u64,
     pub tx_hash: String,
@@ -668,6 +820,26 @@ pub struct SwapHistoryEntry {
     pub amount_out: String,
     pub block_number: u64,
     pub created_at: String,
+}
+
+#[ComplexObject]
+impl SwapHistoryEntry {
+    /// Decimals of `tokenIn` on this chain — the scale `amountIn` is in.
+    /// Null when the token cannot be read (no `--gate` for the chain, or it is
+    /// not an ERC-20); a client must then show the raw integer.
+    #[graphql(complexity = "CHAIN_READ_COST")]
+    async fn amount_in_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        let token = self.token_in.trim().parse().ok()?;
+        state(ctx).chains.token_decimals(self.chain_id, token).await
+    }
+
+    /// Decimals of `tokenOut` on this chain — the scale `amountOut` is in, and
+    /// in general NOT the same as `amountInDecimals`.
+    #[graphql(complexity = "CHAIN_READ_COST")]
+    async fn amount_out_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        let token = self.token_out.trim().parse().ok()?;
+        state(ctx).chains.token_decimals(self.chain_id, token).await
+    }
 }
 
 impl From<SwapRecord> for SwapHistoryEntry {
@@ -1278,6 +1450,64 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// An RPC that answers per FUNCTION, keyed by 4-byte selector, falling back
+    /// to `default` for anything else. The single-reply [`mock_evm_rpc`] cannot
+    /// serve a resolver that reads two different functions — it would hand a
+    /// `bridgeDecimalsFor` tuple back to `decimals()`, which decodes as
+    /// whatever its first word happens to be.
+    async fn mock_evm_rpc_per_selector(
+        replies: Vec<(&'static str, serde_json::Value)>,
+        default: serde_json::Value,
+    ) -> String {
+        use axum::{routing::post, Json, Router};
+        let replies: std::collections::HashMap<String, serde_json::Value> =
+            replies.into_iter().map(|(s, v)| (s.to_string(), v)).collect();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let replies = replies.clone();
+                let default = default.clone();
+                async move {
+                    // Alloy sends the calldata as `input`; older clients use
+                    // `data`. Accept both so the dispatch cannot silently fall
+                    // through to the default and "pass" for the wrong reason.
+                    let call = &req["params"][0];
+                    let data = call["input"]
+                        .as_str()
+                        .or_else(|| call["data"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert!(!data.is_empty(), "eth_call with no calldata: {req}");
+                    let selector = data.get(2..10).unwrap_or_default();
+                    let result = replies.get(selector).cloned().unwrap_or(default);
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A one-word `uint8` return, for `decimals()`.
+    fn u8_reply(v: u8) -> serde_json::Value {
+        let mut w = [0u8; 32];
+        w[31] = v;
+        serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(w)))
+    }
+
+    /// `bridgeDecimalsFor` -> `(set, bridgeDecimals, localDecimals, localToken)`.
+    fn corridor_reply(set: bool, bridge: u8, local: u8, token: &str) -> serde_json::Value {
+        let mut w = [0u8; 128];
+        w[31] = set as u8;
+        w[63] = bridge;
+        w[95] = local;
+        let addr: alloy_primitives::Address = token.parse().unwrap();
+        w[108..128].copy_from_slice(addr.as_slice());
+        serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(w)))
+    }
+
     /// `bridgeDecimalsOf` -> `(set, bridgeDecimals, localDecimals)`, ABI-encoded.
     fn scale_reply(set: bool, bridge: u8, local: u8) -> serde_json::Value {
         let mut w = [0u8; 96];
@@ -1375,6 +1605,45 @@ mod tests {
         assert_eq!(st.bridge_decimals_of(&id).await, Some(6));
     }
 
+    /// The registry is SILENT far more often than it disagrees: `run.sh` never
+    /// emits `bridge_decimals` and `docker/configs/chains.json` omits it. The
+    /// per-transfer field has asked the gate since M-12; this list returned
+    /// `null` in the same situation (found shadow-running the new API against
+    /// live mesh9, 2026-09-21), so a client reading the token list learnt
+    /// nothing while the transfer row right next to it knew the scale.
+    #[tokio::test]
+    async fn a_silent_registry_falls_back_to_the_gate_in_the_token_list() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (mut st, _) = scale_state(&url, 6);
+        // Exactly what an operator-generated registry looks like.
+        st.registry[0].tokens[0].bridge_decimals = None;
+        let schema = async_graphql::Schema::build(Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .data(st)
+            .finish();
+        let res = schema.execute("{ chains { tokens { symbol bridgeDecimals } } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["chains"][0]["tokens"][0]["bridgeDecimals"], 6, "{json}");
+    }
+
+    /// A gate that has no registration for the token still answers `null` —
+    /// the fallback must not invent a scale.
+    #[tokio::test]
+    async fn a_silent_registry_and_an_unregistered_gate_stay_null() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(false, 0, 18), calls.clone()).await;
+        let (mut st, _) = scale_state(&url, 6);
+        st.registry[0].tokens[0].bridge_decimals = None;
+        let schema = async_graphql::Schema::build(Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .data(st)
+            .finish();
+        let res = schema.execute("{ chains { tokens { bridgeDecimals } } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["chains"][0]["tokens"][0]["bridgeDecimals"], serde_json::Value::Null, "{json}");
+    }
+
     /// The `chains` query's per-token figure goes through the same check.
     #[tokio::test]
     async fn the_chains_query_applies_the_same_check() {
@@ -1388,6 +1657,266 @@ mod tests {
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         let json = res.data.into_json().unwrap();
         assert_eq!(json["chains"][0]["tokens"][0]["bridgeDecimals"], serde_json::Value::Null, "{json}");
+    }
+
+    /// `bridgeDecimals` now costs a CHAIN_READ, because it can reach the gate
+    /// (M-11) — so it counts against the H-7 complexity budget where it used to
+    /// cost 1. The UI's own history query must still fit, or this fix breaks
+    /// the page it was meant to fix.
+    ///
+    /// The query below is copied from `frontend/src/api/client.ts`
+    /// (`fetchHistory`), which sends no `limit` and so takes the 50-row default.
+    #[tokio::test]
+    async fn the_frontends_history_query_still_fits_the_complexity_budget() {
+        let dir = std::env::temp_dir().join(format!("graphql-api-cost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = async_graphql::Schema::build(Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription)
+            .limit_complexity(8000)
+            .data(ApiState {
+                backend: Arc::new(StoreBackend::file(&dir).unwrap()),
+                threshold: Some(2),
+                chains: Chains::new(),
+                registry: vec![],
+                swaps: Swaps::new(),
+            })
+            .finish();
+
+        const UI_HISTORY: &str = r#"query Hist($filter: HistoryFilter) {
+           history(filter: $filter) {
+             submissionId debridgeId amount bridgeDecimals chainIdFrom chainIdTo nonce receiver
+             status claimTx signatureCount createdAt updatedAt
+             stuck refundStatus refundTx cancelTx token
+             cancelSignatureCount refundSignatureCount
+             swapIntent {
+               tokenIn amountIn stableOut finalToken finalReceiver
+               finalizeTx finalizeAmountOut finalizeFallback finalizedAt
+             }
+           }
+         }"#;
+        let res = schema.execute(UI_HISTORY).await;
+        let complexity_refused = res.errors.iter().any(|e| e.message.contains("too complex"));
+        assert!(!complexity_refused, "the UI's own query was refused: {:?}", res.errors);
+
+        // The budget still bites: asking for the whole 200-row page WITH the
+        // three swap scales is 200 real chain reads, and is refused.
+        let greedy = UI_HISTORY.replace("history(filter: $filter)", "history(filter: $filter, limit: 200)").replace(
+            "finalizeFallback finalizedAt",
+            "finalizeFallback finalizedAt amountInDecimals stableOutDecimals finalizeAmountOutDecimals",
+        );
+        let res = schema.execute(&greedy).await;
+        assert!(
+            res.errors.iter().any(|e| e.message.contains("too complex")),
+            "200 rows of chain reads should not be free: {:?}",
+            res.errors
+        );
+    }
+
+    /// M-11's root cause. `scripts/run.sh` never emits `bridge_decimals` and
+    /// the tracked `docker/configs/chains.json` omits it, so the registry
+    /// lookup resolved NOTHING on those stacks and every `amount` came back
+    /// with a null scale — which the explorer then formatted with the ERC-20's
+    /// own decimals, rendering a 1,000-token transfer as `0`.
+    ///
+    /// The gate that produced the amount can always be asked instead.
+    #[tokio::test]
+    async fn a_registry_without_bridge_decimals_still_resolves_from_the_source_gate() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (mut st, id) = scale_state(&url, 6);
+        // Exactly what run.sh writes: a token with no `bridge_decimals`.
+        st.registry[0].tokens[0].bridge_decimals = None;
+
+        assert_eq!(st.bridge_decimals_of(&id).await, None, "registry alone cannot say");
+        assert_eq!(st.amount_scale(&id, 11155111, TOKEN).await, Some(6), "the gate can");
+    }
+
+    /// The fallback needs a token to ask about, and must not invent one: a row
+    /// from before the refund path has no `token`, and a Solana source has no
+    /// EVM gate. Both stay null so a client shows raw units.
+    #[tokio::test]
+    async fn an_unaskable_source_leaves_the_scale_null() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(scale_reply(true, 6, 18), calls.clone()).await;
+        let (mut st, id) = scale_state(&url, 6);
+        st.registry[0].tokens[0].bridge_decimals = None;
+
+        assert_eq!(st.amount_scale(&id, 11155111, "").await, None, "no token recorded");
+        assert_eq!(st.amount_scale(&id, 7565164, TOKEN).await, None, "no gate for a Solana source");
+        assert_eq!(st.amount_scale(&id, 11155111, "not-an-address").await, None);
+    }
+
+    /// M-12. `amountIn`, `stableOut` and `finalizeAmountOut` are local amounts
+    /// of different tokens on different chains, served beside a wire `amount`.
+    /// Each must declare its own scale.
+    #[tokio::test]
+    async fn every_swap_amount_declares_the_scale_it_is_in() {
+        // `decimals()` -> 18 for whichever token is asked.
+        let url = mock_evm_rpc_per_selector(vec![("313ce567", u8_reply(18))], u8_reply(18)).await;
+        let (st, _) = scale_state(&url, 6);
+
+        let intent = SwapIntent::from_info(
+            SwapBridgeInfo {
+                token_in: "0x00000000000000000000000000000000000000c1".into(),
+                amount_in: "1000000000000000000".into(),
+                stable_out: "3180000000".into(),
+                final_token: "0x00000000000000000000000000000000000000c2".into(),
+                final_receiver: "0x00000000000000000000000000000000000000c3".into(),
+                finalize_tx: None,
+                finalize_amount_out: None,
+                finalize_fallback: None,
+                finalized_at: None,
+            },
+            11155111,
+            11155111,
+            Some(TOKEN.into()),
+            "0x".to_string() + &"11".repeat(32),
+        );
+
+        let json = resolve_intent(st, intent).await;
+        // Each local amount now says what it is denominated in.
+        assert_eq!(json["intent"]["amountInDecimals"], 18, "{json}");
+        assert_eq!(json["intent"]["stableOutDecimals"], 18, "{json}");
+        // Nothing has been delivered yet, so there is no payout scale to give —
+        // null, not a confidently wrong number.
+        assert_eq!(json["intent"]["finalizeAmountOutDecimals"], serde_json::Value::Null, "{json}");
+    }
+
+    /// The payout token differs between a normal finalize and a fallback: the
+    /// user's `finalToken` versus the bridged stable. Serving one scale for
+    /// both is the M-12 bug in miniature, so the fallback resolves through the
+    /// destination gate's local token instead.
+    #[tokio::test]
+    async fn a_fallback_delivery_is_scaled_by_the_stable_that_arrived() {
+        // The destination pays this corridor out in a 9-decimal local token,
+        // while `finalToken` is an ordinary 18-decimal ERC-20.
+        let url = mock_evm_rpc_per_selector(
+            vec![
+                ("93b06e9d", corridor_reply(true, 6, 9, "0x00000000000000000000000000000000000000dd")),
+                ("313ce567", u8_reply(18)),
+            ],
+            u8_reply(18),
+        )
+        .await;
+        let (st, _) = scale_state(&url, 6);
+
+        let mut info = SwapBridgeInfo {
+            token_in: "0x00000000000000000000000000000000000000c1".into(),
+            amount_in: "1".into(),
+            stable_out: "1".into(),
+            final_token: "0x00000000000000000000000000000000000000c2".into(),
+            final_receiver: "0x00000000000000000000000000000000000000c3".into(),
+            finalize_tx: Some("0xdead".into()),
+            finalize_amount_out: Some("1000000000".into()),
+            finalize_fallback: Some(true),
+            finalized_at: None,
+        };
+        let id = "0x".to_string() + &"11".repeat(32);
+        let intent = SwapIntent::from_info(info.clone(), 11155111, 11155111, Some(TOKEN.into()), id.clone());
+        let json = resolve_intent(st, intent).await;
+        assert_eq!(json["intent"]["finalizeAmountOutDecimals"], 9, "fallback pays the local stable: {json}");
+
+        // The same row WITHOUT the fallback is scaled by `finalToken` instead —
+        // 18 here, against the stable's 9. One label for both would be wrong
+        // for one of them, which is M-12.
+        info.finalize_fallback = Some(false);
+        let url2 = mock_evm_rpc_per_selector(
+            vec![
+                ("93b06e9d", corridor_reply(true, 6, 9, "0x00000000000000000000000000000000000000dd")),
+                ("313ce567", u8_reply(18)),
+            ],
+            u8_reply(18),
+        )
+        .await;
+        let (st2, _) = scale_state(&url2, 6);
+        let intent2 = SwapIntent::from_info(info, 11155111, 11155111, Some(TOKEN.into()), id);
+        let json2 = resolve_intent(st2, intent2).await;
+        assert_eq!(json2["intent"]["finalizeAmountOutDecimals"], 18, "normal finalize pays finalToken: {json2}");
+    }
+
+    /// A pool trade crosses two tokens, so its two amounts are in two scales.
+    /// Serving one number for both (which is what a client had to guess from
+    /// the chain) misreads whichever side is not the chain's default token.
+    #[tokio::test]
+    async fn the_two_sides_of_a_swap_carry_their_own_decimals() {
+        const WETH: &str = "0x00000000000000000000000000000000000000e1";
+        const USDC: &str = "0x00000000000000000000000000000000000000e2";
+        // `decimals()` answers per TOKEN: the calldata is the same selector for
+        // both, so dispatch on the `to` address instead.
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(|Json(req): Json<serde_json::Value>| async move {
+                let to = req["params"][0]["to"].as_str().unwrap_or_default().to_ascii_lowercase();
+                let d: u8 = if to == USDC { 6 } else { 18 };
+                let mut w = [0u8; 32];
+                w[31] = d;
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "result": format!("0x{}", alloy_primitives::hex::encode(w)),
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (st, _) = scale_state(&format!("http://{addr}"), 6);
+
+        let row = SwapHistoryEntry {
+            chain_id: 11155111,
+            tx_hash: "0xfeed".into(),
+            sender: "0x00000000000000000000000000000000000000e3".into(),
+            receiver: "0x00000000000000000000000000000000000000e4".into(),
+            token_in: WETH.into(),
+            token_out: USDC.into(),
+            amount_in: "1000000000000000000".into(),
+            amount_out: "3180000000".into(),
+            block_number: 1,
+            created_at: "2026-09-21T00:00:00Z".into(),
+        };
+
+        struct SwapRoot(std::sync::Mutex<Option<SwapHistoryEntry>>);
+        #[async_graphql::Object]
+        impl SwapRoot {
+            async fn swap(&self) -> SwapHistoryEntry {
+                self.0.lock().unwrap().take().expect("one resolution per root")
+            }
+        }
+        let schema = async_graphql::Schema::build(
+            SwapRoot(std::sync::Mutex::new(Some(row))),
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .data(st)
+        .finish();
+        let res = schema.execute("{ swap { amountInDecimals amountOutDecimals } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["swap"]["amountInDecimals"], 18, "{json}");
+        assert_eq!(json["swap"]["amountOutDecimals"], 6, "{json}");
+    }
+
+    /// Resolve a `SwapIntent`'s fields the way a client reaches them: through a
+    /// real GraphQL execution with `ApiState` in scope.
+    async fn resolve_intent(st: ApiState, intent: SwapIntent) -> serde_json::Value {
+        struct IntentRoot(std::sync::Mutex<Option<SwapIntent>>);
+        #[async_graphql::Object]
+        impl IntentRoot {
+            async fn intent(&self) -> SwapIntent {
+                self.0.lock().unwrap().take().expect("one resolution per root")
+            }
+        }
+        let schema = async_graphql::Schema::build(
+            IntentRoot(std::sync::Mutex::new(Some(intent))),
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .data(st)
+        .finish();
+        let res = schema
+            .execute("{ intent { amountIn amountInDecimals stableOutDecimals finalizeAmountOutDecimals } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        res.data.into_json().unwrap()
     }
 
     /// A Solana mint is not an EVM address and has no single gate registration:

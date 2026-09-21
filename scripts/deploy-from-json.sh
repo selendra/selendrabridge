@@ -938,6 +938,9 @@ if [[ "$SEAL" == "true" ]]; then
   done
 else
   warn "gate.seal = false: the gates stay in their setup phase (setLocalToken instant). Dev only."
+  warn "  NOTE (M-1): since the 2026-09-21 contracts, \`claim\` REVERTS on an unsealed gate, and the"
+  warn "  setup phase expires by itself 7 days after deploy. An unsealed gate accepts sends and"
+  warn "  signatures and then cannot pay out — do not fund one."
 fi
 
 # --- assert the wiring -------------------------------------------------------

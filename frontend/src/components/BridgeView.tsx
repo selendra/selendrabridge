@@ -560,7 +560,10 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
         toChainId,
         receiver,
         fromChainId,
-        "0x"
+        "0x",
+        // M-10: the gate's u64 check is on the wire amount, so the encoder needs
+        // the same unit this form used for `amountTooWide` / `inexact`.
+        bridgeUnit ?? 1n
       );
       setTx({ kind: "pending", label: "Confirming send…", hash });
       const r = await waitReceiptFull(wallet.request, hash);

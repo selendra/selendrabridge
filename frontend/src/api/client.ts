@@ -136,6 +136,7 @@ export async function fetchSwapHistory(chainId?: number, limit?: number): Promis
   return gql<{ swapHistory: SwapHistoryEntry[] }>(
     `{ swapHistory(${args}) {
          chainId txHash sender receiver tokenIn tokenOut amountIn amountOut
+         amountInDecimals amountOutDecimals
          blockNumber createdAt
        } }`
   ).then((d) => d.swapHistory);

@@ -197,7 +197,8 @@ test("the same-chain swaps tab renders live swap history", async ({ page }) => {
   const res = await fetch(`${API}/graphql`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query: "{ swapHistory(limit:5){ chainId amountIn amountOut } }" }),
+    // Same limit the UI asks for, so the row counts are comparable.
+    body: JSON.stringify({ query: "{ swapHistory(limit:100){ chainId amountIn amountOut } }" }),
   });
   const rows = (await res.json()).data.swapHistory as unknown[];
 
@@ -209,9 +210,16 @@ test("the same-chain swaps tab renders live swap history", async ({ page }) => {
   if (rows.length === 0) {
     await expect(page.locator(".tbl__empty")).toContainText("No same-chain swaps recorded yet");
   } else {
-    // Which chain the rows came from depends on where swaps happened, so assert
-    // that rows render at all rather than naming one chain.
-    await expect(page.locator(".tbl tbody tr").first()).toBeVisible({ timeout: 25_000 });
+    // Which chain the rows came from depends on where swaps happened, so count
+    // rows rather than naming one chain. Counting DATA rows matters: a FAILING
+    // query also renders a <tr> (the error cell), so "the first row is visible"
+    // passes on a tab showing nothing but an error — which is exactly what an
+    // API older than the per-token scale fields produces (M-12's deployment
+    // order). Require the error cell to be absent and the count to match.
+    await expect(page.locator(".tbl tbody tr:not(:has(.tbl__empty))")).toHaveCount(rows.length, {
+      timeout: 25_000,
+    });
+    await expect(page.locator(".tbl__empty")).toHaveCount(0);
   }
 });
 

@@ -112,14 +112,26 @@ export function encodeSend(
   amount: bigint,
   chainIdTo: bigint,
   receiver: string,
-  autoParamsHex: string
+  autoParamsHex: string,
+  bridgeUnit: bigint = 1n
 ): string {
   // `receiver` is 0x-hex or a base58 Solana key (see encodeReceiver).
   const receiverHex = encodeReceiver(receiver);
-  // Mirror of Gate.send's H-3 check: a 32-byte receiver is a Solana account,
-  // and the Solana gate's amount is u64.
-  if (strip0x(receiverHex).length === 64 && amount > U64_MAX) {
-    throw new Error(`amount ${amount} exceeds 2^64-1, the widest a Solana receiver can claim (AmountTooWide)`);
+  // Mirror of Gate.send's H-3 check (`Gate.sol:869`): a 32-byte receiver is a
+  // Solana account, and the Solana gate's amount is u64.
+  //
+  // The cap binds the WIRE amount — `Gate.send` converts `amount` with
+  // `bridgeUnit` BEFORE comparing, so checking the local amount here refused
+  // every send above 2^64-1 LOCAL units. At 18 local / 6 bridge decimals that
+  // is ~18.45 tokens, nine orders of magnitude below the real limit, and the
+  // button said "Bridge" right up until this threw (audit 2026-09-16, M-10).
+  // `bridgeUnit` defaults to 1 so a caller that does not know it gets the
+  // conservative old behaviour rather than no check at all.
+  const wireAmount = bridgeUnit > 0n ? amount / bridgeUnit : amount;
+  if (strip0x(receiverHex).length === 64 && wireAmount > U64_MAX) {
+    throw new Error(
+      `amount ${amount} is ${wireAmount} in bridge decimals, which exceeds 2^64-1 — the widest a Solana receiver can claim (AmountTooWide)`
+    );
   }
   // head: token, amount, chainIdTo, off(receiver), off(autoParams) => 5 words.
   const recvTail = encBytesTail(receiverHex);
@@ -452,6 +464,10 @@ export function sendSwap(
   return sendTx(req, from, pool, encodeSwap(tokenIn, tokenOut, amountIn, minAmountOut, to), chainId);
 }
 
+/// `bridgeUnit` is the gate's `10^(localDecimals - bridgeDecimals)` for `token`
+/// — what `Gate.send` divides by before its u64 width check. The caller has
+/// already read it (the form needs it to reject fractional units); passing it
+/// keeps this check on the same quantity the gate applies it to (M-10).
 export function sendBridge(
   req: Eip1193Request,
   from: string,
@@ -461,13 +477,14 @@ export function sendBridge(
   chainIdTo: number,
   receiver: string,
   chainIdFrom: number,
-  autoParamsHex = "0x"
+  autoParamsHex = "0x",
+  bridgeUnit: bigint = 1n
 ): Promise<string> {
   return sendTx(
     req,
     from,
     gate,
-    encodeSend(token, amount, BigInt(chainIdTo), receiver, autoParamsHex),
+    encodeSend(token, amount, BigInt(chainIdTo), receiver, autoParamsHex, bridgeUnit),
     chainIdFrom
   );
 }

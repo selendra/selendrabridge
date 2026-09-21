@@ -94,6 +94,45 @@ export function formatUnitsRaw(raw: bigint, decimals: number): string {
   return (neg ? "-" : "") + (frac ? `${whole}.${frac}` : whole);
 }
 
+/**
+ * A transfer `amount` rendered at the scale it is actually in (M-11).
+ *
+ * `amount` is a WIRE amount: the asset's bridge decimals, which are mesh-wide
+ * and usually NOT the source token's own. The explorer used to fall back to the
+ * ERC-20's local decimals, then to 18, whenever the API served
+ * `bridgeDecimals: null` — which `scripts/run.sh` guaranteed, because it never
+ * emits `bridge_decimals` into the registry. At 6 bridge / 18 local decimals a
+ * 1,000-token transfer rendered as `0`, and an operator diagnosing a stuck
+ * transfer read a number that was a trillion times too small.
+ *
+ * With no scale from the API there is no honest way to place the point, so the
+ * raw integer is shown and labelled — see [`wireAmountTitle`]. A wrong number
+ * looks just as authoritative as a right one; an unformatted one does not.
+ */
+export function formatWireAmount(amount: string, bridgeDecimals: number | null | undefined): string {
+  if (bridgeDecimals == null) return amount;
+  return formatUnits(amount, bridgeDecimals);
+}
+
+/**
+ * Tooltip for [`formatWireAmount`], explaining an unscaled figure.
+ *
+ * `scaleName` names WHICH decimals these are, because the explorer shows two
+ * different kinds side by side: a transfer's `amount` is in the asset's
+ * mesh-wide bridge decimals, while a pool swap's `amountIn`/`amountOut` are in
+ * each token's own local decimals. Saying "bridge decimals" on a swap row would
+ * be a different wrong answer to the same question.
+ */
+export function wireAmountTitle(
+  amount: string,
+  decimals: number | null | undefined,
+  scaleName = "this asset's bridge decimals"
+): string {
+  return decimals == null
+    ? `Raw amount — ${scaleName} are unknown to the API, so the decimal point cannot be placed. ${amount} base units.`
+    : `${amount} base units at ${decimals} decimals (${scaleName})`;
+}
+
 /** Middle-truncate a hex string: 0x1234…abcd. */
 export function shortHex(hex: string, lead = 6, tail = 4): string {
   if (!hex || hex.length <= lead + tail + 2) return hex;

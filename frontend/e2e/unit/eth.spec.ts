@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import {
+  U64_MAX,
   WrongChainError,
   bridgeDecimalsFromUnit,
   encodeApprove,
@@ -199,6 +200,26 @@ test.describe("encodeSend", () => {
     expect(() => encodeSend(A, max + 1n, 7565164n, "0x" + "11".repeat(32), "0x")).toThrow(/AmountTooWide/);
     // a 20-byte EVM receiver is uncapped
     expect(() => encodeSend(A, max + 1n, 1338n, "0x" + "ee".repeat(20), "0x")).not.toThrow();
+  });
+
+  // M-10. `Gate.send` divides by `bridgeUnit` BEFORE the width check
+  // (`Gate.sol:869` compares `wireAmount`), so capping the LOCAL amount here
+  // refused every Solana-bound send above ~18.45 tokens at 18 local / 6 bridge
+  // decimals — the button read "Bridge", and clicking it threw.
+  test("the u64 cap is applied to the wire amount, not the local one", () => {
+    const b58 = "29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2";
+    const unit = 10n ** 12n; // 18 local - 6 bridge
+    const thousandTokens = 1000n * 10n ** 18n; // 1e9 wire units: nowhere near u64
+    expect(() => encodeSend(A, thousandTokens, 7565164n, b58, "0x", unit)).not.toThrow();
+    // The encoded calldata still carries the LOCAL amount — the gate converts.
+    const { words } = decode(encodeSend(A, thousandTokens, 7565164n, b58, "0x", unit));
+    expect(BigInt("0x" + words[1])).toBe(thousandTokens);
+
+    // An amount that genuinely overflows u64 once scaled is still refused.
+    const tooWide = (U64_MAX + 1n) * unit;
+    expect(() => encodeSend(A, tooWide, 7565164n, b58, "0x", unit)).toThrow(/AmountTooWide/);
+    // And with a 1:1 asset the old boundary is unchanged.
+    expect(() => encodeSend(A, U64_MAX + 1n, 7565164n, b58, "0x", 1n)).toThrow(/AmountTooWide/);
   });
 });
 

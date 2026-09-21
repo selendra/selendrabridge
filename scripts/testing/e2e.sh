@@ -122,6 +122,12 @@ echo "=== target setup: fund gate liquidity + register asset ==="
 cast send "$TOKEN_DST" "mint(address,uint256)" "$GATE_DST" $AMOUNT --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate, so sealing is no longer optional —
+# it is the last wiring step, exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 echo "=== writing configs ==="
 rm -f "$LOGS/validator-state.json"
 cat > "$LOGS/validator.toml" <<EOF

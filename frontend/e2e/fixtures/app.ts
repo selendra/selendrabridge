@@ -11,8 +11,9 @@ export { expect };
 
 /**
  * The chains' own RPCs, which the app reads DIRECTLY (not through the wallet):
- * `useChainDecimals` for the explorer's amounts, and — since H-2 — the Bridge
- * view asking the DESTINATION gate what scale it would pay an asset out in.
+ * since H-2, the Bridge view asks the DESTINATION gate what scale it would pay
+ * an asset out in. (The Explorer no longer reads any token decimals over RPC —
+ * since M-11/M-12 every amount arrives from the API with its own scale.)
  * Served here so tests don't depend on a live anvil.
  */
 export interface ChainRpcSetup {

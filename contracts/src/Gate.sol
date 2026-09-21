@@ -197,6 +197,16 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         Constant, not owner-settable, for the reason {UPGRADE_DELAY} is.
     uint256 public constant SCHEDULE_GRACE = 7 days;
 
+    /// @notice How long after {initialize} a brand-new gate may register corridors
+    ///         instantly. See {setupDeadline} for why this exists at all.
+    ///
+    /// @dev    Long enough to wire a mesh across time zones and a weekend, short
+    ///         enough that "we will seal it later" cannot become the permanent
+    ///         state of a funded gate. Constant, for the reason {UPGRADE_DELAY} is:
+    ///         an owner who could extend it could keep the instant path open for
+    ///         ever, which is the hole being closed.
+    uint256 public constant SETUP_WINDOW = 7 days;
+
     // --- corridor registry (appended in the H-1 / M-3 revision) ---
 
     /// @notice One-way flag: once set, registering a NEW corridor via
@@ -262,13 +272,31 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         WRITE-ONCE, and delayed after {seal}: see {setBridgeDecimals}.
     mapping(address token => BridgeDecimals) public bridgeDecimalsOf;
 
+    /// @notice When the instant-registration setup phase stops, regardless of
+    ///         whether anyone remembered to {seal}. Set once at {initialize}.
+    ///
+    /// @dev    Finding M-1. {isSealed} made the setup phase end on an OPERATOR
+    ///         ACTION, and nothing made that action happen: a gate left unsealed
+    ///         keeps one-block registration forever, which is round-4 H-1 verbatim
+    ///         on a funded gate. A deadline makes the phase end on its own.
+    ///
+    ///         ZERO MEANS EXPIRED, which is what makes this safe to append to a
+    ///         gate that is already live: the slot was part of `__gap`, so an
+    ///         existing gate reads 0 and gets the delayed path for every
+    ///         registration — fail-closed, and no behaviour change for a gate that
+    ///         is already sealed (it was on the delayed path anyway). Same for a
+    ///         legacy gate upgraded in place: it does NOT get a fresh instant
+    ///         window, which is the conservative reading.
+    uint256 public setupDeadline;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
     ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
     ///      `supportedChain` took one each: 49 -> 47. `bridgeDecimalsOf` took
-    ///      one: 47 -> 46. The gap still ends at slot 63.)
-    uint256[46] private __gap;
+    ///      one: 47 -> 46. `setupDeadline` took one: 46 -> 45. The gap still ends
+    ///      at slot 63.)
+    uint256[45] private __gap;
 
     /// @param amount the WIRE amount, in the asset's bridge decimals (see
     ///        {BridgeDecimals}) — what the submissionId commits to, not the local
@@ -338,6 +366,10 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @notice A destination chain was listed (`ok`) or de-listed for `send`.
     event SupportedChainSet(uint256 indexed chainId, bool ok);
 
+    /// @dev Emitted by {initializeV2}: this gate was migrated in place from a
+    ///      pre-decimals implementation, at identity scale.
+    event MigratedToV2(uint256 tokensRegistered, uint256 chainsListed);
+
     error NotOwner();
     error ZeroAmount();
     error AlreadyExecuted();
@@ -402,6 +434,10 @@ contract Gate is Initializable, UUPSUpgradeable {
     error ScheduleExpired(bytes32 key, uint256 readyAt);
     /// @dev {seal} was called on a gate that is already sealed
     error AlreadySealed();
+
+    /// @dev {claim} on a gate whose registry is still open. See {seal} and M-1:
+    ///      funds only ever leave a gate whose corridor list is final.
+    error NotSealed();
     /// @dev `send` towards a chain the owner has not listed in {supportedChain}
     error UnsupportedChain(uint256 chainIdTo);
     /// @dev a 32-byte (non-EVM) receiver was given an amount the destination VM
@@ -445,6 +481,8 @@ contract Gate is Initializable, UUPSUpgradeable {
         // `__self` immutable — so there is nothing to initialize.
         if (bridgeDomain_ == bytes32(0)) revert ZeroBridgeDomain();
         bridgeDomain = bridgeDomain_;
+        // The instant-registration phase starts here and ends on its own (M-1).
+        setupDeadline = block.timestamp + SETUP_WINDOW;
 
         owner = msg.sender;
         emit OwnershipTransferred(address(0), msg.sender);
@@ -466,6 +504,71 @@ contract Gate is Initializable, UUPSUpgradeable {
         }
         threshold = threshold_;
         emit ThresholdSet(threshold_);
+    }
+
+    /// @notice Migrate a gate deployed BEFORE the decimals revision, in the same
+    ///         transaction as the implementation swap. Call it as the `data` of
+    ///         `upgradeToAndCall`, never separately.
+    ///
+    /// @param legacyTokens every local token this gate already holds or pays out.
+    ///        Each is registered at IDENTITY scale — `bridgeDecimals ==
+    ///        decimals()` — so `bridgeUnit` is 1 and amounts keep the exact
+    ///        meaning the old code gave them. Tokens already registered are
+    ///        skipped, so the call is idempotent.
+    /// @param legacyChains every destination chain `send` was serving.
+    ///
+    /// @dev    FINDING M-2. The decimals revision added three mappings and made
+    ///         `claim`, `send` and `refund` depend on them. On the block a plain
+    ///         in-place upgrade landed, all three read zero, so `send` reverted
+    ///         `UnsupportedChain`, `claim` reverted `BridgeDecimalsUnset` — and so
+    ///         did `refund`, the one path documented as never halting, which meant
+    ///         the two-phase recovery could not rescue what the frozen claim had
+    ///         stranded. Seeding all of it here removes that window entirely:
+    ///         there is no block in which the new implementation is installed and
+    ///         the state it needs is missing.
+    ///
+    ///         WHY IDENTITY SCALE, AND NOT THE MESH'S REAL ONE. A pre-upgrade
+    ///         in-flight transfer put a LOCAL amount in the field that the new
+    ///         `claim` reads as a WIRE amount. Registering the mesh's real scale
+    ///         here would multiply every one of those by `bridgeUnit` — paying a
+    ///         power of ten too much, silently, to whoever claims first. Identity
+    ///         makes `bridgeUnit == 1`, so old ids settle for exactly what they
+    ///         always meant. And since registration is write-once, this gate keeps
+    ///         identity scale for ever: A GATE MIGRATED THIS WAY CAN NEVER JOIN A
+    ///         MESH THAT NORMALISES DECIMALS. Changing the scale of a live asset
+    ///         is a new deployment generation, not an upgrade — the same rule
+    ///         {bridgeDomain} already states, for the same reason.
+    ///
+    ///         `reinitializer(2)` so it runs exactly once, and never on a gate
+    ///         deployed by {initialize} at this version (that one is already at
+    ///         version 1 with the state seeded correctly — for a fresh gate this
+    ///         function is a no-op it should never need).
+    function initializeV2(address[] calldata legacyTokens, uint256[] calldata legacyChains)
+        external
+        reinitializer(2)
+    {
+        // `upgradeToAndCall` delegatecalls this with the caller preserved, so the
+        // owner check is the same one every other privileged entrypoint runs.
+        if (msg.sender != owner) revert NotOwner();
+
+        for (uint256 i = 0; i < legacyTokens.length; i++) {
+            address token = legacyTokens[i];
+            if (token == address(0)) revert ZeroAddress();
+            if (bridgeDecimalsOf[token].set) continue;
+            uint8 localDecimals = IERC20Metadata(token).decimals();
+            bridgeDecimalsOf[token] =
+                BridgeDecimals({set: true, bridgeDecimals: localDecimals, localDecimals: localDecimals});
+            emit BridgeDecimalsSet(token, localDecimals, localDecimals);
+        }
+
+        for (uint256 i = 0; i < legacyChains.length; i++) {
+            if (!supportedChain[legacyChains[i]]) {
+                supportedChain[legacyChains[i]] = true;
+                emit SupportedChainSet(legacyChains[i], true);
+            }
+        }
+
+        emit MigratedToV2(legacyTokens.length, legacyChains.length);
     }
 
     // ---------------------------------------------------------------------
@@ -683,7 +786,7 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (localToken == address(0)) revert ZeroAddress();
         address current = tokenOf[debridgeId];
         if (current != address(0)) revert LocalTokenAlreadySet(debridgeId, current);
-        if (isSealed) _consumeGovernance(setLocalTokenActionId(debridgeId, localToken));
+        if (!inSetupPhase()) _consumeGovernance(setLocalTokenActionId(debridgeId, localToken));
         // A corridor whose token cannot convert amounts could lock funds that no
         // claim can pay out. (A revert here also restores a consumed schedule.)
         if (!bridgeDecimalsOf[localToken].set) revert BridgeDecimalsUnset(localToken);
@@ -708,7 +811,7 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (bridgeDecimals > localDecimals || localDecimals - bridgeDecimals > 77) {
             revert InvalidBridgeDecimals(token, bridgeDecimals, localDecimals);
         }
-        if (isSealed) _consumeGovernance(setBridgeDecimalsActionId(token, bridgeDecimals));
+        if (!inSetupPhase()) _consumeGovernance(setBridgeDecimalsActionId(token, bridgeDecimals));
         bridgeDecimalsOf[token] =
             BridgeDecimals({set: true, bridgeDecimals: bridgeDecimals, localDecimals: localDecimals});
         emit BridgeDecimalsSet(token, bridgeDecimals, localDecimals);
@@ -782,6 +885,17 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (isSealed) revert AlreadySealed();
         isSealed = true;
         emit Sealed();
+    }
+
+    /// @notice True while corridors may still be registered in one block, i.e.
+    ///         before {seal} AND before {setupDeadline}.
+    ///
+    /// @dev    Two independent ends to the setup phase, because relying on the
+    ///         first one alone is finding M-1: {seal} is an operator action that
+    ///         nothing forced, and {setupDeadline} is the clock that ends the
+    ///         phase when nobody does. Whichever comes first wins.
+    function inSetupPhase() public view returns (bool) {
+        return !isSealed && block.timestamp <= setupDeadline;
     }
 
     /// @notice List (or de-list) a destination chain for `send`.
@@ -931,6 +1045,23 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes calldata nativeSender,
         bytes[] calldata signatures
     ) external whenNotPaused returns (bytes32 submissionId) {
+        // M-1: funds only ever leave a gate whose registry is final. {seal} used
+        // to be a runbook step consulted by no fund-moving function, so a gate
+        // that was funded and never sealed kept one-block re-registration — the
+        // round-4 H-1 drain, waiting. Refusing here makes sealing unskippable:
+        // an operator cannot run a bridge that pays out without it.
+        //
+        // HONEST LIMIT: this defends against the FORGOTTEN procedure, not against
+        // the owner key. A malicious owner still registers a fake corridor while
+        // unsealed, calls {seal}, and claims — three public transactions instead
+        // of two, with no notice period, because a corridor registered during
+        // setup is live the moment the gate is sealed. Closing that needs a
+        // cooling period between {seal} and the first claim, which would make
+        // every new mesh wait {GOVERNANCE_DELAY} before its first transfer; not
+        // taken here. Post-seal registrations DO get the delay, and the owner-key
+        // exposure itself is the operational finding (T-5).
+        if (!isSealed) revert NotSealed();
+
         submissionId = _idFor(
             debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
         );
@@ -1074,10 +1205,30 @@ contract Gate is Initializable, UUPSUpgradeable {
 
         // `send` locked exactly `toBridgeAmount(token, local)`, and the
         // registration is write-once, so this is exactly what was locked.
-        uint256 localAmount = toLocalAmount(token, amount);
+        uint256 localAmount = _refundLocalAmount(token, amount);
         IERC20(token).safeTransfer(sender, localAmount);
 
         emit Refunded(submissionId, debridgeId, sender, localAmount);
+    }
+
+    /// @dev The refund payout, which must work even for a token this gate has no
+    ///      registration for.
+    ///
+    ///      An unregistered token can only mean a LEGACY lock: since the decimals
+    ///      revision `send` goes through {toBridgeAmount}, which reverts when the
+    ///      token is unregistered, and a registration is write-once — so a
+    ///      `sentBy` entry for an unregistered token was necessarily written by
+    ///      the old implementation, whose amounts were raw local units. Returning
+    ///      `amount` unchanged is exactly what that transfer locked.
+    ///
+    ///      This is what keeps {refund}'s never-halting promise true through an
+    ///      in-place upgrade even if the operator skipped {initializeV2} (M-2). It
+    ///      cannot over-pay: the alternative multiplier is always >= 1, so the
+    ///      unregistered case pays the smallest amount the token could mean.
+    function _refundLocalAmount(address token, uint256 amount) internal view returns (uint256) {
+        BridgeDecimals memory d = bridgeDecimalsOf[token];
+        if (!d.set) return amount;
+        return amount * 10 ** (d.localDecimals - d.bridgeDecimals);
     }
 
     /// @notice Recompute a submissionId without executing (hash-equivalence tests).

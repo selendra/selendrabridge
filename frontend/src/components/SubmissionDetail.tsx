@@ -1,16 +1,14 @@
 import { useEffect, type ReactNode } from "react";
 import { StatusBadge, RefundBadge } from "./StatusBadge";
 import { Glyph, ArrowRight } from "./icons";
-import { chainViz, formatUnits, shortHex } from "../data/format";
+import { chainViz, formatWireAmount, shortHex, wireAmountTitle } from "../data/format";
 import { fetchHistory, fetchSubmission } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, HistoryEntry, Submission } from "../api/types";
-import { useChainDecimals, type DecimalsProvider } from "./useChainDecimals";
 
 interface Props {
   submissionId: string;
   chains: Chain[];
-  wallet?: DecimalsProvider | null;
   onClose: () => void;
 }
 
@@ -27,13 +25,12 @@ function chainName(chains: Chain[], id: number) {
   return chains.find((c) => c.chainId === id)?.name ?? `Chain ${id}`;
 }
 
-export function SubmissionDetail({ submissionId, chains, wallet, onClose }: Props) {
+export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
   const { data, error, loading } = usePoll<Submission | null>(
     () => fetchSubmission(submissionId),
     [submissionId],
     6000
   );
-  const decimalsByChain = useChainDecimals(chains, wallet);
 
   // Best-effort: only populated when graphql-api was started with --store-url.
   const { data: historyRows } = usePoll<HistoryEntry[]>(
@@ -91,7 +88,12 @@ export function SubmissionDetail({ submissionId, chains, wallet, onClose }: Prop
               {refund && refund.refundStatus !== "none" && <RefundBadge refundStatus={refund.refundStatus} />}
             </div>
 
-            <Row label="Amount">{formatUnits(data.amount, data.bridgeDecimals ?? decimalsByChain[data.chainIdFrom] ?? 18)} </Row>
+            <Row label="Amount">
+              <span title={wireAmountTitle(data.amount, data.bridgeDecimals)} data-testid="detail-amount">
+                {formatWireAmount(data.amount, data.bridgeDecimals)}
+              </span>
+              {data.bridgeDecimals == null && <span className="unit-unknown"> (raw units)</span>}
+            </Row>
             {refund && refund.refundStatus !== "none" && (
               <>
                 <Row label="Refund status">

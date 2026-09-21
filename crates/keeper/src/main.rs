@@ -29,6 +29,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
+use bridge_core::allow::AllowlistPolicy;
 use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use config::{ChainCfg, Config};
@@ -62,6 +63,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg_path = std::env::args().nth(1).unwrap_or_else(|| "keeper.toml".into());
     let cfg = Config::load(&cfg_path)?;
+
+    // Say so at startup: with this set, a store that serves an empty allowlist
+    // halts claiming rather than falling back to "allow everything" (M-5).
+    if cfg.allowlist.required() {
+        info!(
+            pinned_tokens = cfg.allowlist.pinned_tokens.len(),
+            pinned_chains = cfg.allowlist.pinned_chains.len(),
+            "allowlist enforcement REQUIRED"
+        );
+    }
 
     let signer = cfg.keeper.load("keeper").context("loading keeper signer")?;
     // Shared across every per-target loop (one HTTP client / one dir handle).
@@ -102,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
     for target in cfg.targets {
         let signer = signer.clone();
         let source = source.clone();
-        tasks.spawn(async move { run_target(target, signer, source).await });
+        let policy = cfg.allowlist.clone();
+        tasks.spawn(async move { run_target(target, signer, source, policy).await });
     }
 
     // And one refund loop per SOURCE chain. Refunds pay out where the funds were
@@ -135,7 +147,7 @@ async fn connect_gate(
     chain: &ChainCfg,
     signer: &PrivateKeySigner,
     role: &'static str,
-) -> anyhow::Result<(impl Provider + Clone, Address, GateView)> {
+) -> anyhow::Result<(impl Provider + Clone, Address, GateView, B256)> {
     let wallet = EthereumWallet::from(signer.clone());
     let gate_addr: Address = chain.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(chain.poll_interval_ms.max(1000));
@@ -180,15 +192,87 @@ async fn connect_gate(
         }
     };
 
+    // Read once: `bridgeDomain` is immutable for the life of a deployment (it is
+    // set in `initialize` and never written again), and every id this gate
+    // computes is bound to it. Needed to tell a claimable transfer from one
+    // signed under a PREVIOUS deployment — see [`gate_submission_id`].
+    let bridge_domain = loop {
+        match Gate::new(gate_addr, &provider).bridgeDomain().call().await {
+            Ok(d) => break d,
+            Err(e) => {
+                warn!(
+                    chain_id = chain.chain_id,
+                    error = %e,
+                    "reading Gate.bridgeDomain() failed; retrying (is this gate pre-domain?)"
+                );
+                tokio::time::sleep(retry).await;
+            }
+        }
+    };
+
     info!(
         keeper = %signer.address(),
         gate = %gate_addr,
         chain_id = chain.chain_id,
         threshold = view.threshold,
         validator_count = view.validator_count,
+        %bridge_domain,
         "{role} loop started"
     );
-    Ok((provider, gate_addr, view))
+    Ok((provider, gate_addr, view, bridge_domain))
+}
+
+/// The submissionId THIS gate will recompute from `rec`'s own params.
+///
+/// `Gate.claim`/`cancel`/`refund` all rebuild the id from calldata using their
+/// OWN `bridgeDomain` and verify the signatures against that (`Gate.sol:_idFor`).
+/// The keeper used to take the stored id and the eight params on trust and hand
+/// them straight to the gate — `grep bridge_domain crates/keeper` had no hits at
+/// all (audit 2026-09-16, M-6).
+///
+/// That makes a domain rotation — which the runbook MANDATES on every redeploy,
+/// per round-4 H-3 — into a permanent revert loop: every unclaimed pre-rotation
+/// row still carries the old domain, so the new gate computes a different id,
+/// finds no valid signatures over it, and reverts `NotEnoughSignatures` at
+/// estimateGas. Every check the keeper made passed, so it retried at 1 s
+/// forever, logging "claim failed" and naming no cause.
+///
+/// Comparing here turns that into one report per transfer, with the reason.
+fn gate_submission_id(rec: &SubmissionRecord, bridge_domain: B256) -> anyhow::Result<B256> {
+    // Recomputed through the SAME canonical hasher the store and validator use —
+    // with the gate's domain substituted for the record's — rather than a second
+    // copy of the hashing rules here. THE HASH IS SACRED.
+    let mut as_this_gate_sees_it = rec.clone();
+    as_this_gate_sees_it.bridge_domain = format!("{bridge_domain:#x}");
+    bridge_core::store::canonical_submission_id(&as_this_gate_sees_it)
+        .map_err(|e| anyhow::anyhow!("record params do not form a submissionId: {e}"))
+}
+
+/// Does this gate agree that `rec` is the transfer its id names?
+///
+/// `Err(reason)` is an operator-facing explanation for a transfer this gate can
+/// never accept, whatever the quorum.
+fn agrees_with_gate(rec: &SubmissionRecord, bridge_domain: B256) -> Result<(), &'static str> {
+    let claimed = match B256::from_str(&rec.submission_id) {
+        Ok(v) => v,
+        Err(_) => return Err("submission_id is not a 32-byte hash"),
+    };
+    match gate_submission_id(rec, bridge_domain) {
+        Ok(computed) if computed == claimed => Ok(()),
+        Ok(_) => {
+            let stored_domain = B256::from_str(&rec.bridge_domain).ok();
+            if stored_domain != Some(bridge_domain) {
+                Err("signed under a DIFFERENT bridgeDomain than this gate's — the domain was \
+                     rotated (or this is the wrong gate), so the gate recomputes another id and \
+                     no signature can ever satisfy it; this transfer belongs to the previous \
+                     deployment and must be refunded there")
+            } else {
+                Err("params do not hash to the stored submissionId — the store paired them \
+                     wrongly; refusing to put them in calldata")
+            }
+        }
+        Err(_) => Err("params do not form a submissionId at all"),
+    }
 }
 
 /// Claim loop for a single destination chain.
@@ -196,9 +280,10 @@ async fn run_target(
     target: ChainCfg,
     signer: PrivateKeySigner,
     source: Arc<StoreBackend>,
+    policy: AllowlistPolicy,
 ) -> anyhow::Result<()> {
     let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
-    let (provider, gate_addr, mut view) = connect_gate(&target, &signer, "target").await?;
+    let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&target, &signer, "target").await?;
     let gate = Gate::new(gate_addr, &provider);
 
     // Submissions already reported UNCLAIMABLE on this chain. Bounded in practice
@@ -213,8 +298,21 @@ async fn run_target(
         // Allowlist for this tick. Fail-closed: if the sig-store is unreachable,
         // skip the tick rather than claim on a stale view. None => file mode
         // (no central allowlist, enforcement disabled).
-        let allowlist = match source.fetch_allowlist().await {
-            Ok(a) => a,
+        // Two ways this can refuse, and both skip the tick rather than claim:
+        // the fetch failed (transport), or it succeeded and the policy rejects
+        // what came back — an empty list where one is required, or a served list
+        // missing a locally pinned entry (audit 2026-09-16, M-5).
+        let allowlist = match source.fetch_allowlist().await.map(|v| policy.check(v)) {
+            Ok(Ok(a)) => a,
+            Ok(Err(refusal)) => {
+                warn!(
+                    chain_id = target.chain_id,
+                    reason = %refusal,
+                    "REFUSING to claim on the served allowlist; skipping tick"
+                );
+                tokio::time::sleep(retry).await;
+                continue;
+            }
             Err(e) => {
                 warn!(chain_id = target.chain_id, error = %e, "allowlist fetch failed; skipping tick");
                 tokio::time::sleep(retry).await;
@@ -267,6 +365,22 @@ async fn run_target(
                 .member_signatures(&gate, &rec.submission_id, SigKind::Cancel, &rec.cancel_signatures)
                 .await;
             if cancel_sigs.len() as u64 >= view.threshold {
+                // `Gate.cancel` rebuilds the id from these params too, so a
+                // record this gate cannot arrive at is as uncancellable as it is
+                // unclaimable — and the cancel branch `continue`s, so without
+                // this it would never reach the claim path's report (M-6).
+                if let Err(reason) = agrees_with_gate(&rec, bridge_domain) {
+                    if stranded.should_report(&rec.submission_id) {
+                        warn!(
+                            chain_id = target.chain_id,
+                            submission_id = %rec.submission_id,
+                            reason,
+                            "UNCANCELLABLE — this gate recomputes a different submissionId for \
+                             these params, so no quorum can satisfy it"
+                        );
+                    }
+                    continue;
+                }
                 if !pending.may_submit(&provider, &rec.submission_id, SigKind::Cancel).await {
                     continue;
                 }
@@ -314,7 +428,7 @@ async fn run_target(
             if !pending.may_submit(&provider, &rec.submission_id, SigKind::Transfer).await {
                 continue;
             }
-            match try_claim(&gate, &rec, &claim_sigs).await {
+            match try_claim(&gate, &rec, &claim_sigs, bridge_domain).await {
                 Ok(ClaimOutcome::Submitted(tx)) => {
                     stranded.clear(&rec.submission_id);
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
@@ -390,9 +504,11 @@ async fn run_source_refunds(
     store: Arc<StoreBackend>,
 ) -> anyhow::Result<()> {
     let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
-    let (provider, gate_addr, mut view) = connect_gate(&src, &signer, "source refund").await?;
+    let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&src, &signer, "source refund").await?;
     let gate = Gate::new(gate_addr, &provider);
     let mut pending = PendingTxs::default();
+    // Reported-once memo, as in the claim loop.
+    let mut stranded = StrandedLog::default();
 
     loop {
         view.refresh_if_stale(&gate).await;
@@ -419,7 +535,19 @@ async fn run_source_refunds(
             if (refund_sigs.len() as u64) < view.threshold {
                 continue;
             }
-            if !pending.may_submit(&provider, &rec.submission_id, SigKind::Refund).await {
+            // `Gate.refund` rebuilds the id as well. A pre-rotation row reads
+            // `sentBy == 0` on the new gate and was already skipped silently;
+            // say why instead, once per transfer (M-6).
+            if let Err(reason) = agrees_with_gate(&rec, bridge_domain) {
+                if stranded.should_report(&rec.submission_id) {
+                    warn!(
+                        chain_id = src.chain_id,
+                        submission_id = %rec.submission_id,
+                        reason,
+                        "UNREFUNDABLE at this gate — it recomputes a different submissionId for \
+                         these params"
+                    );
+                }
                 continue;
             }
             match try_refund(&gate, &rec, &refund_sigs).await {
@@ -440,6 +568,7 @@ async fn run_source_refunds(
             }
         }
         pending.retain_seen(&seen);
+        stranded.retain_seen(&seen);
         tokio::time::sleep(Duration::from_millis(src.poll_interval_ms)).await;
     }
 }
@@ -694,6 +823,7 @@ async fn try_claim<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
+    bridge_domain: B256,
 ) -> anyhow::Result<ClaimOutcome> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -714,6 +844,11 @@ async fn try_claim<P: Provider>(
             "receiver is not a 20-byte EVM address (a 32-byte one is addressed for \
              another VM and reverts BadReceiver here)",
         ));
+    }
+
+    // Before any RPC: would this gate even arrive at this id? (M-6.)
+    if let Err(reason) = agrees_with_gate(rec, bridge_domain) {
+        return Ok(ClaimOutcome::Stranded(reason));
     }
 
     if gate.executed(submission_id).call().await? {
@@ -1636,5 +1771,98 @@ mod tests {
             ClaimOutcome::AlreadyExecuted
         );
         assert_ne!(ClaimOutcome::Stranded("a"), ClaimOutcome::Stranded("b"));
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    /// A record whose id is genuinely `keccak(params)` under `domain`, as the
+    /// store would hold it.
+    fn record_under(domain: B256) -> SubmissionRecord {
+        let token = Address::repeat_byte(0x11);
+        let debridge_id = bridge_core::debridge_id(U256::from(1337u64), token);
+        let receiver = Address::repeat_byte(0xAB).to_vec();
+        let id = bridge_core::submission_id(
+            domain,
+            debridge_id,
+            U256::from(100u64),
+            U256::from(1337u64),
+            U256::from(7u64),
+            U256::from(42u64),
+            &receiver,
+        );
+        SubmissionRecord {
+            submission_id: format!("{id:#x}"),
+            bridge_domain: format!("{domain:#x}"),
+            debridge_id: format!("{debridge_id:#x}"),
+            amount: "100".into(),
+            chain_id_from: 1337,
+            chain_id_to: 7,
+            nonce: 42,
+            receiver: format!("0x{}", hex::encode(&receiver)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: format!("{token:#x}"),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    /// M-6. Rotating `BRIDGE_DOMAIN` is MANDATED on every redeploy (round-4
+    /// H-3), and every unclaimed pre-rotation row still carries the old one. The
+    /// gate rebuilds the id from calldata with its OWN domain, so it looks for
+    /// signatures over an id nobody signed and reverts `NotEnoughSignatures` at
+    /// estimateGas — which the keeper retried at 1 s, forever, logging "claim
+    /// failed" and naming no cause.
+    #[test]
+    fn a_transfer_from_a_previous_deployment_is_reported_not_retried() {
+        let old_domain = B256::repeat_byte(0xD0);
+        let new_domain = B256::repeat_byte(0xD1);
+        let rec = record_under(old_domain);
+
+        // The gate it was signed for still accepts it.
+        assert!(agrees_with_gate(&rec, old_domain).is_ok());
+
+        // The redeployed gate can never arrive at that id, and says so.
+        let reason = agrees_with_gate(&rec, new_domain).expect_err("must not be submitted");
+        assert!(reason.contains("bridgeDomain"), "the reason must name the cause: {reason}");
+        assert!(reason.contains("rotated"), "{reason}");
+
+        // And the id it WOULD compute really is a different one — i.e. the
+        // check is not just comparing the stored domain string.
+        let computed = gate_submission_id(&rec, new_domain).unwrap();
+        assert_ne!(format!("{computed:#x}"), rec.submission_id);
+    }
+
+    /// The other way the pair can disagree: same domain, but the store handed us
+    /// params that do not hash to the id the signatures are over. Those params
+    /// are what becomes calldata, so they must not be submitted either — and the
+    /// operator needs to hear a different reason, because the fix is different.
+    #[test]
+    fn params_that_do_not_hash_to_their_id_are_refused_with_their_own_reason() {
+        let domain = B256::repeat_byte(0xD0);
+        let mut rec = record_under(domain);
+        rec.amount = "101".into(); // one digit, hashed by nobody
+
+        let reason = agrees_with_gate(&rec, domain).expect_err("must not be submitted");
+        assert!(reason.contains("do not hash"), "{reason}");
+        assert!(!reason.contains("rotated"), "a param mismatch is not a rotation: {reason}");
+
+        // A malformed id is refused before anything is hashed.
+        let mut bad = record_under(domain);
+        bad.submission_id = "0xnope".into();
+        assert!(agrees_with_gate(&bad, domain).is_err());
+    }
+
+    /// The happy path must stay untouched: an ordinary in-domain transfer is
+    /// submitted exactly as before.
+    #[test]
+    fn a_current_transfer_is_unaffected() {
+        let domain = B256::repeat_byte(0xD0);
+        assert!(agrees_with_gate(&record_under(domain), domain).is_ok());
     }
 }

@@ -11,6 +11,8 @@ const submissions = [
     submissionId: SUB_A,
     debridgeId: "0x" + "11".repeat(32),
     amount: "1500000000000000000",
+    // An 18/18 asset: the API says so rather than leaving the view to guess.
+    bridgeDecimals: 18,
     chainIdFrom: 1337,
     chainIdTo: 1338,
     nonce: 1,
@@ -25,6 +27,7 @@ const submissions = [
     submissionId: SUB_B,
     debridgeId: "0x" + "22".repeat(32),
     amount: "500000000000000000",
+    bridgeDecimals: 18,
     chainIdFrom: 1338,
     chainIdTo: 1337,
     nonce: 2,
@@ -49,6 +52,8 @@ const swapHistory = [
     tokenOut: "0x" + "bb".repeat(20),
     amountIn: "1000000000000000000",
     amountOut: "990000000000000000",
+    amountInDecimals: 18,
+    amountOutDecimals: 18,
     blockNumber: 12,
     createdAt: "2026-08-01T10:00:00Z",
   },
@@ -121,6 +126,36 @@ test("formats an amount in the bridge decimals the API reports, not the token's"
   await expect(page.locator(".tbl__row").first().locator(".tbl__amount")).toHaveText("2.5");
 });
 
+/**
+ * M-11. `amount` is a WIRE amount. When the API cannot name its scale
+ * (`bridgeDecimals: null` — which `scripts/run.sh` guarantees, since it never
+ * emits `bridge_decimals`), the explorer used to format it with the source
+ * ERC-20's own decimals, then with 18. A 1,000-token transfer at 6 bridge / 18
+ * local decimals rendered as `0`: an operator diagnosing a stuck transfer read
+ * a number a trillion times too small, with nothing to say it was a guess.
+ */
+test("shows raw units rather than a wrong amount when the API cannot name the scale", async ({ page }) => {
+  // 1,000 tokens at 6 bridge decimals, on a chain whose token has 18.
+  await openExplorer(page, {
+    submissions: [{ ...submissions[0], amount: "1000000000", bridgeDecimals: null }],
+  });
+  const cell = page.locator(".tbl__row").first().locator('[data-testid="submission-amount"]');
+  // Not "0", and not 1000 either — nothing here can honestly place the point.
+  await expect(cell).toHaveText("1000000000");
+  await expect(cell).toHaveClass(/tbl__amount--raw/);
+  await expect(cell).toHaveAttribute("title", /bridge decimals are unknown/i);
+});
+
+test("the detail drawer marks an unscaled amount too", async ({ page }) => {
+  await openExplorer(page, {
+    submissions: [{ ...submissions[0], amount: "1000000000", bridgeDecimals: null }],
+    submissionStatus: { [SUB_A.toLowerCase()]: "READY" },
+  });
+  await page.locator(".tbl__row").first().click();
+  await expect(page.locator('[data-testid="detail-amount"]')).toHaveText("1000");
+  await expect(page.locator(".drawer")).toContainText("(raw units)");
+});
+
 test("renders the lifecycle status per row", async ({ page }) => {
   await openExplorer(page);
   await expect(page.locator(".tbl__row").first()).toContainText(/Ready/i);
@@ -186,6 +221,22 @@ test("switches to the same-chain swaps tab", async ({ page }) => {
   await expect(page.locator(".tbl tbody tr").first()).toContainText("Chain A");
 });
 
+/** A backend too old to serve `amountInDecimals`/`amountOutDecimals` answers the
+ *  swaps query with a GraphQL error. That used to be swallowed into `[]`, so the
+ *  tab said "No same-chain swaps recorded yet" — a claim about the CHAIN, made on
+ *  the strength of a failed request. The deployment order (API before UI) is a
+ *  real constraint, so getting it wrong has to be legible. */
+test("an API error in the swaps tab is reported, not shown as an empty chain", async ({ page }) => {
+  await openExplorer(page, {
+    swapHistoryError: 'Unknown field "amountInDecimals" on type "SwapHistoryEntry".',
+  });
+  await page.getByRole("button", { name: "Same-chain swaps" }).click();
+  const empty = page.locator(".tbl__empty");
+  await expect(empty).toContainText("Couldn’t load swaps");
+  await expect(empty).toContainText("amountInDecimals");
+  await expect(empty).not.toContainText("No same-chain swaps recorded yet");
+});
+
 test("the swaps tab bounds its query with integer literals", async ({ page }) => {
   const { backend } = await openExplorer(page, { swapHistory });
   await page.getByRole("button", { name: "Same-chain swaps" }).click();
@@ -194,6 +245,44 @@ test("the swaps tab bounds its query with integer literals", async ({ page }) =>
     // Only `chainId: <digits>` and `limit: <digits>` may appear.
     expect(q).toMatch(/swapHistory\((chainId: \d+(, )?)?(limit: \d+)?\)/);
   }
+});
+
+/**
+ * The same class as M-11, one level down: a swap crosses TWO tokens, so
+ * `amountIn` and `amountOut` are in different scales. Both used to be formatted
+ * with `decimalsByChain[sw.chainId]` — the chain's DEFAULT token's decimals —
+ * which is right only when the pool happens to trade that token against another
+ * of equal width. A 1 WETH -> 3,180 USDC trade (18 in, 6 out) showed the output
+ * as 0.00000000000000318.
+ */
+test("scales each side of a swap by its own token, not the chain's default", async ({ page }) => {
+  await openExplorer(page, {
+    swapHistory: [
+      {
+        ...swapHistory[0],
+        amountIn: "1000000000000000000", // 1 WETH, 18dp
+        amountInDecimals: 18,
+        amountOut: "3180000000", // 3,180 USDC, 6dp
+        amountOutDecimals: 6,
+      },
+    ],
+  });
+  await page.getByRole("button", { name: "Same-chain swaps" }).click();
+  await expect(page.locator('[data-testid="swap-amount-in"]')).toHaveText("1");
+  await expect(page.locator('[data-testid="swap-amount-out"]')).toHaveText("3,180");
+});
+
+test("a swap whose token decimals the API could not read shows raw units", async ({ page }) => {
+  await openExplorer(page, {
+    swapHistory: [
+      { ...swapHistory[0], amountOut: "3180000000", amountOutDecimals: null },
+    ],
+  });
+  await page.getByRole("button", { name: "Same-chain swaps" }).click();
+  const out = page.locator('[data-testid="swap-amount-out"]');
+  await expect(out).toHaveText("3180000000");
+  await expect(out).toHaveClass(/tbl__amount--raw/);
+  await expect(out).toHaveAttribute("title", /this token's decimals are unknown/i);
 });
 
 test("an empty swaps tab says so rather than showing a blank table", async ({ page }) => {

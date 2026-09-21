@@ -68,6 +68,7 @@ contract UpgradeTest is Test {
         g.setBridgeDecimals(address(dstToken), 18);
         dstToken.mint(address(g), 1_000 ether);
         g.setLocalToken(debridgeId, address(dstToken));
+        g.seal();
     }
 
     // -----------------------------------------------------------------

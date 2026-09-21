@@ -30,9 +30,10 @@
 //!                                           examine (still requires on-chain checks)
 //!
 //!   # observed terminal states (Indexer scope ONLY — authoritative)
-//!   POST   /submissions/:id/observed/claimed   {"claim_tx":  ".."} -> mark_claimed
-//!   POST   /submissions/:id/observed/cancelled {"cancel_tx": ".."} -> mark_cancelled
-//!   POST   /submissions/:id/observed/refunded  {"refund_tx": ".."} -> mark_refunded
+//!   # 404 for an id this store has no submission row for (M-4); retryable.
+//!   POST   /submissions/:id/observed/claimed   {"claim_tx":  ".."} -> mark_claimed_observed
+//!   POST   /submissions/:id/observed/cancelled {"cancel_tx": ".."} -> mark_cancelled_observed
+//!   POST   /submissions/:id/observed/refunded  {"refund_tx": ".."} -> mark_refunded_observed
 //!
 //! The lifecycle (`status`, `refund_status`) gates the claim and refund queues,
 //! so it moves only on an OBSERVED on-chain `Claimed`/`Cancelled`/`Refunded`,
@@ -341,10 +342,13 @@ fn require_credentials(auth: &Auth, allow_unauthenticated: bool) -> anyhow::Resu
 /// Map a DbError to an HTTP error, distinguishing caller faults (4xx) from
 /// server faults (5xx) so a forged signature reads as 400, not 500.
 fn db_err(e: DbError) -> (StatusCode, String) {
-    let code = if e.is_client_error() {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+    let code = match &e {
+        // Its own status so the caller can tell "I sent nonsense" from "you do
+        // not know this transfer yet" and retry the second (audit 2026-09-16,
+        // M-4).
+        DbError::UnknownSubmission(_) => StatusCode::NOT_FOUND,
+        e if e.is_client_error() => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, e.to_string())
 }
@@ -569,11 +573,26 @@ async fn get_refund_candidates(
 // Solana relayer's observer loop, which reads the gate's `["executed", id]` /
 // `["refunded", id]` marker PDAs at `finalized` and reports what it saw. Each
 // handler is a thin skin over the SAME `Db::mark_*` the indexer calls on an EVM
-// event, park-if-missing included: a `Claimed` observed before the source `Sent`
-// row exists is parked and applied when the row arrives, exactly as for an EVM
-// destination during backfill. Nothing here reads the caller's word about
-// anything but the tx it saw; the scope is what makes the caller trustworthy,
-// and the scope is handed to nothing else.
+// event — with ONE deliberate difference: a report for a submission this store
+// has never seen is refused (404), not parked.
+//
+// Parking here was round-4 M-1's primitive surviving under a different scope
+// (audit 2026-09-16, M-4). submissionIds are deterministic and nonces
+// sequential, so an attacker holding `SIG_STORE_INDEXER_TOKEN` can COMPUTE the
+// ids of transfers that have not happened yet. Posting them pre-armed a marker
+// for each: the moment the real `Sent` row arrived, `status='claimed'` was
+// applied and the transfer vanished from `pending_claims`,
+// `sweep_refund_eligible` and `refund_candidates` at once — permanently, since
+// nothing writes `status` back. The EVM indexer still parks, because it writes
+// to Postgres directly from inside the trust boundary and genuinely does read
+// a destination `Claimed` before the source `Sent` during backfill.
+//
+// The observer loses nothing real: it reports terminal markers for transfers
+// whose signatures it posted to this same store first, so the row is always
+// already here. A 404 is retryable, and the next tick re-reads the same marker.
+// Nothing here reads the caller's word about anything but the tx it saw; the
+// scope is what makes the caller trustworthy, and the scope is handed to
+// nothing else.
 
 /// An observed destination `Claimed`. Authoritative — see the group note.
 async fn post_observed_claimed(
@@ -581,7 +600,7 @@ async fn post_observed_claimed(
     Path(id): Path<String>,
     Json(body): Json<ClaimedRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_claimed(&id, &body.claim_tx).await.map_err(db_err)?;
+    s.db.mark_claimed_observed(&id, &body.claim_tx).await.map_err(db_err)?;
     info!(submission_id = %id, claim_tx = %body.claim_tx, "observed Claimed (reported by an observer)");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -592,7 +611,7 @@ async fn post_observed_cancelled(
     Path(id): Path<String>,
     Json(body): Json<ObservedCancelledRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_cancelled(&id, &body.cancel_tx).await.map_err(db_err)?;
+    s.db.mark_cancelled_observed(&id, &body.cancel_tx).await.map_err(db_err)?;
     info!(submission_id = %id, cancel_tx = %body.cancel_tx, "observed Cancelled (reported by an observer)");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -603,7 +622,7 @@ async fn post_observed_refunded(
     Path(id): Path<String>,
     Json(body): Json<ObservedRefundedRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_refunded(&id, &body.refund_tx).await.map_err(db_err)?;
+    s.db.mark_refunded_observed(&id, &body.refund_tx).await.map_err(db_err)?;
     info!(submission_id = %id, refund_tx = %body.refund_tx, "observed Refunded (reported by an observer)");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1201,6 +1220,63 @@ mod tests {
         assert_eq!(row.claim_tx.as_deref(), Some(claim.claim_tx.as_str()));
     }
 
+    /// M-4 (round-4 M-1 under a different scope). `SIG_STORE_INDEXER_TOKEN`
+    /// lives in one container, and compromising it used to be enough to make
+    /// transfers that had not happened yet disappear the moment they did:
+    /// submissionIds are deterministic and nonces sequential, so the attacker
+    /// computes upcoming ids, POSTs a `claimed` marker for each, and every one
+    /// is applied on arrival — out of `pending_claims`, out of the refund sweep,
+    /// out of `refund_candidates`, permanently, since nothing writes `status`
+    /// back. Funds stay in the gate and no queue shows them.
+    ///
+    /// The whole attack, end to end, against the real routes.
+    #[tokio::test]
+    async fn a_future_submission_id_cannot_be_pre_poisoned() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
+        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+
+        let chain_to = 700_000 + (std::process::id() as u64 % 90_000);
+        // Three transfers the attacker knows are coming but that nobody has
+        // signed yet — exactly what a leaked Indexer token can compute.
+        let coming: Vec<SubmissionRecord> = (0..3).map(|_| signed_record(chain_to)).collect();
+
+        for rec in &coming {
+            let id = &rec.submission_id;
+            for (route, body) in [
+                ("claimed", serde_json::json!({ "claim_tx": "0xdeadbeef" })),
+                ("cancelled", serde_json::json!({ "cancel_tx": "0xdeadbeef" })),
+                ("refunded", serde_json::json!({ "refund_tx": "0xdeadbeef" })),
+            ] {
+                let uri = format!("/submissions/{}/observed/{route}", &id[2..]);
+                let res = post_json(app.clone(), &uri, Some(OBS), &body).await;
+                assert_eq!(res.status(), StatusCode::NOT_FOUND, "{route} on an unknown id must be refused");
+            }
+        }
+
+        // The transfers now happen, exactly as they would have anyway.
+        for rec in &coming {
+            assert_eq!(post_json(app.clone(), "/submissions", Some(VAL), rec).await.status(), StatusCode::OK);
+        }
+        db.sweep_refund_eligible(chrono::Duration::seconds(-1)).await.unwrap();
+
+        // Every one of them is visible and actionable: nothing was lying in wait.
+        let queue: Vec<SubmissionRecord> =
+            get_json(app.clone(), &format!("/submissions?pending=claims&chain_id_to={chain_to}"), KEEP).await;
+        let candidates: Vec<SubmissionRecord> = get_json(app.clone(), "/refund-candidates", VAL).await;
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=100", READ).await;
+        for rec in &coming {
+            let id = &rec.submission_id;
+            let is = |r: &SubmissionRecord| r.submission_id.eq_ignore_ascii_case(id);
+            assert!(queue.iter().any(is), "{id} must be claimable");
+            assert!(candidates.iter().any(is), "{id} must be reachable by the refund path");
+            let row = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(id)).expect("in history");
+            assert_eq!(row.status, "signed", "{id} arrived un-poisoned");
+            assert_eq!(row.claim_tx, None, "no attacker tx hash attached");
+        }
+    }
+
     /// THE fix for delivered EVM->Solana transfers that stayed `signed` forever:
     /// an OBSERVED claim reported on the Indexer-scoped route is authoritative —
     /// the row flips to `claimed`, leaves the claim queue, and a stale `eligible`
@@ -1246,18 +1322,26 @@ mod tests {
         assert_eq!(row.refund_status, "none", "the stale eligible flag is cleared");
         assert!(!row.stuck);
 
-        // A report for an id with no row yet PARKS (unlike the advisory route):
-        // when the row appears it comes up claimed, never queued — the same
-        // backfill behaviour the EVM indexer relies on.
+        // M-4: a report for an id this store has never seen is REFUSED, and
+        // leaves nothing behind. It used to be parked, which is what made a
+        // future id pre-poisonable — see `a_future_submission_id_cannot_be_pre_poisoned`.
         let future = signed_record(chain_to);
         let fid = future.submission_id.clone();
         let furi = format!("/submissions/{}/observed/claimed", &fid[2..]);
-        assert_eq!(post_json(app.clone(), &furi, Some(OBS), &claim).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(post_json(app.clone(), &furi, Some(OBS), &claim).await.status(), StatusCode::NOT_FOUND);
         let mut observed = future.clone();
         observed.signatures.clear();
         db.observe_submission(observed).await.unwrap();
         let q: Vec<SubmissionRecord> = get_json(app.clone(), &queue_uri, KEEP).await;
-        assert!(!q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&fid)), "parked marker applied on arrival");
+        assert!(q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&fid)), "arrives queued, not pre-claimed");
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let frow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&fid)).unwrap();
+        assert_eq!(frow.status, "signed", "no marker was waiting for it");
+
+        // ...and the observer's own report lands normally once the row exists,
+        // which is the only ordering it can actually produce: it posts the
+        // signatures to this store before it ever reads the gate's marker.
+        assert_eq!(post_json(app.clone(), &furi, Some(OBS), &claim).await.status(), StatusCode::NO_CONTENT);
         let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
         let frow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&fid)).unwrap();
         assert_eq!(frow.status, "claimed");

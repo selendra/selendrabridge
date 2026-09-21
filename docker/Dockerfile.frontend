@@ -16,6 +16,15 @@ RUN bun run build
 
 # nginx-unprivileged runs as uid 101 and listens on 8080 — no root, no cap_net.
 FROM nginxinc/nginx-unprivileged:1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+# A template, so the entrypoint's envsubst can set the CSP's `connect-src` per
+# deployment (M-16). It lands as conf.d/default.conf exactly as the plain file
+# used to.
+COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
+# The RPC endpoints are runtime registry data, so the image cannot enumerate
+# them. This default blocks plaintext exfiltration and allows the loopback
+# endpoints local stacks use; a deployment that knows its origins should pass a
+# narrower list. An UNSET variable would envsubst to an empty directive and
+# break every request, so it is set here rather than left to the operator.
+ENV BRIDGE_CSP_CONNECT_SRC="'self' https: wss: http://127.0.0.1:* http://localhost:*"
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 8080

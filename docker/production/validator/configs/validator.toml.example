@@ -121,3 +121,19 @@ block_confirmation = 64
 chain_id = 56
 rpcs = ["https://your-bsc-node.example.com"]
 gate = "0x0000000000000000000000000000000000000000"
+
+# --- allowlist enforcement (audit 2026-09-16, M-5) ----------------------------
+#
+# The sig-store is UNTRUSTED. Until this block exists, an empty or absent
+# allowlist means "no restriction" — which is also what a compromised or
+# truncated store serves, so the kill-switch could be switched off by the very
+# component it guards against. Opting in turns that into a refusal: the node
+# skips the tick (logging why) rather than acting on a list it cannot trust.
+#
+# `require = true` alone is enough. Pinning names entries that MUST be present,
+# which also catches a partial truncation; pinning implies `require`.
+#
+# [allowlist]
+# require = true
+# pinned_tokens = ["0x…debridge_id…"]
+# pinned_chains = [[11155111, 560048]]

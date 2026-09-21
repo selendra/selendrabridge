@@ -15,15 +15,30 @@
 #   docker compose up -d anvil-src anvil-dst
 #   bash docker/deploy.sh                 # deploys + wires on both chains
 #   docker compose up -d                  # brings up the rest, health-ordered
-#   # open http://localhost:8080 (UI) and http://localhost:8088 (GraphiQL)
-#   # send a transfer on localhost:8545 and watch it flow through to EXECUTED.
+#   # open http://localhost:8080 (UI); send a transfer on localhost:8545 and
+#   # watch it flow through to EXECUTED.
+#
+# For GraphiQL + schema introspection, add the dev override (M-15) — it is opt-in
+# because this file is the template people adapt for a real deployment:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# EXPOSURE (audit 2026-09-16, M-15):
+#   * Every published port binds 127.0.0.1 ONLY. A bare `8545:8545` listens on
+#     every interface AND writes its own DNAT rule, which bypasses ufw/firewalld
+#     — an open unauthenticated RPC and a schema-dumping endpoint. To reach the
+#     stack from elsewhere, front it with the TLS + auth terminator in
+#     docker/production/, do not republish on 0.0.0.0.
+#   * Postgres and the sig-store are not published at all (internal network).
+#   * graphql-api runs with `--production`: no GraphiQL, no introspection, and
+#     `chains` serves only the keyless `public_rpc_url`.
 #
 # PRODUCTION NOTES:
-#   * Postgres and the sig-store are NOT published to the host here (internal
-#     network only). The anvils/UI/GraphQL are, for local use.
 #   * Set real secrets: one per service (see the sig-store block below), e.g.
 #       SIG_STORE_VALIDATOR_TOKEN=$(openssl rand -hex 32) docker compose up -d
-#   * Replace the anvil services + baked keys/addresses with your real chains.
+#   * Replace the anvil services + baked keys/addresses with your real chains,
+#     and give each a `public_rpc_url` in docker/configs/chains.json — a keyless
+#     endpoint safe to hand to a browser. `--production` refuses to start without
+#     one, which is the point: it is the only url the API serves publicly.
 
 x-restart: &restart
   restart: unless-stopped
@@ -34,7 +49,7 @@ services:
     <<: *restart
     # foundry image entrypoint wraps the command in a shell, hence one string.
     command: ["anvil --host 0.0.0.0 --chain-id 1337"]
-    ports: ["8545:8545"]
+    ports: ["127.0.0.1:8545:8545"]
     healthcheck:
       test: ["CMD", "cast", "chain-id", "--rpc-url", "http://localhost:8545"]
       interval: 3s
@@ -45,7 +60,7 @@ services:
     image: ghcr.io/foundry-rs/foundry:latest@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17
     <<: *restart
     command: ["anvil --host 0.0.0.0 --chain-id 1338"]
-    ports: ["8546:8545"]
+    ports: ["127.0.0.1:8546:8545"]
     healthcheck:
       test: ["CMD", "cast", "chain-id", "--rpc-url", "http://localhost:8545"]
       interval: 3s
@@ -200,6 +215,13 @@ services:
       - "2"
       - "--chains-file"
       - "/configs/chains.json"
+      # M-15: GraphiQL and introspection OFF, and `chains` serves only the
+      # keyless `public_rpc_url`. This file's own header tells operators to swap
+      # in their real chains, so its DEFAULT is what ends up facing the
+      # internet. For local exploration add the dev override, which turns the
+      # playground back on:
+      #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+      - "--production"
     environment:
       # READ-ONLY, and this is now the service's ONLY credential. It used to also
       # carry DATABASE_URL with the same full-privilege `bridge` role the
@@ -212,7 +234,7 @@ services:
       RUST_LOG: "graphql_api=info"
     volumes:
       - ./docker/configs:/configs:ro
-    ports: ["8088:8088"]
+    ports: ["127.0.0.1:8088:8088"]
     depends_on:
       sig-store:
         condition: service_healthy
@@ -229,7 +251,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.frontend
     <<: *restart
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8080:8080"]
     depends_on:
       graphql-api:
         condition: service_healthy

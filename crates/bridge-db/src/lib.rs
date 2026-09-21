@@ -39,6 +39,15 @@ pub enum DbError {
          deliberately."
     )]
     LastAllowlistEntry(&'static str),
+    /// A lifecycle report names a submission this store has never seen, on a
+    /// path that may not park it for later (audit 2026-09-16, M-4). See
+    /// [`Missing::Reject`].
+    #[error(
+        "no submission {0} — a lifecycle report is only accepted for a transfer \
+         this store already knows about. If the report is genuine, it arrived \
+         before the source `Sent` row: it will be accepted once that row exists."
+    )]
+    UnknownSubmission(String),
 }
 
 /// Canonical form of a submissionId used as the DB key everywhere: lowercase,
@@ -162,6 +171,7 @@ impl DbError {
             DbError::Store(e) => !matches!(e, StoreError::Io(_) | StoreError::Json(_)),
             DbError::BadField(_) => true,
             DbError::LastAllowlistEntry(_) => true,
+            DbError::UnknownSubmission(_) => true,
             DbError::Sqlx(_) => false,
         }
     }
@@ -511,6 +521,26 @@ struct Marker<'a> {
     refund_status: Option<&'a str>,
 }
 
+/// What a lifecycle write does when it names a submission with no row yet.
+///
+/// The two callers differ, and the difference is the whole of M-4. The EVM
+/// indexer reads each chain in its own loop, so a destination `Claimed` really
+/// can arrive before the source `Sent` — routinely, during backfill — and it
+/// writes to Postgres directly, from inside the trust boundary. The HTTP
+/// `/observed/*` routes are outside it: a holder of the Indexer-scoped token
+/// could park markers for ids that have not happened yet (submissionIds are
+/// deterministic and nonces sequential, so future ids are computable), and each
+/// one would land the instant its transfer appeared — `status='claimed'`, hidden
+/// from `pending_claims`, `sweep_refund_eligible` and `refund_candidates`, with
+/// nothing that ever writes it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Missing {
+    /// Park the marker and apply it when the row arrives. In-process callers.
+    Park,
+    /// Refuse with [`DbError::UnknownSubmission`]. The HTTP routes.
+    Reject,
+}
+
 impl Marker<'static> {
     const NONE: Marker<'static> =
         Marker { status: "", claim_tx: None, cancel_tx: None, refund_tx: None, refund_status: None };
@@ -853,6 +883,22 @@ impl Db {
     /// `executed` flag makes that impossible), so seeing one would mean the two
     /// chains disagree, and quietly overwriting it would hide that.
     pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
+        self.mark_claimed_with(submission_id, claim_tx, Missing::Park).await
+    }
+
+    /// [`Db::mark_claimed`] for a report that arrived over HTTP: identical,
+    /// except that an id with no submission row is REFUSED rather than parked
+    /// (audit 2026-09-16, M-4 — see [`Missing`]).
+    pub async fn mark_claimed_observed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
+        self.mark_claimed_with(submission_id, claim_tx, Missing::Reject).await
+    }
+
+    async fn mark_claimed_with(
+        &self,
+        submission_id: &str,
+        claim_tx: &str,
+        missing: Missing,
+    ) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
         checked_tx_ref("claim_tx", claim_tx)?;
         const SQL: &str = "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
@@ -871,6 +917,7 @@ impl Db {
             affected,
             Retry { sql: SQL, arg: claim_tx },
             Marker { status: "claimed", claim_tx: Some(claim_tx), ..Marker::NONE },
+            missing,
         )
         .await
     }
@@ -939,13 +986,20 @@ impl Db {
         rows_affected: u64,
         retry: Retry<'_>,
         marker: Marker<'_>,
+        missing: Missing,
     ) -> Result<(), DbError> {
         if rows_affected > 0 {
             return Ok(());
         }
+        // The row exists but the UPDATE matched nothing — a guard in the SQL
+        // declined it (`mark_cancelled` will not overwrite `refunded`). Not a
+        // missing submission, so `Reject` does not apply.
         if self.submission_exists(id).await? {
             self.lifecycle_update(retry.sql, id, retry.arg).await?;
             return Ok(());
+        }
+        if missing == Missing::Reject {
+            return Err(DbError::UnknownSubmission(id.to_string()));
         }
         sqlx::query(
             "INSERT INTO pending_lifecycle \
@@ -1008,6 +1062,20 @@ impl Db {
     /// This is the state that unlocks refund attestations, so it is only ever
     /// written from an observed on-chain event, never from a relayer's say-so.
     pub async fn mark_cancelled(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
+        self.mark_cancelled_with(submission_id, cancel_tx, Missing::Park).await
+    }
+
+    /// [`Db::mark_cancelled`] for an HTTP report: an unknown id is refused (M-4).
+    pub async fn mark_cancelled_observed(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
+        self.mark_cancelled_with(submission_id, cancel_tx, Missing::Reject).await
+    }
+
+    async fn mark_cancelled_with(
+        &self,
+        submission_id: &str,
+        cancel_tx: &str,
+        missing: Missing,
+    ) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
         checked_tx_ref("cancel_tx", cancel_tx)?;
         const SQL: &str = "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
@@ -1018,12 +1086,27 @@ impl Db {
             affected,
             Retry { sql: SQL, arg: cancel_tx },
             Marker { cancel_tx: Some(cancel_tx), refund_status: Some("cancelled"), ..Marker::NONE },
+            missing,
         )
         .await
     }
 
     /// Record that the source gate returned the funds (`Gate.Refunded`).
     pub async fn mark_refunded(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
+        self.mark_refunded_with(submission_id, refund_tx, Missing::Park).await
+    }
+
+    /// [`Db::mark_refunded`] for an HTTP report: an unknown id is refused (M-4).
+    pub async fn mark_refunded_observed(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
+        self.mark_refunded_with(submission_id, refund_tx, Missing::Reject).await
+    }
+
+    async fn mark_refunded_with(
+        &self,
+        submission_id: &str,
+        refund_tx: &str,
+        missing: Missing,
+    ) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
         checked_tx_ref("refund_tx", refund_tx)?;
         const SQL: &str = "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
@@ -1034,6 +1117,7 @@ impl Db {
             affected,
             Retry { sql: SQL, arg: refund_tx },
             Marker { refund_tx: Some(refund_tx), refund_status: Some("refunded"), ..Marker::NONE },
+            missing,
         )
         .await
     }

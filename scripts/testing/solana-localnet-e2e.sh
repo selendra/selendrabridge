@@ -3,8 +3,11 @@
 #
 # Prereqs (one-time):
 #   * a solana-test-validator container listening on 127.0.0.1:8899, e.g.:
-#       docker run -d --name solana-node -p 8899:8899 -p 8900:8900 \
+#       docker run -d --name solana-node \
+#         -p 127.0.0.1:8899:8899 -p 127.0.0.1:8900:8900 \
 #         solanalabs/solana:v1.18.26 solana-test-validator --ledger /tmp/ledger --quiet
+#     (loopback-pinned on purpose — M-9: a bare `-p 8899:8899` publishes an
+#     unauthenticated validator RPC on every interface, past the host firewall.)
 #   * the BPF program built:  bash scripts/testing/build-solana.sh
 #   * the WSL Solana CLI + a native (nvm) node toolchain installed.
 #

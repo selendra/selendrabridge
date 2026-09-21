@@ -86,6 +86,8 @@ contract RefundTest is Test {
         dstGate.setBridgeDecimals(address(dstToken), 18);
         dstToken.mint(address(dstGate), 1_000 ether);
         dstGate.setLocalToken(debridgeId, address(dstToken));
+        srcGate.seal();
+        dstGate.seal();
 
         vm.chainId(CHAIN_SRC);
     }

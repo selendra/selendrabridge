@@ -116,6 +116,12 @@ DEBRIDGE_ID=$(cast keccak "0x$(printf '%064x' $SRC_CHAIN)${TOKEN#0x}")
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$TOKEN_DST" \
   --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
+
 echo "=== writing validator config (dead RPC first → failover guard) ==="
 cat > "$VCFG" <<EOF
 [source]

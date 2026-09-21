@@ -78,14 +78,35 @@ wait_status() { # $1=debridge_id $2=want  -> 0 once history reaches that status
   for i in $(seq 1 80); do [[ "$(hist_status_for "$1")" == "$2" ]] && return 0; sleep 0.25; done; return 1
 }
 
+# The CLAIM evidence this topology can actually produce.
+#
+# `status = claimed` is written only by `Db::mark_claimed`, reachable from the
+# EVM indexer or the Indexer-scoped /observed/claimed route. This script runs
+# NEITHER — validator, keeper and sig-store only. Round 4 made the keeper's own
+# report advisory (`note_keeper_claim` writes `keeper_claim_tx` and nothing
+# else), which silently made a `wait_status … claimed` assertion unreachable:
+# the bridge worked, the check could never pass (audit 2026-09-16). So assert
+# the keeper's report, and pin the outcome on the chain itself via `executed`.
+hist_keeper_claimtx_for() { # $1=debridge_id -> keeper's reported claim tx, or NONE
+  curl -fsS "$STORE_URL/history" | python3 -c "import sys,json;d=json.load(sys.stdin);m=[r for r in d if r['debridge_id'].lower()=='${1,,}'];print((m[0].get('keeper_claim_tx') or m[0].get('claim_tx') or 'NONE') if m else 'NONE')"
+}
+wait_keeper_claim() { # $1=debridge_id -> 0 once the keeper has reported a claim tx
+  for i in $(seq 1 80); do [[ "$(hist_keeper_claimtx_for "$1")" == 0x* ]] && return 0; sleep 0.25; done; return 1
+}
+
 echo "=== building binaries ==="
 ( cd "$ROOT" && cargo build -p validator -p keeper -p sig-store >/dev/null 2>&1 ) || fail "cargo build failed"
 
 echo "=== starting Postgres in Docker ($PG_NAME on :$PG_PORT) ==="
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+# M-9 (audit 2026-09-16): publish the database on LOOPBACK only. A docker `-p`
+# publish writes its own DNAT rule and bypasses ufw/firewalld, so a bare
+# `-p 5433:5432` with POSTGRES_PASSWORD=bridge hands this database — signatures,
+# allowlists, cursors — to anyone who can reach the host. The launchers were
+# fixed in round 4; these harnesses were not.
 docker run -d --name "$PG_NAME" \
   -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
-  -p ${PG_PORT}:5432 postgres:16-alpine >/dev/null
+  -p 127.0.0.1:${PG_PORT}:5432 postgres:16-alpine >/dev/null
 for i in $(seq 1 60); do
   docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && break
   sleep 0.5
@@ -138,6 +159,12 @@ cast send "$TOKEN_GOOD_DST" "mint(address,uint256)" "$GATE_DST" 1000000000000000
 cast send "$TOKEN_BAD_DST"  "mint(address,uint256)" "$GATE_DST" 1000000000000000000000 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DID_GOOD" "$TOKEN_GOOD_DST" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DID_BAD"  "$TOKEN_BAD_DST"  --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
+
+# M-1: `claim` reverts on an unsealed gate — sealing is the last wiring step,
+# exactly as production does it (run.sh, deploy-from-json.sh).
+echo "=== sealing gates (claim requires it) ==="
+seal_gate "$SRC_RPC" "$KEY0" "$GATE_SRC"
+seal_gate "$DST_RPC" "$KEY0" "$GATE_DST"
 
 echo "=== starting Postgres-backed sig-store ($STORE_URL) ==="
 # --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
@@ -215,13 +242,15 @@ send() { # $1=token $2=chainTo
 echo
 echo "########## CHECK 1: allowlisted token bridges + lands in history ##########"
 send "$TOKEN_GOOD" $DST_CHAIN
-wait_status "$DID_GOOD" claimed || fail "allowlisted GOOD transfer never reached status=claimed"
-TX=$(hist_claimtx_for "$DID_GOOD")
+wait_keeper_claim "$DID_GOOD" || fail "allowlisted GOOD transfer: keeper never reported a claim tx"
+TX=$(hist_keeper_claimtx_for "$DID_GOOD")
+STATUS=$(hist_status_for "$DID_GOOD")
 GOOD_BAL=$(bal "$TOKEN_GOOD_DST" "$RECEIVER" "$DST_RPC")
-echo "  history: status=claimed claim_tx=$TX  receiver good-bal=$GOOD_BAL"
-[[ "$TX" == 0x* ]]          || fail "history claim_tx for GOOD missing"
+echo "  history: status=$STATUS keeper_claim_tx=$TX  receiver good-bal=$GOOD_BAL"
+[[ "$TX" == 0x* ]]             || fail "history keeper_claim_tx for GOOD missing"
+[[ "$STATUS" == "signed" || "$STATUS" == "claimed" ]] || fail "unexpected history status for GOOD: $STATUS"
 [[ "$GOOD_BAL" == "$AMOUNT" ]] || fail "receiver was not paid the GOOD amount"
-echo "✅ GOOD token bridged 100, history shows status=claimed with a claim_tx"
+echo "✅ GOOD token bridged 100, persisted in Postgres, keeper claim tx recorded"
 
 echo
 echo "########## CHECK 2: NON-allowlisted token is blocked (no signature, no claim) ##########"
@@ -242,8 +271,8 @@ echo "########## CHECK 3: allowlist the token (live) → next transfer bridges #
 SIG_STORE="$STORE_URL" bash "$ROOT/scripts/testing/allowlist.sh" add-token $SRC_CHAIN "$TOKEN_BAD" BAD >/dev/null
 echo "  added BAD token to allowlist; sending again"
 send "$TOKEN_BAD" $DST_CHAIN
-wait_status "$DID_BAD" claimed || fail "token did not bridge after being allowlisted"
-echo "  receiver bad-bal=$(bal "$TOKEN_BAD_DST" "$RECEIVER" "$DST_RPC")  history status=claimed"
+wait_keeper_claim "$DID_BAD" || fail "token did not bridge after being allowlisted"
+echo "  receiver bad-bal=$(bal "$TOKEN_BAD_DST" "$RECEIVER" "$DST_RPC")  keeper_claim_tx=$(hist_keeper_claimtx_for "$DID_BAD")"
 [[ "$(bal "$TOKEN_BAD_DST" "$RECEIVER" "$DST_RPC")" == "$AMOUNT" ]] || fail "receiver not paid after allowlisting"
 echo "✅ once allowlisted, the same token bridges and is claimed (live refresh, no restart)"
 
@@ -261,7 +290,7 @@ echo "✅ allowed token to a non-allowlisted chain pair → blocked"
 echo
 echo "================= DB E2E RESULT ================="
 echo "✅ Postgres-backed sig-store works end to end:"
-echo "   • transaction history persisted in Postgres (status signed→claimed + claim_tx)"
+echo "   • transaction history persisted in Postgres (status=signed + keeper claim tx)"
 echo "   • token allowlist enforced at the validator (and keeper)"
 echo "   • chain-pair allowlist enforced"
 echo "   • allowlist edits apply live (no restart)"
