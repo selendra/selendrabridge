@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+log-scrub = { workspace = true }
 # `abi` lets a dir-backed mutation reuse the store trust boundary (id<->params +
 # signature auth); `http` lets us front the remote sig-store instead of a dir.
 # `axum-auth` brings the shared rate-limit layer (same one the sig-store uses).

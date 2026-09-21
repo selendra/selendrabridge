@@ -1,0 +1,13 @@
+[package]
+name = "log-scrub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately dependency-light: the Solana relayer cannot depend on
+# `bridge-core` (its unconditional `alloy-primitives` clashes with the relayer's
+# <1.4 pin), and duplicating this logic in two places is exactly how the two
+# mirrored `Submission` structs drifted. One tiny crate both sides can share.
+[dependencies]
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }

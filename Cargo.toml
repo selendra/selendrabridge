@@ -11,6 +11,7 @@ members = [
     "crates/indexer",
     "crates/swap-math",
     "crates/price-keeper",
+    "crates/log-scrub",
 ]
 # The deployable Solana BPF program is built with the Solana toolchain
 # (`cargo build-sbf`), not the host workspace — its solana-program/spl-token deps
@@ -26,6 +27,7 @@ license = "MIT"
 swap-math = { path = "crates/swap-math" }
 bridge-solana = { path = "crates/bridge-solana" }
 bridge-core = { path = "crates/bridge-core" }
+log-scrub = { path = "crates/log-scrub" }
 bridge-db = { path = "crates/bridge-db" }
 
 alloy = { version = "1.0", features = [

@@ -15,6 +15,9 @@ description = "The Solana leg's off-chain runner: scan Sent, sign, and submit cl
 # chain client with the EVM side.
 
 [dependencies]
+# Shared with the workspace crates so the log scrubbing cannot drift between
+# the two halves of the bridge (see crates/log-scrub).
+log-scrub = { path = "../log-scrub" }
 # NOT bridge-core: its `alloy-primitives` dependency is unconditional (it backs
 # the core hashing), and alloy's zeroize ^1.5 cannot coexist with solana-client's
 # <1.4 pin. Making it optional would mean gutting bridge-core for every other

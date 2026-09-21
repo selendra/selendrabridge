@@ -125,7 +125,21 @@ fn stale_leg(pool: &Pool, rec_in: &TokenRec, rec_out: &TokenRec, now: i64) -> an
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+/// `anyhow`'s default `Error:` print goes straight to stderr, around the
+/// subscriber the daemons install — and a transport failure inside it carries
+/// the RPC URL, which on a keyed endpoint is the provider key (found in the
+/// live mesh9 logs, 2026-09-21). So this scrubs the one line it prints.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", log_scrub::scrub(&format!("{e:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = argv
         .iter()

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+log-scrub = { workspace = true }
 # The Postgres source of truth. A bearer token (SIG_STORE_TOKEN) authenticates
 # the HTTP boundary; bridge-db ALSO reuses bridge-core's trust-boundary
 # validation (id<->params binding + signature authentication) as defense in

@@ -9,6 +9,7 @@ description = "Keeps EVM SwapPool prices fresh: re-asserts (or steps toward) con
 # solana-client and alloy cannot share a binary. Both plan with swap-math::refresh.
 
 [dependencies]
+log-scrub = { workspace = true }
 bridge-core = { workspace = true, features = ["abi"] }
 swap-math = { workspace = true }
 alloy = { workspace = true }

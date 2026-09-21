@@ -104,12 +104,9 @@ impl Config {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "solana_price_keeper=info".into()),
-        )
-        .init();
+    // Scrubbed writer: a transport error carries the URL it failed on, and on a
+    // keyed endpoint that is the provider key (see `log_scrub`).
+    log_scrub::init("solana_price_keeper=info");
 
     let path = std::env::args().nth(1).unwrap_or_else(|| "solana-price-keeper.toml".into());
     let raw = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;

@@ -95,6 +95,8 @@ impl Store {
     ) -> anyhow::Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(token) = token.as_deref().filter(|t| !t.is_empty()) {
+            // Never log this value, whichever layer ends up formatting it.
+            log_scrub::register_secret(token);
             let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| anyhow::anyhow!("sig-store token is not a valid header value"))?;
             v.set_sensitive(true);

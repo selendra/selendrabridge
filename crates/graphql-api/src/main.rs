@@ -127,12 +127,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "graphql_api=info".into()),
-        )
-        .init();
+    // Scrubbed writer: a transport error carries the URL it failed on, and on a
+    // keyed endpoint that is the provider key (see `log_scrub`).
+    log_scrub::init("graphql_api=info");
 
     let args = Args::parse();
 

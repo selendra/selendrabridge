@@ -140,7 +140,21 @@ impl Args {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// `anyhow`'s default `Error:` print goes straight to stderr, around the
+/// subscriber the daemons install — and a transport failure inside it carries
+/// the RPC URL, which on a keyed endpoint is the provider key (found in the
+/// live mesh9 logs, 2026-09-21). So this scrubs the one line it prints.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", log_scrub::scrub(&format!("{e:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // The command is the first bare token that is NOT a flag's value. Skipping
     // only `--`-prefixed tokens is not enough: `--rpc https://…` would make the
@@ -658,4 +672,21 @@ fn main() -> anyhow::Result<()> {
     let sig = rpc.send_and_confirm_transaction(&tx)?;
     println!("{cmd} OK — tx {sig}");
     Ok(())
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    /// The `Error:` line this binary prints is outside any subscriber, so it
+    /// gets the scrub explicitly. Pins that a transport failure carrying a
+    /// keyed RPC URL cannot reach stderr in the clear.
+    #[test]
+    fn the_error_line_cannot_carry_an_rpc_key() {
+        let e = anyhow::anyhow!(
+            "reading the gate: error sending request for url (https://solana-devnet.rpc.example/v2/alch_Ex4mpl3K3y-N0t-Re4l7): dns error"
+        );
+        let printed = format!("{}", log_scrub::scrub(&format!("{e:?}")));
+        assert!(!printed.contains("alch_Ex4mpl3K3y-N0t-Re4l7"), "{printed}");
+        assert!(printed.contains("https://solana-devnet.rpc.example/v2/<redacted>"), "{printed}");
+        assert!(printed.contains("dns error"), "{printed}");
+    }
 }

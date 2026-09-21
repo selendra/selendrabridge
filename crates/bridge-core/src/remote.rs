@@ -109,6 +109,8 @@ impl RemoteStore {
         let base = base.into().trim_end_matches('/').to_string();
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(token) = token.as_deref().filter(|t| !t.is_empty()) {
+            // Never log this value, whichever layer ends up formatting it.
+            log_scrub::register_secret(token);
             if let Ok(mut value) =
                 reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             {

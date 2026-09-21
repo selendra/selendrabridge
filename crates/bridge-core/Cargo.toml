@@ -17,6 +17,7 @@ http = ["dep:reqwest"]
 axum-auth = ["dep:axum"]
 
 [dependencies]
+log-scrub = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy = { workspace = true, optional = true }
 serde = { workspace = true }
