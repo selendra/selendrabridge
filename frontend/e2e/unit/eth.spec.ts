@@ -27,7 +27,9 @@ import {
   waitReceiptFull,
   rpcRequest,
   type Eip1193Request,
+  SENT_SIGNATURE,
 } from "../../src/wallet/eth";
+import { bytesToHex, keccak256 } from "../../src/wallet/keccak";
 
 /**
  * `src/wallet/eth.ts` — the hand-rolled ABI codec.
@@ -250,24 +252,27 @@ test.describe("encodeAutoParamsTo", () => {
 test.describe("encodeFinalize", () => {
   const debridgeId = "0x" + "22".repeat(32);
 
-  test("chains three dynamic tails from a seven-word head", () => {
+  test("chains three dynamic tails from an eight-word head", () => {
     const receiver = "0x" + "33".repeat(20);
     const nativeSender = "0x" + "44".repeat(20);
     const auto = encodeAutoParamsTo(0n, 0n, receiver, encodeSwapIntent(A, B, 1n));
 
     const { selector, words } = decode(
-      encodeFinalize(debridgeId, 999n, 1337n, 5n, receiver, auto, nativeSender)
+      encodeFinalize(debridgeId, 999n, 6, 1337n, 5n, receiver, auto, nativeSender)
     );
-    expect(selector).toBe("c2c1fffb");
+    expect(selector).toBe("705f6b62");
     expect(words[0]).toBe("22".repeat(32));
     expect(words[1]).toBe(word(999n));
-    expect(words[2]).toBe(word(1337n));
-    expect(words[3]).toBe(word(5n));
+    // The wire scale rides as a full word here — calldata is abi.encode'd, not
+    // packed; it is only one raw byte inside the submissionId preimage.
+    expect(words[2]).toBe(word(6n));
+    expect(words[3]).toBe(word(1337n));
+    expect(words[4]).toBe(word(5n));
 
-    const offReceiver = Number(BigInt("0x" + words[4]));
-    const offAuto = Number(BigInt("0x" + words[5]));
-    const offNs = Number(BigInt("0x" + words[6]));
-    expect(offReceiver).toBe(224); // 7 head words
+    const offReceiver = Number(BigInt("0x" + words[5]));
+    const offAuto = Number(BigInt("0x" + words[6]));
+    const offNs = Number(BigInt("0x" + words[7]));
+    expect(offReceiver).toBe(256); // 8 head words
 
     // Each offset must equal the previous one plus that tail's full length.
     const tailLen = (off: number) => 32 + Math.ceil(Number(BigInt("0x" + words[off / 32])) / 32) * 32;
@@ -279,7 +284,7 @@ test.describe("encodeFinalize", () => {
   });
 
   test("rejects a debridgeId that is not 32 bytes", () => {
-    expect(() => encodeFinalize("0x1234", 1n, 1n, 1n, "0x", "0x", "0x")).toThrow(/bad bytes32/);
+    expect(() => encodeFinalize("0x1234", 1n, 6, 1n, 1n, "0x", "0x", "0x")).toThrow(/bad bytes32/);
   });
 });
 
@@ -319,7 +324,7 @@ test.describe("chain-id binding", () => {
       ],
       [
         "finalize",
-        () => sendFinalize(req, FROM, A, "0x" + "22".repeat(32), 1n, 1337, 1, "0x", "0x", "0x", 1338),
+        () => sendFinalize(req, FROM, A, "0x" + "22".repeat(32), 1n, 6, 1337, 1, "0x", "0x", "0x", 1338),
       ],
     ];
 
@@ -348,7 +353,7 @@ test.describe("chain-id binding", () => {
   test("finalize binds to the DESTINATION chain, not the transfer's origin", async () => {
     const { req, calls } = stubProvider({ chainId: 1338 });
     // chainIdFrom is 1337 (a hashed field); finalize executes on 1338.
-    await sendFinalize(req, FROM, A, "0x" + "22".repeat(32), 1n, 1337, 1, "0x", "0x", "0x", 1338);
+    await sendFinalize(req, FROM, A, "0x" + "22".repeat(32), 1n, 6, 1337, 1, "0x", "0x", "0x", 1338);
     const tx = calls[1].params?.[0] as { chainId: string };
     expect(tx.chainId).toBe("0x53a"); // 1338
   });
@@ -524,18 +529,22 @@ test.describe("receipts", () => {
 });
 
 test.describe("extractSent", () => {
-  const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+  // Derived from the signature, exactly as `eth.ts` does — a literal here would
+  // be a second copy to forget, and H-2 has already changed this event once.
+  const SENT_TOPIC0 = bytesToHex(keccak256(new TextEncoder().encode(SENT_SIGNATURE)));
   const submissionId = "0x" + "11".repeat(32);
   const debridgeId = "0x" + "22".repeat(32);
-  // Sent's non-indexed data: amount at word 0, nonce at word 4.
-  const data = "0x" + word(777n) + word(0n) + word(0n) + word(0n) + word(9n);
+  // Sent's non-indexed data: amount(0), bridgeDecimals(1), chainIdFrom(2),
+  // chainIdTo(3), off(receiver)(4), nonce(5).
+  const data =
+    "0x" + word(777n) + word(6n) + word(0n) + word(0n) + word(0n) + word(9n);
 
-  test("pulls the id, debridgeId, amount and nonce out of the log", () => {
+  test("pulls the id, debridgeId, amount, wire scale and nonce out of the log", () => {
     const sent = extractSent(
       [{ address: A, topics: [SENT_TOPIC0, submissionId, debridgeId], data }],
       A
     );
-    expect(sent).toEqual({ submissionId, debridgeId, amount: 777n, nonce: 9n });
+    expect(sent).toEqual({ submissionId, debridgeId, amount: 777n, bridgeDecimals: 6, nonce: 9n });
   });
 
   test("matches the gate address case-insensitively", () => {

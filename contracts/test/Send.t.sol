@@ -44,6 +44,7 @@ contract SendTest is Test {
         bytes32 indexed submissionId,
         bytes32 indexed debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 chainIdTo,
         bytes receiver,
@@ -77,7 +78,7 @@ contract SendTest is Test {
 
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, address(token));
         bytes32 expectedId = BridgeHash.getSubmissionId(
-            TEST_BRIDGE_DOMAIN, debridgeId, amount, block.chainid, CHAIN_TO, 0, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, 18, amount, block.chainid, CHAIN_TO, 0, receiver
         );
 
         vm.expectEmit(true, true, true, true);
@@ -85,6 +86,7 @@ contract SendTest is Test {
             expectedId,
             debridgeId,
             amount,
+            18,
             block.chainid,
             CHAIN_TO,
             receiver,

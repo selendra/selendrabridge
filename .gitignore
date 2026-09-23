@@ -67,6 +67,12 @@ scripts/*.config.local
 # Solana keypair files for the devnet leg — real ed25519 private keys.
 .solana/
 
+# Staging area for a new generation's fresh key material (validators, keeper,
+# Solana program + relayer payer) before `bridge-from-json.sh` copies it into
+# docker/<mesh>/keys/. Real private keys, same rule as .solana/.
+.mesh10-keys/
+.mesh*-keys/
+
 # editors, tooling, OS
 .vs/
 .idea/*

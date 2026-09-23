@@ -61,6 +61,8 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
 
     // --- EVM side: user sends 100 units to a 32-byte Solana token account -------
     let amount: u64 = 100_000;
+    // The mesh's wire scale for this asset — inside the submissionId since H-2.
+    const BRIDGE_DECIMALS: u8 = 6;
     let receiver: Vec<u8> = vec![0xCA; 32]; // Solana token account (32 bytes)
     let evm_sender: Vec<u8> = vec![0xBE; 20];
     let nonce = 0u64;
@@ -69,6 +71,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
     let id = bridge_core::submission_id(
         MESH_DOMAIN.into(),
         debridge_id.into(),
+        BRIDGE_DECIMALS,
         U256::from(amount),
         U256::from(EVM_CHAIN_ID),
         U256::from(SOLANA_CHAIN_ID),
@@ -79,7 +82,16 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
 
     // The Solana gate must recompute the identical id.
     assert_eq!(
-        gate.id_for(&debridge_id, amount, EVM_CHAIN_ID, SOLANA_CHAIN_ID, nonce, &receiver, None),
+        gate.id_for(
+            &debridge_id,
+            amount,
+            BRIDGE_DECIMALS,
+            EVM_CHAIN_ID,
+            SOLANA_CHAIN_ID,
+            nonce,
+            &receiver,
+            None
+        ),
         id,
         "solana gate recomputes a different submissionId than the EVM gate emitted"
     );
@@ -88,6 +100,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
         submission_id: id,
         debridge_id,
         amount,
+        bridge_decimals: BRIDGE_DECIMALS,
         chain_id_from: EVM_CHAIN_ID,
         chain_id_to: SOLANA_CHAIN_ID,
         receiver: receiver.clone(),
@@ -106,6 +119,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
             let re = gate.id_for(
                 &args.debridge_id,
                 args.amount,
+                args.bridge_decimals,
                 args.chain_id_from,
                 SOLANA_CHAIN_ID,
                 args.nonce,
@@ -120,7 +134,7 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
     // Claim releases the SPL to the receiver, exactly once.
     let vault_before = gate.vault_balance(&debridge_id);
     let claimed = gate
-        .claim(debridge_id, amount, EVM_CHAIN_ID, nonce, receiver.clone(), None, &sigs)
+        .claim(debridge_id, amount, BRIDGE_DECIMALS, EVM_CHAIN_ID, nonce, receiver.clone(), None, &sigs)
         .expect("2-of-3 claim should succeed");
     assert_eq!(claimed.amount, amount);
     assert_eq!(gate.token_accounts.get(&[0xCA; 32]).copied(), Some(amount));
@@ -128,19 +142,28 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
 
     // Replay is blocked.
     assert_eq!(
-        gate.claim(debridge_id, amount, EVM_CHAIN_ID, nonce, receiver.clone(), None, &sigs).unwrap_err(),
+        gate.claim(debridge_id, amount, BRIDGE_DECIMALS, EVM_CHAIN_ID, nonce, receiver.clone(), None, &sigs).unwrap_err(),
         GateError::AlreadyExecuted
     );
 
     // --- Below-threshold and non-validator safety (a second transfer) ----------
     let nonce2 = 1u64;
     let receiver2: Vec<u8> = vec![0xDD; 32];
-    let id2 = gate.id_for(&debridge_id, amount, EVM_CHAIN_ID, SOLANA_CHAIN_ID, nonce2, &receiver2, None);
+    let id2 = gate.id_for(
+        &debridge_id,
+        amount,
+        BRIDGE_DECIMALS,
+        EVM_CHAIN_ID,
+        SOLANA_CHAIN_ID,
+        nonce2,
+        &receiver2,
+        None,
+    );
 
     // Only one validator signs -> refused, nothing released.
     let one = sorted_sigs(&id2, vec![vs[0].sign(&id2).await]);
     assert!(matches!(
-        gate.claim(debridge_id, amount, EVM_CHAIN_ID, nonce2, receiver2.clone(), None, &one).unwrap_err(),
+        gate.claim(debridge_id, amount, BRIDGE_DECIMALS, EVM_CHAIN_ID, nonce2, receiver2.clone(), None, &one).unwrap_err(),
         GateError::Verify(VerifyError::NotEnoughSignatures { got: 1, want: 2 })
     ));
     assert_eq!(gate.token_accounts.get(&[0xDD; 32]).copied(), None);
@@ -149,14 +172,14 @@ async fn evm_to_solana_claim_release_replay_and_threshold() {
     let outsider = Validator::random();
     let mixed = sorted_sigs(&id2, vec![vs[0].sign(&id2).await, outsider.sign(&id2).await]);
     assert!(matches!(
-        gate.claim(debridge_id, amount, EVM_CHAIN_ID, nonce2, receiver2.clone(), None, &mixed).unwrap_err(),
+        gate.claim(debridge_id, amount, BRIDGE_DECIMALS, EVM_CHAIN_ID, nonce2, receiver2.clone(), None, &mixed).unwrap_err(),
         GateError::Verify(VerifyError::NotEnoughSignatures { got: 1, want: 2 })
     ));
 
     // Recovery: the second validator returns -> threshold met -> released.
     let two = sorted_sigs(&id2, vec![vs[0].sign(&id2).await, vs[1].sign(&id2).await]);
     gate
-        .claim(debridge_id, amount, EVM_CHAIN_ID, nonce2, receiver2, None, &two)
+        .claim(debridge_id, amount, BRIDGE_DECIMALS, EVM_CHAIN_ID, nonce2, receiver2, None, &two)
         .expect("recovered 2-of-3 claim should succeed");
     assert_eq!(gate.token_accounts.get(&[0xDD; 32]).copied(), Some(amount));
 
@@ -182,10 +205,19 @@ async fn solana_to_evm_send_scan_and_evm_verification() {
 
     // --- Solana side: lock SPL, emit a Sent to a 20-byte EVM receiver ----------
     let amount: u64 = 42_000;
+    const SOL_BRIDGE_DECIMALS: u8 = 9;
     let evm_receiver: Vec<u8> = vec![0xEE; 20];
     let solana_sender: Vec<u8> = vec![0x11; 32];
     let sent = gate
-        .send(debridge_id, amount, EVM_CHAIN_ID, evm_receiver.clone(), solana_sender, None)
+        .send(
+            debridge_id,
+            amount,
+            SOL_BRIDGE_DECIMALS,
+            EVM_CHAIN_ID,
+            evm_receiver.clone(),
+            solana_sender,
+            None,
+        )
         .expect("solana send");
     assert_eq!(sent.chain_id_from, SOLANA_CHAIN_ID);
     assert_eq!(sent.chain_id_to, EVM_CHAIN_ID);
@@ -213,6 +245,7 @@ async fn solana_to_evm_send_scan_and_evm_verification() {
     let recomputed = bridge_core::submission_id(
         MESH_DOMAIN.into(),
         debridge_id.into(),
+        SOL_BRIDGE_DECIMALS,
         U256::from(amount),
         U256::from(SOLANA_CHAIN_ID),
         U256::from(EVM_CHAIN_ID),

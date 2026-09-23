@@ -60,6 +60,9 @@ interface PendingSwap {
   submissionId: string;
   debridgeId: string;
   amount: bigint; // stable amount bridged
+  /** The wire scale that amount is in — inside the submissionId (H-2), so
+   *  `finalize()` cannot name this transfer without it. */
+  bridgeDecimals: number;
   nonce: bigint;
   chainIdFrom: number;
   chainIdTo: number;
@@ -612,6 +615,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
         submissionId: sent.submissionId,
         debridgeId: sent.debridgeId,
         amount: sent.amount,
+        bridgeDecimals: sent.bridgeDecimals,
         nonce: sent.nonce,
         chainIdFrom: fromChainId,
         chainIdTo: toChainId,
@@ -667,6 +671,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
         finalizeReg.router,
         pending.debridgeId,
         pending.amount,
+        pending.bridgeDecimals,
         pending.chainIdFrom,
         Number(pending.nonce),
         pending.remoteRouter,

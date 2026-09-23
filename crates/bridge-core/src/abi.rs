@@ -19,6 +19,10 @@ sol! {
             bytes32 indexed submissionId,
             bytes32 indexed debridgeId,
             uint256 amount,
+            /// H-2: the wire scale `amount` is denominated in, as the SOURCE gate
+            /// has it registered — and part of the submissionId, so it is what
+            /// the validators sign over, not a hint.
+            uint8 bridgeDecimals,
             uint256 chainIdFrom,
             uint256 chainIdTo,
             bytes receiver,
@@ -60,6 +64,7 @@ sol! {
         function claim(
             bytes32 debridgeId,
             uint256 amount,
+            uint8 bridgeDecimals,
             uint256 chainIdFrom,
             uint256 nonce,
             bytes receiver,
@@ -73,6 +78,7 @@ sol! {
         function cancel(
             bytes32 debridgeId,
             uint256 amount,
+            uint8 bridgeDecimals,
             uint256 chainIdFrom,
             uint256 nonce,
             bytes receiver,
@@ -86,6 +92,7 @@ sol! {
             address token,
             bytes32 debridgeId,
             uint256 amount,
+            uint8 bridgeDecimals,
             uint256 chainIdTo,
             uint256 nonce,
             bytes receiver,

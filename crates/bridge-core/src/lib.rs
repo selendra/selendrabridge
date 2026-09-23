@@ -67,7 +67,7 @@ pub fn debridge_id(native_chain_id: U256, native_token: Address) -> B256 {
     keccak256(packed)
 }
 
-/// The 8-field packed base of every submissionId (unhashed), matching
+/// The 9-field packed base of every submissionId (unhashed), matching
 /// `BridgeHash.packedSubmission`.
 ///
 /// `bridge_domain` identifies the DEPLOYMENT GENERATION and must equal the
@@ -75,21 +75,31 @@ pub fn debridge_id(native_chain_id: U256, native_token: Address) -> B256 {
 /// without it a submissionId commits to no contract identity at all, so a quorum
 /// signature from a superseded deployment verifies perfectly against a freshly
 /// deployed gate (which also restarts its nonces). See `Gate.bridgeDomain`.
+///
+/// `bridge_decimals` is the WIRE SCALE `amount` is denominated in (H-2). `amount`
+/// is a bare integer whose meaning is entirely decided by what each gate
+/// registered for the asset; leaving the scale out made the two ends agreeing a
+/// convention rather than a check, and a one-digit mis-registration then paid out
+/// a power of ten on an ordinary transfer. Each gate hashes ITS OWN registration,
+/// so a mismatch yields two ids that never meet. One byte, packed between two
+/// 32-byte words.
 fn packed_submission(
     bridge_domain: B256,
     debridge_id: B256,
+    bridge_decimals: u8,
     amount: U256,
     chain_id_from: U256,
     chain_id_to: U256,
     nonce: U256,
     receiver: &[u8],
 ) -> Vec<u8> {
-    let mut packed = Vec::with_capacity(32 * 7 + receiver.len());
+    let mut packed = Vec::with_capacity(32 * 7 + 1 + receiver.len());
     packed.extend_from_slice(&U256::from(SUBMISSION_PREFIX).to_be_bytes::<32>());
     packed.extend_from_slice(bridge_domain.as_slice());
     packed.extend_from_slice(debridge_id.as_slice());
     packed.extend_from_slice(&chain_id_from.to_be_bytes::<32>());
     packed.extend_from_slice(&chain_id_to.to_be_bytes::<32>());
+    packed.push(bridge_decimals);
     packed.extend_from_slice(&amount.to_be_bytes::<32>());
     packed.extend_from_slice(receiver);
     packed.extend_from_slice(&nonce.to_be_bytes::<32>());
@@ -97,9 +107,11 @@ fn packed_submission(
 }
 
 /// submissionId for a transfer WITHOUT an execution payload.
+#[allow(clippy::too_many_arguments)]
 pub fn submission_id(
     bridge_domain: B256,
     debridge_id: B256,
+    bridge_decimals: u8,
     amount: U256,
     chain_id_from: U256,
     chain_id_to: U256,
@@ -109,6 +121,7 @@ pub fn submission_id(
     keccak256(packed_submission(
         bridge_domain,
         debridge_id,
+        bridge_decimals,
         amount,
         chain_id_from,
         chain_id_to,
@@ -118,9 +131,11 @@ pub fn submission_id(
 }
 
 /// submissionId for a transfer WITH an execution payload.
+#[allow(clippy::too_many_arguments)]
 pub fn submission_id_with_auto(
     bridge_domain: B256,
     debridge_id: B256,
+    bridge_decimals: u8,
     amount: U256,
     chain_id_from: U256,
     chain_id_to: U256,
@@ -128,8 +143,16 @@ pub fn submission_id_with_auto(
     receiver: &[u8],
     auto: &AutoParams,
 ) -> B256 {
-    let mut packed =
-        packed_submission(bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, receiver);
+    let mut packed = packed_submission(
+        bridge_domain,
+        debridge_id,
+        bridge_decimals,
+        amount,
+        chain_id_from,
+        chain_id_to,
+        nonce,
+        receiver,
+    );
     packed.extend_from_slice(&auto.execution_fee.to_be_bytes::<32>());
     packed.extend_from_slice(&auto.flags.to_be_bytes::<32>());
     packed.extend_from_slice(keccak256(&auto.fallback_address).as_slice());

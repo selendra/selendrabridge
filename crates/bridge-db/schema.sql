@@ -166,6 +166,19 @@ CREATE TABLE IF NOT EXISTS pending_lifecycle (
 -- under a zero domain, which is exactly the cross-deployment replay this closes.
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS bridge_domain TEXT;
 
+-- H-2: the wire scale the transfer's `amount` is denominated in, from the source
+-- `Sent`. Also part of the submissionId preimage, and nullable for exactly the
+-- same reason `bridge_domain` is: a row written before the scale existed has
+-- none, and 0 is a perfectly valid scale, so defaulting would silently recompute
+-- such a row under a scale nobody signed. SMALLINT because Postgres has no
+-- unsigned byte; the range is pinned by the CHECK.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS bridge_decimals SMALLINT;
+DO $$ BEGIN
+    ALTER TABLE submissions
+        ADD CONSTRAINT submissions_bridge_decimals_range
+        CHECK (bridge_decimals IS NULL OR (bridge_decimals >= 0 AND bridge_decimals <= 255));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 -- Audit 2026-09-09, M-1: the keeper's claim report is ADVISORY.
 --
 -- `POST /submissions/:id/claimed` (Relay scope) used to write `status='claimed'`

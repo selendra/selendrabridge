@@ -31,7 +31,11 @@ pub const SENT_EVENT_TAG: &[u8] = b"BRIDGE_SENT";
 
 /// Wire-format version of [`SentEvent`]. Bump on any layout change so a decoder
 /// can reject an event it wasn't built to read instead of silently misreading it.
-pub const SENT_EVENT_VERSION: u8 = 1;
+/// Version 2 added `bridge_decimals` (H-2): the wire scale went into the
+/// submissionId preimage, so an event without it cannot be used to recompute an
+/// id at all. A v1 decoder reading v2 bytes — or the reverse — would misread
+/// every field after `amount`, which is exactly what this rejection prevents.
+pub const SENT_EVENT_VERSION: u8 = 2;
 
 /// The line prefix Solana's runtime prints for `sol_log_data(...)` — the program
 /// emits its `Sent` event through that syscall, so this is where we find it.
@@ -64,6 +68,9 @@ pub struct SentEvent {
     /// transfer (a validator/relayer can check it against the debridgeId).
     pub mint: [u8; 32],
     pub amount: u64,
+    /// Wire scale `amount` is denominated in, as the source gate's asset registry
+    /// has it. Part of the submissionId preimage (H-2).
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub nonce: u64,
@@ -81,6 +88,7 @@ impl SentEvent {
             debridge_id: s.debridge_id,
             mint,
             amount: s.amount,
+            bridge_decimals: s.bridge_decimals,
             chain_id_from: s.chain_id_from,
             chain_id_to: s.chain_id_to,
             nonce: s.nonce,
@@ -106,6 +114,7 @@ impl SentEvent {
             submission_id: self.submission_id,
             debridge_id: self.debridge_id,
             amount: self.amount,
+            bridge_decimals: self.bridge_decimals,
             chain_id_from: self.chain_id_from,
             chain_id_to: self.chain_id_to,
             receiver: self.receiver.clone(),
@@ -524,6 +533,7 @@ pub fn build_claim_instruction(
     let ix = GateInstruction::Claim(ClaimArgs {
         debridge_id: sent.debridge_id,
         amount: sent.amount,
+        bridge_decimals: sent.bridge_decimals,
         chain_id_from: sent.chain_id_from,
         nonce: sent.nonce,
         receiver: sent.receiver.clone(),
@@ -544,6 +554,7 @@ mod tests {
             submission_id: [0x11; 32],
             debridge_id: [0x22; 32],
             amount: 42_000,
+            bridge_decimals: 6,
             chain_id_from: crate::SOLANA_CHAIN_ID,
             chain_id_to: 1337,
             receiver: vec![0xEE; 20],
@@ -958,12 +969,13 @@ mod tests {
             let native_sender = vec![0x11u8; 20];
             let auto = wire_to_auto(&wire, &native_sender);
             let ours = crate::hash::submission_id_with_auto(
-                &[0xD0; 32], &[9; 32], &crate::hash::amount_word(500), 1337, 7565164, 3,
+                &[0xD0; 32], &[9; 32], 6, &crate::hash::amount_word(500), 1337, 7565164, 3,
                 &[0xAB; 32], &auto,
             );
             let theirs = bridge_core::submission_id_with_auto(
                 alloy_primitives::B256::from([0xD0; 32]),
                 alloy_primitives::B256::from([9u8; 32]),
+                6,
                 alloy_primitives::U256::from(500u64),
                 alloy_primitives::U256::from(1337u64),
                 alloy_primitives::U256::from(7565164u64),

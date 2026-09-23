@@ -877,6 +877,12 @@ async fn try_claim<P: Provider>(
     }
 
     let amount = U256::from_str(&rec.amount).context("bad amount")?;
+    // H-2: the wire scale is part of the id, so it is part of the call. A record
+    // with none cannot be claimed at all — it belongs to a generation whose ids
+    // were computed from a different preimage.
+    let bridge_decimals = rec
+        .bridge_decimals
+        .context("record has no bridge_decimals — its id cannot be reproduced")?;
     let receiver = bytes_of(&rec.receiver)?;
     let auto_params = bytes_of(&rec.auto_params)?;
     let native_sender = bytes_of(&rec.native_sender)?;
@@ -889,6 +895,7 @@ async fn try_claim<P: Provider>(
     let call = gate.claim(
         debridge_id,
         amount,
+        bridge_decimals,
         U256::from(rec.chain_id_from),
         U256::from(rec.nonce),
         receiver,
@@ -966,6 +973,7 @@ async fn try_cancel<P: Provider>(
     let call = gate.cancel(
         debridge_id,
         amount,
+        rec.bridge_decimals.context("record has no bridge_decimals")?,
         U256::from(rec.chain_id_from),
         U256::from(rec.nonce),
         bytes_of(&rec.receiver)?,
@@ -1021,6 +1029,7 @@ async fn try_refund<P: Provider>(
         token,
         debridge_id,
         amount,
+        rec.bridge_decimals.context("record has no bridge_decimals")?,
         U256::from(rec.chain_id_to),
         U256::from(rec.nonce),
         bytes_of(&rec.receiver)?,
@@ -1788,6 +1797,7 @@ mod domain_tests {
         let id = bridge_core::submission_id(
             domain,
             debridge_id,
+            6,
             U256::from(100u64),
             U256::from(1337u64),
             U256::from(7u64),
@@ -1799,6 +1809,7 @@ mod domain_tests {
             bridge_domain: format!("{domain:#x}"),
             debridge_id: format!("{debridge_id:#x}"),
             amount: "100".into(),
+            bridge_decimals: Some(6),
             chain_id_from: 1337,
             chain_id_to: 7,
             nonce: 42,

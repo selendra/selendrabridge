@@ -61,7 +61,7 @@ contract ClaimTest is Test {
 
     function _id() internal view returns (bytes32) {
         return BridgeHash.getSubmissionId(
-            TEST_BRIDGE_DOMAIN, debridgeId, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, 18, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
         );
     }
 
@@ -88,7 +88,7 @@ contract ClaimTest is Test {
 
     function _claim(bytes[] memory sigs) internal returns (bytes32) {
         return gate.claim(
-            debridgeId, AMOUNT, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
+            debridgeId, AMOUNT, 18, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
         );
     }
 
@@ -173,19 +173,19 @@ contract ClaimTest is Test {
         // amount tampered to 999 ether; recomputed id won't match the signed one
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
         gate.claim(
-            debridgeId, 999 ether, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
+            debridgeId, 999 ether, 18, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
         );
     }
 
     function test_Claim_UnknownAsset_Reverts() public {
         bytes32 unknown = BridgeHash.getDebridgeId(CHAIN_FROM, address(0xDEAD));
         bytes32 id = BridgeHash.getSubmissionId(
-            TEST_BRIDGE_DOMAIN, unknown, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
+            TEST_BRIDGE_DOMAIN, unknown, 18, AMOUNT, CHAIN_FROM, block.chainid, NONCE, receiver
         );
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = _sign(v1pk, id);
 
         vm.expectRevert(abi.encodeWithSelector(Gate.UnknownAsset.selector, unknown));
-        gate.claim(unknown, AMOUNT, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs);
+        gate.claim(unknown, AMOUNT, 18, CHAIN_FROM, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs);
     }
 }

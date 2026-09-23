@@ -33,10 +33,11 @@
 //!     governance-status   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
 //!     send --debridge-id 0x.. --amount N --chain-id-to N --receiver 0x..
 //!          --from-token-account <pubkey>
-//!     cancel --submission-id 0x.. --debridge-id 0x.. --wire-amount N --chain-id-from N --nonce N
+//!     cancel --submission-id 0x.. --debridge-id 0x.. --wire-amount N --bridge-decimals N
+//!            --chain-id-from N --nonce N
 //!            --receiver 0x.. --native-sender 0x.. --signature 0x.. [--signature 0x..]
-//!     refund --submission-id 0x.. --debridge-id 0x.. --wire-amount N --chain-id-to N
-//!            --nonce N --receiver 0x.. --native-sender 0x..
+//!     refund --submission-id 0x.. --debridge-id 0x.. --wire-amount N --bridge-decimals N
+//!            --chain-id-to N --nonce N --receiver 0x.. --native-sender 0x..
 //!            [--to-token-account <pubkey>]   (default: the account `send` debited,
 //!                                             read from the ["sent", id] record)
 //!            --signature 0x.. [--signature 0x..]
@@ -48,6 +49,13 @@
 //! decimals — the value hashed into the submissionId, i.e. the sig-store record's
 //! `amount`. They differ whenever an asset's mint has more decimals than its
 //! bridge decimals, so the two are deliberately different flags.
+//!
+//! `--bridge-decimals` is that same scale as a number, and is ALSO hashed into
+//! the id (H-2). It is required rather than read from the asset registry on
+//! purpose: a cancel is the recovery path for a transfer this gate cannot settle,
+//! including one whose asset it never registered, so there may be nothing on
+//! chain to read. Pass the sig-store record's `bridge_decimals`. A wrong value
+//! simply produces an id no validator signed.
 //!
 //! `cancel`/`refund` take signatures as INPUT rather than signing themselves:
 //! they are validator attestations over domain-separated digests, and a tool that
@@ -490,6 +498,7 @@ fn run() -> anyhow::Result<()> {
             let id = bridge_solana::hash::submission_id(
                 &bridge_domain,
                 &debridge_id,
+                asset.bridge_decimals,
                 &bridge_solana::hash::amount_word(wire_amount as u128),
                 chain_id,
                 chain_id_to,
@@ -532,6 +541,7 @@ fn run() -> anyhow::Result<()> {
             let a = bridge_solana::instruction::CancelArgs {
                 debridge_id: hex32(&args.req("--debridge-id")?)?,
                 amount: wire_amount,
+                bridge_decimals: args.req("--bridge-decimals")?.parse()?,
                 chain_id_from: args.req("--chain-id-from")?.parse()?,
                 nonce: args.req("--nonce")?.parse()?,
                 receiver: hex::decode(
@@ -570,6 +580,7 @@ fn run() -> anyhow::Result<()> {
             let a = bridge_solana::instruction::RefundArgs {
                 debridge_id,
                 amount: wire_amount,
+                bridge_decimals: args.req("--bridge-decimals")?.parse()?,
                 chain_id_to: args.req("--chain-id-to")?.parse()?,
                 nonce: args.req("--nonce")?.parse()?,
                 receiver: hex::decode(

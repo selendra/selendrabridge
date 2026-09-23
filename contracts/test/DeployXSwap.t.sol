@@ -89,7 +89,7 @@ contract DeployXSwapTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(validatorPk, MessageHashUtils.toEthSignedMessageHash(id));
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = abi.encodePacked(r, s, v);
-        b.router.claimAndFinalize(did, 3180e6, CHAIN_A, 0, recv, autoParams, sender, sigs);
+        b.router.claimAndFinalize(did, 3180e6, 6, CHAIN_A, 0, recv, autoParams, sender, sigs);
 
         assertEq(b.alt.balanceOf(finalReceiver), 1590e18, "3180 USD of WETH buys 1590 TT at 2.0");
     }

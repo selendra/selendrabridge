@@ -40,6 +40,7 @@ fn record(chain_to: u64) -> SubmissionRecord {
     let id = bridge_core::submission_id(
         domain,
         debridge_id,
+        6,
         U256::from(100u64),
         U256::from(1337u64),
         U256::from(chain_to),
@@ -51,6 +52,7 @@ fn record(chain_to: u64) -> SubmissionRecord {
         bridge_domain: format!("{domain:#x}"),
         debridge_id: format!("{debridge_id:#x}"),
         amount: "100".into(),
+        bridge_decimals: Some(6),
         chain_id_from: 1337,
         chain_id_to: chain_to,
         nonce,

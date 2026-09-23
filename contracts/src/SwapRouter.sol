@@ -390,9 +390,12 @@ contract SwapRouter is ReentrancyGuard {
     ///         the transfer deferred. Only the transfer's `finalReceiver`, the
     ///         router owner or the guardian can take the stable fallback, and only
     ///         after {FALLBACK_GRACE} while the swap is still blocked.
+    /// @param bridgeDecimals the wire scale from the source `Sent` event; part of
+    ///        the submissionId, so a wrong value simply fails the delivery proof.
     function finalize(
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 nonce,
         bytes calldata receiver,
@@ -400,7 +403,15 @@ contract SwapRouter is ReentrancyGuard {
         bytes calldata nativeSender
     ) external nonReentrant returns (bytes32 submissionId) {
         submissionId = gate.computeSubmissionId(
-            debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            amount,
+            bridgeDecimals,
+            chainIdFrom,
+            block.chainid,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
         // Delivery proof: the Gate only sets this after verifying the validator
         // threshold, and the amount + intent are bound into the id it signed.
@@ -422,6 +433,7 @@ contract SwapRouter is ReentrancyGuard {
     function claimAndFinalize(
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 nonce,
         bytes calldata receiver,
@@ -432,8 +444,17 @@ contract SwapRouter is ReentrancyGuard {
         // Releases `amount` of the stable to `receiver` (this router) and sets
         // executed[submissionId]. Reverts if it was already claimed. `claim`
         // itself returns the submissionId, so there's no need to recompute it.
-        submissionId =
-            gate.claim(debridgeId, amount, chainIdFrom, nonce, receiver, autoParams, nativeSender, signatures);
+        submissionId = gate.claim(
+            debridgeId,
+            amount,
+            bridgeDecimals,
+            chainIdFrom,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender,
+            signatures
+        );
         _settle(submissionId, debridgeId, amount, receiver, autoParams);
     }
 

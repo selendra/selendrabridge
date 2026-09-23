@@ -45,6 +45,8 @@ pub struct Sent {
     pub submission_id: Bytes32,
     pub debridge_id: Bytes32,
     pub amount: u64,
+    /// Wire scale `amount` is denominated in — inside the id (H-2).
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub receiver: Vec<u8>,
@@ -136,10 +138,12 @@ impl SolanaGate {
 
     /// Lock `amount` of the asset and produce a `Sent` for the validators.
     /// `receiver` is a 20-byte EVM address for Solana→EVM.
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         &mut self,
         debridge_id: Bytes32,
         amount: u64,
+        bridge_decimals: u8,
         chain_id_to: u64,
         receiver: Vec<u8>,
         native_sender: Vec<u8>,
@@ -156,6 +160,7 @@ impl SolanaGate {
         let submission_id = self.id_for(
             &debridge_id,
             amount,
+            bridge_decimals,
             self.chain_id,
             chain_id_to,
             nonce,
@@ -171,6 +176,7 @@ impl SolanaGate {
             submission_id,
             debridge_id,
             amount,
+            bridge_decimals,
             chain_id_from: self.chain_id,
             chain_id_to,
             receiver,
@@ -192,6 +198,7 @@ impl SolanaGate {
         &mut self,
         debridge_id: Bytes32,
         amount: u64,
+        bridge_decimals: u8,
         chain_id_from: u64,
         nonce: u64,
         receiver: Vec<u8>,
@@ -201,6 +208,7 @@ impl SolanaGate {
         let submission_id = self.id_for(
             &debridge_id,
             amount,
+            bridge_decimals,
             chain_id_from,
             self.chain_id,
             nonce,
@@ -249,6 +257,7 @@ impl SolanaGate {
         &self,
         debridge_id: &Bytes32,
         amount: u64,
+        bridge_decimals: u8,
         chain_id_from: u64,
         chain_id_to: u64,
         nonce: u64,
@@ -260,6 +269,7 @@ impl SolanaGate {
             None => hash::submission_id(
                 &self.bridge_domain,
                 debridge_id,
+                bridge_decimals,
                 &amt,
                 chain_id_from,
                 chain_id_to,
@@ -269,6 +279,7 @@ impl SolanaGate {
             Some(a) => hash::submission_id_with_auto(
                 &self.bridge_domain,
                 debridge_id,
+                bridge_decimals,
                 &amt,
                 chain_id_from,
                 chain_id_to,

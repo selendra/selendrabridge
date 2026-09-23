@@ -39,7 +39,7 @@ library BridgeHash {
         return keccak256(abi.encodePacked(nativeChainId, nativeToken));
     }
 
-    /// @dev The 8-field base of every submissionId, returned unhashed so the
+    /// @dev The 9-field base of every submissionId, returned unhashed so the
     ///      auto-variant can append to it (exactly as deBridge does).
     ///
     /// @param bridgeDomain the DEPLOYMENT binding, and the whole reason this
@@ -56,9 +56,29 @@ library BridgeHash {
     ///        makes every historical attestation hash to something the new gates
     ///        never accept. A mismatched domain fails loudly (no id ever agrees)
     ///        rather than silently paying out, which is the failure mode you want.
+    ///
+    /// @param bridgeDecimals the SCALE `amount` is denominated in — H-2, and the
+    ///        second reason this differs from deBridge's layout. `amount` is a
+    ///        bare integer; what it is worth depends entirely on the wire scale
+    ///        each end registered for the asset. Leaving that scale out of the
+    ///        preimage made the two ends agreeing a pure off-chain convention:
+    ///        a source registered at 6 and a destination at 3 produce the SAME
+    ///        id for a transfer the destination then pays out 1000x, to any
+    ///        user, permissionlessly, with nothing on-chain able to detect it.
+    ///
+    ///        With the scale inside the preimage, each gate hashes the value it
+    ///        itself registered, so a mis-registration makes the ids diverge and
+    ///        the claim simply never verifies. Same discipline as `bridgeDomain`:
+    ///        a mesh-wide constant fails LOUDLY on mismatch rather than paying
+    ///        out the wrong number.
+    ///
+    ///        One byte, packed between two fixed-width words, so it neither
+    ///        widens the dynamic tail nor disturbs the length invariant the
+    ///        no-auto/with-auto forms are distinguished by.
     function packedSubmission(
         bytes32 bridgeDomain,
         bytes32 debridgeId,
+        uint8 bridgeDecimals,
         uint256 amount,
         uint256 chainIdFrom,
         uint256 chainIdTo,
@@ -66,7 +86,15 @@ library BridgeHash {
         bytes memory receiver
     ) internal pure returns (bytes memory) {
         return abi.encodePacked(
-            SUBMISSION_PREFIX, bridgeDomain, debridgeId, chainIdFrom, chainIdTo, amount, receiver, nonce
+            SUBMISSION_PREFIX,
+            bridgeDomain,
+            debridgeId,
+            chainIdFrom,
+            chainIdTo,
+            bridgeDecimals,
+            amount,
+            receiver,
+            nonce
         );
     }
 
@@ -74,6 +102,7 @@ library BridgeHash {
     function getSubmissionId(
         bytes32 bridgeDomain,
         bytes32 debridgeId,
+        uint8 bridgeDecimals,
         uint256 amount,
         uint256 chainIdFrom,
         uint256 chainIdTo,
@@ -81,7 +110,9 @@ library BridgeHash {
         bytes memory receiver
     ) internal pure returns (bytes32) {
         return keccak256(
-            packedSubmission(bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver)
+            packedSubmission(
+                bridgeDomain, debridgeId, bridgeDecimals, amount, chainIdFrom, chainIdTo, nonce, receiver
+            )
         );
     }
 
@@ -89,6 +120,7 @@ library BridgeHash {
     function getSubmissionIdWithAuto(
         bytes32 bridgeDomain,
         bytes32 debridgeId,
+        uint8 bridgeDecimals,
         uint256 amount,
         uint256 chainIdFrom,
         uint256 chainIdTo,
@@ -98,7 +130,9 @@ library BridgeHash {
     ) internal pure returns (bytes32) {
         return keccak256(
             abi.encodePacked(
-                packedSubmission(bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver),
+                packedSubmission(
+                    bridgeDomain, debridgeId, bridgeDecimals, amount, chainIdFrom, chainIdTo, nonce, receiver
+                ),
                 autoParams.executionFee,
                 autoParams.flags,
                 keccak256(autoParams.fallbackAddress),
@@ -111,7 +145,7 @@ library BridgeHash {
     /// @notice Digest a validator signs to authorise CANCELLING a transfer on the
     ///         destination chain (burning it so `claim` can never release funds).
     /// @dev    Domain-separated from a submissionId two ways: a different prefix,
-    ///         and a 64-byte preimage where a submissionId's is >= 224 bytes. So a
+    ///         and a 64-byte preimage where a submissionId's is >= 225 bytes. So a
     ///         validator's transfer signature can never be replayed as a cancel
     ///         (and vice-versa) short of a keccak256 preimage collision.
     function getCancelId(bytes32 submissionId) internal pure returns (bytes32) {

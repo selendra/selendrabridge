@@ -55,6 +55,8 @@ pub mod wire {
     pub struct ClaimArgs {
         pub debridge_id: [u8; 32],
         pub amount: u64,
+        /// H-2: the wire scale, from the source `Sent`. Inside the submissionId.
+        pub bridge_decimals: u8,
         pub chain_id_from: u64,
         pub nonce: u64,
         pub receiver: Vec<u8>,
@@ -79,6 +81,7 @@ pub mod wire {
     pub struct CancelArgs {
         pub debridge_id: [u8; 32],
         pub amount: u64,
+        pub bridge_decimals: u8,
         pub chain_id_from: u64,
         pub nonce: u64,
         pub receiver: Vec<u8>,
@@ -104,6 +107,7 @@ pub mod wire {
     pub struct RefundArgs {
         pub debridge_id: [u8; 32],
         pub amount: u64,
+        pub bridge_decimals: u8,
         pub chain_id_to: u64,
         pub nonce: u64,
         pub receiver: Vec<u8>,
@@ -170,6 +174,9 @@ pub struct EncodableRecord {
     pub id: [u8; 32],
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    /// Wire scale the id was minted at, carried through so every instruction
+    /// this record builds hashes to the same id the validators signed.
+    pub bridge_decimals: u8,
     pub receiver: Vec<u8>,
     pub native_sender: Vec<u8>,
     pub auto: Option<wire::AutoParamsWire>,
@@ -183,6 +190,7 @@ pub fn encodable(rec: &SubmissionRecord) -> Result<EncodableRecord, Unencodable>
     let receiver = hex_bytes(&rec.receiver).map_err(|_| Unencodable::Field("receiver"))?;
     let native_sender = hex_bytes(&rec.native_sender).map_err(|_| Unencodable::Field("native_sender"))?;
     let amount: u64 = rec.amount.parse().map_err(|_| Unencodable::Amount)?;
+    let bridge_decimals = rec.bridge_decimals.ok_or(Unencodable::Field("bridge_decimals"))?;
     let blob = hex_bytes(&rec.auto_params).map_err(|_| Unencodable::Field("auto_params"))?;
     let auto = bridge_solana::relayer::decode_evm_auto_params(&blob)
         .map_err(|e| Unencodable::AutoParams(e.to_string()))?;
@@ -190,17 +198,19 @@ pub fn encodable(rec: &SubmissionRecord) -> Result<EncodableRecord, Unencodable>
     let amount_word = bridge_solana::hash::amount_word(amount as u128);
     let recomputed = match &auto {
         None => bridge_solana::hash::submission_id(
-            &bridge_domain, &debridge_id, &amount_word, rec.chain_id_from, rec.chain_id_to, rec.nonce, &receiver,
+            &bridge_domain, &debridge_id, bridge_decimals, &amount_word, rec.chain_id_from,
+            rec.chain_id_to, rec.nonce, &receiver,
         ),
         Some(w) => bridge_solana::hash::submission_id_with_auto(
-            &bridge_domain, &debridge_id, &amount_word, rec.chain_id_from, rec.chain_id_to, rec.nonce, &receiver,
+            &bridge_domain, &debridge_id, bridge_decimals, &amount_word, rec.chain_id_from,
+            rec.chain_id_to, rec.nonce, &receiver,
             &bridge_solana::relayer::wire_to_auto(w, &native_sender),
         ),
     };
     if recomputed != id {
         return Err(Unencodable::IdMismatch);
     }
-    Ok(EncodableRecord { id, debridge_id, amount, receiver, native_sender, auto })
+    Ok(EncodableRecord { id, debridge_id, amount, bridge_decimals, receiver, native_sender, auto })
 }
 
 /// Signatures ordered by recovered signer, ascending, keeping ONLY registered
@@ -440,6 +450,7 @@ impl Submitter {
         let args = wire::CancelArgs {
             debridge_id: enc.debridge_id,
             amount: enc.amount,
+            bridge_decimals: enc.bridge_decimals,
             chain_id_from: rec.chain_id_from,
             nonce: rec.nonce,
             receiver: enc.receiver.clone(),
@@ -551,6 +562,7 @@ impl Submitter {
         let args = wire::ClaimArgs {
             debridge_id,
             amount: enc.amount,
+            bridge_decimals: enc.bridge_decimals,
             chain_id_from: rec.chain_id_from,
             nonce: rec.nonce,
             receiver,
@@ -656,6 +668,7 @@ impl Submitter {
         let args = wire::RefundArgs {
             debridge_id: enc.debridge_id,
             amount: enc.amount,
+            bridge_decimals: enc.bridge_decimals,
             chain_id_to: rec.chain_id_to,
             nonce: rec.nonce,
             receiver: enc.receiver.clone(),
@@ -1098,6 +1111,7 @@ mod wire_compat_tests {
         let ours = wire::cancel_instruction_data(&wire::CancelArgs {
             debridge_id,
             amount: 1234,
+            bridge_decimals: 6,
             chain_id_from: 1337,
             nonce: 7,
             receiver: receiver.clone(),
@@ -1108,6 +1122,7 @@ mod wire_compat_tests {
         let theirs = GateInstruction::Cancel(SharedCancelArgs {
             debridge_id,
             amount: 1234,
+            bridge_decimals: 6,
             chain_id_from: 1337,
             nonce: 7,
             receiver,
@@ -1138,6 +1153,7 @@ mod wire_compat_tests {
         let ours = wire::refund_instruction_data(&wire::RefundArgs {
             debridge_id,
             amount: 300,
+            bridge_decimals: 6,
             chain_id_to: 1337,
             nonce: 0,
             receiver: receiver.clone(),
@@ -1148,6 +1164,7 @@ mod wire_compat_tests {
         let theirs = GateInstruction::Refund(SharedRefundArgs {
             debridge_id,
             amount: 300,
+            bridge_decimals: 6,
             chain_id_to: 1337,
             nonce: 0,
             receiver,
@@ -1190,6 +1207,7 @@ mod wire_compat_tests {
         let ours = wire::claim_instruction_data(&wire::ClaimArgs {
             debridge_id,
             amount: 1234,
+            bridge_decimals: 6,
             chain_id_from: 1337,
             nonce: 7,
             receiver: receiver.clone(),
@@ -1201,6 +1219,7 @@ mod wire_compat_tests {
         let theirs = GateInstruction::Claim(SharedClaimArgs {
             debridge_id,
             amount: 1234,
+            bridge_decimals: 6,
             chain_id_from: 1337,
             nonce: 7,
             receiver,
@@ -1256,13 +1275,25 @@ mod encodable_tests {
         out
     }
 
+    /// The wire scale every fixture record here is minted at.
+    const REC_DECIMALS: u8 = 6;
+
     fn record(amount: u64, auto: Option<(u128, u64, Vec<u8>, Vec<u8>)>) -> SubmissionRecord {
         let receiver = vec![0xABu8; 32];
         let native_sender = vec![0x11u8; 20];
         let amount_word = bridge_solana::hash::amount_word(amount as u128);
         let (id, blob) = match &auto {
             None => (
-                bridge_solana::hash::submission_id(&DOMAIN, &DEBRIDGE, &amount_word, 1337, 7565164, 3, &receiver),
+                bridge_solana::hash::submission_id(
+                    &DOMAIN,
+                    &DEBRIDGE,
+                    REC_DECIMALS,
+                    &amount_word,
+                    1337,
+                    7565164,
+                    3,
+                    &receiver,
+                ),
                 Vec::new(),
             ),
             Some((fee, flags, fb, data)) => {
@@ -1275,7 +1306,8 @@ mod encodable_tests {
                 let auto = bridge_solana::relayer::wire_to_auto(&wire, &native_sender);
                 (
                     bridge_solana::hash::submission_id_with_auto(
-                        &DOMAIN, &DEBRIDGE, &amount_word, 1337, 7565164, 3, &receiver, &auto,
+                        &DOMAIN, &DEBRIDGE, REC_DECIMALS, &amount_word, 1337, 7565164, 3,
+                        &receiver, &auto,
                     ),
                     abi_encode_auto(*fee, *flags, fb, data),
                 )
@@ -1286,6 +1318,7 @@ mod encodable_tests {
             bridge_domain: hex0x(&DOMAIN),
             debridge_id: hex0x(&DEBRIDGE),
             amount: amount.to_string(),
+            bridge_decimals: Some(REC_DECIMALS),
             chain_id_from: 1337,
             chain_id_to: 7565164,
             nonce: 3,

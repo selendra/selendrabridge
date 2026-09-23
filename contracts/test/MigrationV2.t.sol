@@ -74,15 +74,28 @@ contract LegacyGate is Initializable, UUPSUpgradeable {
         isSealed = true;
     }
 
+    function pause() external {
+        require(msg.sender == owner, "owner");
+        paused = true;
+    }
+
     /// @dev The legacy wire format: the RAW local amount, unconverted.
+    ///
+    ///      The id is packed HERE rather than through {BridgeHash}, because the
+    ///      library no longer computes this shape: H-2 added the wire scale to the
+    ///      preimage. Reproducing the old eight-field packing by hand is the whole
+    ///      point of the fixture — it is what makes a legacy id genuinely
+    ///      unreachable from the new implementation instead of accidentally equal.
     function send(address token, uint256 amount, uint256 chainIdTo, bytes calldata receiver)
         external
         returns (bytes32 submissionId)
     {
         uint256 nonce = nonceTo[chainIdTo]++;
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, token);
-        submissionId = BridgeHash.getSubmissionId(
-            bridgeDomain, debridgeId, amount, block.chainid, chainIdTo, nonce, receiver
+        submissionId = keccak256(
+            abi.encodePacked(
+                uint256(1), bridgeDomain, debridgeId, block.chainid, chainIdTo, amount, receiver, nonce
+            )
         );
         sentBy[submissionId] = msg.sender;
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
@@ -201,32 +214,60 @@ contract MigrationV2Test is Test {
     // the break, and what is left of it
     // -----------------------------------------------------------------
 
-    /// Without the migration call the gate is still stopped for `claim` and
-    /// `send` — an operator MUST seed the new state. What must NOT happen is the
-    /// recovery path stopping with it: `refund` is documented as never halting,
-    /// and before this fix it reverted `BridgeDecimalsUnset` like everything else,
-    /// so funds frozen by the upgrade could not even be returned.
-    function test_UpgradeWithoutMigration_StillRefunds() public {
+    /// H-2 CHANGED WHAT AN IN-PLACE UPGRADE CAN DO, and this is the test that
+    /// says so out loud.
+    ///
+    /// The wire scale is part of the submissionId preimage now, so an id minted
+    /// by the legacy implementation cannot be recomputed by the new one — not
+    /// under identity scale, not under any scale, because the preimage has a
+    /// field the old one never had. `refund` used to be the guarantee that an
+    /// upgrade could stop `send` and `claim` and still hand the money back. It no
+    /// longer is: the funds and the `sentBy` record both survive the upgrade
+    /// perfectly, and are simply keyed by an id nothing will ever compute again.
+    ///
+    /// That is the honest cost of binding the scale, and it is why the migration
+    /// is now pause -> drain -> upgrade rather than upgrade-and-carry-on. It is
+    /// asserted rather than described so nobody rediscovers it on a live gate.
+    function test_UpgradeStrandsWhateverWasInFlight() public {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_SRC, address(token));
         bytes32 id = _legacyInFlight(10 ether);
-        uint256 balanceBefore = token.balanceOf(user);
 
         _upgradeTo(address(new Gate()), "");
         Gate upgraded = Gate(address(legacy));
 
-        // The forward paths are stopped, loudly, which is the operator's cue.
-        vm.expectRevert(abi.encodeWithSelector(Gate.UnsupportedChain.selector, CHAIN_DST));
-        vm.prank(user);
-        upgraded.send(address(token), 1 ether, CHAIN_DST, receiver, "");
+        // The record survived the upgrade intact — this is not lost storage.
+        assertEq(upgraded.sentBy(id), user, "the lock is still recorded");
 
-        // The way back is NOT stopped: an unregistered token can only mean a
-        // legacy lock, whose amount was already local units.
+        // But no call can name it. The refund recomputes the id from its
+        // arguments, under the new preimage, and lands on a key nothing wrote.
         bytes32 refundId = BridgeHash.getRefundId(id);
-        upgraded.refund(
-            address(token), did, 10 ether, CHAIN_DST, 0, receiver, "", "", _sign(refundId)
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.NotSent.selector,
+                upgraded.computeSubmissionId(did, 10 ether, 18, CHAIN_SRC, CHAIN_DST, 0, receiver, "", "")
+            )
         );
-        assertEq(token.balanceOf(user), balanceBefore + 10 ether, "refund pays exactly what was locked");
-        assertTrue(upgraded.refunded(id), "and is marked spent");
+        upgraded.refund(
+            address(token), did, 10 ether, 18, CHAIN_DST, 0, receiver, "", "", _sign(refundId)
+        );
+
+        // And there is no scale that rescues it: the field itself is new, so every
+        // value of it produces an id the legacy gate never minted.
+        for (uint8 d = 0; d <= 18; d++) {
+            assertTrue(
+                upgraded.computeSubmissionId(did, 10 ether, d, CHAIN_SRC, CHAIN_DST, 0, receiver, "", "")
+                    != id,
+                "no wire scale reproduces a legacy id"
+            );
+        }
+    }
+
+    /// The other half of the same rule, enforced rather than documented: the
+    /// migration call refuses to run on a gate that is still accepting transfers.
+    /// An operator cannot reach the stranding above by following the runbook.
+    function test_MigrationRefusesToRunOnALiveGate() public {
+        vm.expectRevert(Gate.MigrationRequiresPause.selector);
+        _upgradeTo(address(new Gate()), abi.encodeCall(Gate.initializeV2, (_tokens(), _chains())));
     }
 
     /// The whole point of {initializeV2}: seeded in the SAME transaction as the
@@ -236,10 +277,14 @@ contract MigrationV2Test is Test {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_SRC, address(token));
         legacy.setLocalToken(did, address(token));
 
+        // Halted and drained first — the migration requires it (H-2), and this
+        // fixture has nothing in flight.
+        legacy.pause();
         _upgradeTo(
             address(new Gate()), abi.encodeCall(Gate.initializeV2, (_tokens(), _chains()))
         );
         Gate upgraded = Gate(address(legacy));
+        upgraded.unpause();
 
         // Identity scale: registered, and a no-op conversion.
         (bool set, uint8 bridgeDec, uint8 localDec) = upgraded.bridgeDecimalsOf(address(token));
@@ -254,36 +299,48 @@ contract MigrationV2Test is Test {
         upgraded.send(address(token), 5 ether, CHAIN_DST, receiver, "");
 
         vm.chainId(CHAIN_DST);
-        bytes32 inbound = upgraded.computeSubmissionId(did, 7 ether, CHAIN_SRC, CHAIN_DST, 99, receiver, "", "");
-        upgraded.claim(did, 7 ether, CHAIN_SRC, 99, receiver, "", "", _sign(inbound));
+        bytes32 inbound =
+            upgraded.computeSubmissionId(did, 7 ether, 18, CHAIN_SRC, CHAIN_DST, 99, receiver, "", "");
+        upgraded.claim(did, 7 ether, 18, CHAIN_SRC, 99, receiver, "", "", _sign(inbound));
         assertEq(token.balanceOf(receiverAddr), 7 ether, "claim pays the raw amount, as it always did");
     }
 
-    /// The silent half of M-2, and the reason the migration registers IDENTITY
-    /// rather than the mesh's real scale: a pre-upgrade id carries a local amount,
-    /// and any non-identity scale multiplies it on the way out.
-    function test_Migration_IdentityIsWhatStopsThePowerOfTenOverpay() public {
+    /// M-2's original reason for registering IDENTITY scale was arithmetic: a
+    /// pre-upgrade id carries a LOCAL amount, and a non-identity scale would
+    /// multiply it on the way out. H-2 removed the overpay a different way — the
+    /// id itself no longer matches — so identity is now about the gate's FUTURE
+    /// transfers rather than its in-flight ones, and the write-once rule is what
+    /// still makes re-scaling a new generation instead of an upgrade.
+    function test_Migration_TheInFlightOverpayIsUnreachable() public {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_SRC, address(token));
         legacy.setLocalToken(did, address(token));
 
-        // An id created under the OLD rules: 3 TST as 3e18 raw units.
+        // An id created under the OLD rules: 3 TST as 3e18 raw units, with the
+        // old eight-field preimage.
         vm.chainId(CHAIN_DST);
-        bytes32 inflight =
-            BridgeHash.getSubmissionId(DOMAIN, did, 3 ether, CHAIN_SRC, CHAIN_DST, 42, receiver);
+        bytes32 inflight = keccak256(
+            abi.encodePacked(uint256(1), DOMAIN, did, CHAIN_SRC, CHAIN_DST, uint256(3 ether), receiver, uint256(42))
+        );
 
+        legacy.pause();
         _upgradeTo(
             address(new Gate()), abi.encodeCall(Gate.initializeV2, (_tokens(), _chains()))
         );
         Gate upgraded = Gate(address(legacy));
+        upgraded.unpause();
 
-        upgraded.claim(did, 3 ether, CHAIN_SRC, 42, receiver, "", "", _sign(inflight));
-        assertEq(token.balanceOf(receiverAddr), 3 ether, "exactly what it always meant");
+        // Identity scale is registered, so the amount would still MEAN the same
+        // thing — but the claim never gets that far. The signature is over an id
+        // the new preimage cannot produce, so the threshold does not verify and
+        // nothing is released.
+        (, uint8 bridgeDec,) = upgraded.bridgeDecimalsOf(address(token));
+        assertEq(bridgeDec, 18, "identity");
+        vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
+        upgraded.claim(did, 3 ether, 18, CHAIN_SRC, 42, receiver, "", "", _sign(inflight));
+        assertEq(token.balanceOf(receiverAddr), 0, "nothing released");
 
-        // Had the mesh's real scale (6) been registered instead, the same claim
-        // would have released 3e18 * 1e12 — a trillion-fold overpay that the
-        // gate's whole liquidity could not cover. The registration is write-once,
-        // so identity is now permanent for this gate: re-scaling a live asset is
-        // a new deployment generation, never an upgrade.
+        // And the registration stays write-once, so this gate keeps identity for
+        // ever: re-scaling a live asset is a new deployment generation.
         vm.expectRevert(abi.encodeWithSelector(Gate.BridgeDecimalsAlreadySet.selector, address(token)));
         upgraded.setBridgeDecimals(address(token), 6);
     }
@@ -293,6 +350,7 @@ contract MigrationV2Test is Test {
     // -----------------------------------------------------------------
 
     function test_InitializeV2_RunsOnceAndOnlyForTheOwner() public {
+        legacy.pause(); // the migration's precondition (H-2)
         address impl = address(new Gate());
 
         // A stranger cannot ride the upgrade call.
@@ -312,6 +370,7 @@ contract MigrationV2Test is Test {
     /// scale it has, so re-running a migration list cannot silently re-scale an
     /// asset that was set correctly.
     function test_InitializeV2_SkipsWhatIsAlreadyRegistered() public {
+        legacy.pause();
         address[] memory two = new address[](2);
         two[0] = address(token);
         two[1] = address(token); // same token twice
@@ -325,6 +384,7 @@ contract MigrationV2Test is Test {
     }
 
     function test_InitializeV2_RefusesTheZeroToken() public {
+        legacy.pause();
         address[] memory bad = new address[](1);
         bad[0] = address(0);
         vm.expectRevert(Gate.ZeroAddress.selector);
@@ -336,6 +396,7 @@ contract MigrationV2Test is Test {
     /// public delay. Fail-closed is the right default for a gate that already
     /// holds funds (M-1 + M-2 together).
     function test_MigratedGate_GetsNoFreshSetupPhase() public {
+        legacy.pause();
         _upgradeTo(address(new Gate()), abi.encodeCall(Gate.initializeV2, (_tokens(), _chains())));
         Gate upgraded = Gate(address(legacy));
 

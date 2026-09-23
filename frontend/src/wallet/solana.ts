@@ -376,6 +376,13 @@ export async function buildGateSendInstruction(args: {
    * the `sent` PDA it seeds — must be built from that, not from `amount`.
    */
   bridgeUnit: bigint;
+  /**
+   * The asset's bridge decimals, as the Solana gate's own registry has them.
+   * Hashed into the id (H-2), so it must be the SAME value the program will
+   * read from the asset account — a mismatch makes the `sent` PDA wrong and the
+   * send fails rather than locking funds under an id nobody can settle.
+   */
+  bridgeDecimals: number;
   receiver: Uint8Array;
 }): Promise<{ instruction: Instruction; submissionId: string }> {
   if (args.bridgeUnit <= 0n) throw new Error("bridge unit must be positive");
@@ -385,6 +392,7 @@ export async function buildGateSendInstruction(args: {
   const id = submissionId({
     bridgeDomain: args.bridgeDomain,
     debridgeId: args.debridgeId,
+    bridgeDecimals: args.bridgeDecimals,
     amount: args.amount / args.bridgeUnit,
     chainIdFrom: args.solanaChainId,
     chainIdTo: args.chainIdTo,

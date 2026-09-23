@@ -98,7 +98,7 @@ contract UpgradeTest is Test {
         // --- generation A: the attestation is genuinely valid here ---
         vm.chainId(CHAIN_DST);
         Gate genA = _destination(DOMAIN_A, debridgeId);
-        genA.claim(debridgeId, AMOUNT, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
+        genA.claim(debridgeId, AMOUNT, 18, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
         assertEq(
             TestToken(genA.tokenOf(debridgeId)).balanceOf(receiverAddr),
             AMOUNT,
@@ -112,7 +112,7 @@ contract UpgradeTest is Test {
         // The gate recomputes the id under DOMAIN_B, so the signature recovers a
         // non-validator and the quorum is never met.
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
-        genB.claim(debridgeId, AMOUNT, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
+        genB.claim(debridgeId, AMOUNT, 18, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
 
         assertEq(
             TestToken(genB.tokenOf(debridgeId)).balanceOf(receiverAddr),
@@ -147,7 +147,7 @@ contract UpgradeTest is Test {
 
         vm.chainId(CHAIN_DST);
         Gate redeployedSameDomain = _destination(DOMAIN_A, debridgeId);
-        redeployedSameDomain.claim(debridgeId, AMOUNT, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
+        redeployedSameDomain.claim(debridgeId, AMOUNT, 18, CHAIN_SRC, 0, receiver, EMPTY, EMPTY, sigs);
 
         assertEq(
             TestToken(redeployedSameDomain.tokenOf(debridgeId)).balanceOf(receiverAddr),
@@ -165,8 +165,8 @@ contract UpgradeTest is Test {
 
         bytes32 debridgeId = BridgeHash.getDebridgeId(CHAIN_SRC, address(0x1234));
         assertTrue(
-            a.computeSubmissionId(debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, 0, receiver, EMPTY, EMPTY)
-                != b.computeSubmissionId(debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, 0, receiver, EMPTY, EMPTY),
+            a.computeSubmissionId(debridgeId, AMOUNT, 18, CHAIN_SRC, CHAIN_DST, 0, receiver, EMPTY, EMPTY)
+                != b.computeSubmissionId(debridgeId, AMOUNT, 18, CHAIN_SRC, CHAIN_DST, 0, receiver, EMPTY, EMPTY),
             "two generations must never agree on a submissionId"
         );
     }

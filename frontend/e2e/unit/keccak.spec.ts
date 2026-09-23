@@ -51,6 +51,7 @@ test("submissionId matches every Solidity fixture without an auto payload", () =
     const got = submissionId({
       bridgeDomain: f.bridgeDomain,
       debridgeId: f.debridgeId,
+      bridgeDecimals: f.bridgeDecimals,
       amount: BigInt(f.amount),
       chainIdFrom: BigInt(f.chainIdFrom),
       chainIdTo: BigInt(f.chainIdTo),
@@ -71,6 +72,7 @@ test("a 32-byte Solana receiver hashes at its own width, not padded", () => {
       submissionId({
         bridgeDomain: f.bridgeDomain,
         debridgeId: f.debridgeId,
+        bridgeDecimals: f.bridgeDecimals,
         amount: BigInt(f.amount),
         chainIdFrom: BigInt(f.chainIdFrom),
         chainIdTo: BigInt(f.chainIdTo),
@@ -79,4 +81,35 @@ test("a 32-byte Solana receiver hashes at its own width, not padded", () => {
       })
     )
   ).toBe(f.submissionId);
+});
+
+/**
+ * H-2 at the hash layer, in the browser. `scale-separated` repeats `no-auto`
+ * field for field at a different `bridgeDecimals`, so an implementation that
+ * dropped the scale byte would produce one id for both — and a wallet would
+ * happily sign a transfer the destination reads at a scale nobody agreed to.
+ */
+test("the wire scale changes the submissionId", () => {
+  const plain = fx.fixtures.find((x: { name: string }) => x.name === "no-auto");
+  const rescaled = fx.fixtures.find((x: { name: string }) => x.name === "scale-separated");
+  expect(rescaled.bridgeDecimals).not.toBe(plain.bridgeDecimals);
+  expect(rescaled.amount).toBe(plain.amount);
+  expect(rescaled.bridgeDomain).toBe(plain.bridgeDomain);
+
+  const id = (f: { bridgeDomain: string; debridgeId: string; bridgeDecimals: number; amount: string; chainIdFrom: number; chainIdTo: number; nonce: number; receiver: string }) =>
+    bytesToHex(
+      submissionId({
+        bridgeDomain: f.bridgeDomain,
+        debridgeId: f.debridgeId,
+        bridgeDecimals: f.bridgeDecimals,
+        amount: BigInt(f.amount),
+        chainIdFrom: BigInt(f.chainIdFrom),
+        chainIdTo: BigInt(f.chainIdTo),
+        nonce: BigInt(f.nonce),
+        receiver: hexToBytes(f.receiver),
+      })
+    );
+  expect(id(plain)).toBe(plain.submissionId);
+  expect(id(rescaled)).toBe(rescaled.submissionId);
+  expect(id(rescaled)).not.toBe(id(plain));
 });

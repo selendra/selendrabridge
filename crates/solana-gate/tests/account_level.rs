@@ -812,6 +812,12 @@ fn executed_pda(id: &[u8; 32]) -> Pubkey {
     Pubkey::find_program_address(&[b"executed", id], &PROGRAM_ID).0
 }
 
+/// The wire scale every fixture in this file registers its asset at. Since H-2
+/// it is part of the submissionId preimage, so the hand-rolled hashes below must
+/// carry it too — that is what makes them a genuine independent reproduction of
+/// the program's, rather than a copy that would agree with any bug.
+const FIXTURE_BRIDGE_DECIMALS: u8 = 6;
+
 /// Recompute the submissionId exactly as the program does, so the test can derive
 /// the marker PDA the instruction will touch.
 fn submission_id_for(args: &CancelArgs, chain_id_to: u64) -> [u8; 32] {
@@ -827,6 +833,7 @@ fn submission_id_for(args: &CancelArgs, chain_id_to: u64) -> [u8; 32] {
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(chain_id_to),
+        &[args.bridge_decimals],
         &be32(args.amount),
         &args.receiver,
         &be32(args.nonce),
@@ -838,6 +845,7 @@ fn cancel_args(signatures: Vec<Vec<u8>>) -> CancelArgs {
     CancelArgs {
         debridge_id: [9u8; 32],
         amount: 100,
+        bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
         chain_id_from: DEST_CHAIN,
         nonce: 0,
         receiver: vec![0xAB; 32],
@@ -1281,6 +1289,7 @@ async fn a_claim_succeeds_even_when_the_marker_pda_was_pre_funded_by_a_griefer()
     let args = solana_gate::ClaimArgs {
         debridge_id: fx.debridge_id,
         amount: 250,
+        bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
         chain_id_from: DEST_CHAIN,
         nonce: 0,
         receiver: receiver_token.to_bytes().to_vec(),
@@ -1344,6 +1353,7 @@ fn claim_submission_id(args: &solana_gate::ClaimArgs) -> [u8; 32] {
         &args.debridge_id,
         &be32(args.chain_id_from),
         &be32(CHAIN_ID),
+        &[args.bridge_decimals],
         &be32(args.amount),
         &args.receiver,
         &be32(args.nonce),
@@ -1365,6 +1375,7 @@ fn send_submission_id(debridge_id: &[u8; 32], amount: u64, receiver: &[u8], nonc
         debridge_id,
         &be32(CHAIN_ID),
         &be32(DEST_CHAIN),
+        &[FIXTURE_BRIDGE_DECIMALS],
         &be32(amount),
         receiver,
         &be32(nonce),
@@ -1442,6 +1453,7 @@ async fn refund_returns_locked_funds_to_the_account_that_sent_them() {
         GateInstruction::Refund(solana_gate::RefundArgs {
             debridge_id: fx.debridge_id,
             amount,
+            bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
             chain_id_to: DEST_CHAIN,
             nonce: 0,
             receiver: receiver.clone(),
@@ -1513,6 +1525,7 @@ async fn a_refund_cannot_be_replayed() {
             GateInstruction::Refund(solana_gate::RefundArgs {
                 debridge_id: fx.debridge_id,
                 amount,
+                bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
                 chain_id_to: DEST_CHAIN,
                 nonce: 0,
                 receiver: receiver.clone(),
@@ -1998,6 +2011,7 @@ async fn send_hashes_bridge_units_and_refund_returns_the_mint_amount() {
         GateInstruction::Refund(solana_gate::RefundArgs {
             debridge_id: fx.debridge_id,
             amount: 2_250_000, // the id's (bridge) amount
+            bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
             chain_id_to: DEST_CHAIN,
             nonce: 0,
             receiver: receiver.clone(),
@@ -2057,6 +2071,7 @@ async fn claim_pays_a_bridge_amount_out_in_mint_units() {
     let args = solana_gate::ClaimArgs {
         debridge_id: fx.debridge_id,
         amount: 1_500_000,
+        bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
         chain_id_from: DEST_CHAIN,
         nonce: 0,
         receiver: receiver_token.to_bytes().to_vec(),
@@ -2087,4 +2102,103 @@ async fn claim_pays_a_bridge_amount_out_in_mint_units() {
     assert_eq!(spl_balance(&recv), 1_500_000_000, "1.5 tokens at 9 decimals");
     let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
     assert_eq!(spl_balance(&vault), 3_500_000_000);
+}
+
+/// `GateError::BridgeScaleMismatch`, appended last — `Custom(n)` is variant `n - 1`, and
+/// the enum, and the discriminant order is part of the on-chain ABI.
+const BRIDGE_SCALE_MISMATCH: u32 = 25;
+/// `GateError::NotEnoughSignatures` — the 5th variant, so `Custom(5)`.
+const NOT_ENOUGH_SIGNATURES: u32 = 5;
+
+/// H-2 ON SOLANA, the destination half. The asset registry here is what
+/// `RegisterAsset` wrote; the claim carries what the SOURCE gate hashed. When
+/// they differ, both doors are shut, and this walks both.
+///
+/// Registered at 6, the mesh at 9: a wire amount the source meant as 1.5 tokens
+/// would have been paid out as 1500. Note there is no third option — the scale
+/// that matches the signatures is refused by the registry, and the scale the
+/// registry accepts hashes to an id nobody signed — so the transfer is stranded
+/// rather than mis-paid, and stranded has the cancel -> refund path.
+#[tokio::test]
+async fn claim_refuses_a_wire_scale_this_gate_did_not_register() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    // 9-decimal mint registered at 6 — the fixture default.
+    let mut fx =
+        setup_with_asset_decimals(vec![v1.address, v2.address, v3.address], 2, 5_000_000_000, 0, 9, 6).await;
+    let receiver_token = Pubkey::new_unique();
+    fx.ctx.set_account(
+        &receiver_token,
+        &token_account(fx.mint, Pubkey::new_unique(), 0, COption::None, COption::None).into(),
+    );
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+
+    let accounts = |id: &[u8; 32]| {
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+            AccountMeta::new(executed_pda(id), false),
+            AccountMeta::new(fx.owner.pubkey(), true),
+            AccountMeta::new(fx.vault, false),
+            AccountMeta::new(receiver_token, false),
+            AccountMeta::new_readonly(vault_authority(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ]
+    };
+
+    // 1) The honest keeper's claim: the SOURCE's scale, which is what the
+    //    validators signed. The registry refuses it before any token moves.
+    let signed = solana_gate::ClaimArgs {
+        debridge_id: fx.debridge_id,
+        amount: 1_500_000,
+        bridge_decimals: 9,
+        chain_id_from: DEST_CHAIN,
+        nonce: 0,
+        receiver: receiver_token.to_bytes().to_vec(),
+        auto: None,
+        native_sender: vec![0x11; 20],
+        signatures: vec![],
+    };
+    let signed_id = claim_submission_id(&signed);
+    let sigs = quorum(&[&v1, &v2], &signed_id);
+    let err = exec(
+        &mut fx.ctx,
+        ix(
+            GateInstruction::Claim(solana_gate::ClaimArgs { signatures: sigs, ..signed.clone() }),
+            accounts(&signed_id),
+        ),
+        &[&owner],
+    )
+    .await
+    .expect_err("a mis-scaled claim must be refused");
+    assert!(is_custom(&err, BRIDGE_SCALE_MISMATCH), "expected BridgeScaleMismatch, got {err:?}");
+
+    // 2) The same transfer restated at this gate's own scale — what an operator
+    //    "fixing" the mismatch by hand would try. Now the id is a different hash,
+    //    so the signatures are over some other transfer and the quorum fails.
+    let restated = solana_gate::ClaimArgs { bridge_decimals: 6, ..signed };
+    let restated_id = claim_submission_id(&restated);
+    assert_ne!(restated_id, signed_id, "premise: the scale changes the id");
+    let err = exec(
+        &mut fx.ctx,
+        ix(
+            GateInstruction::Claim(solana_gate::ClaimArgs {
+                // One signature, so the failure can only be "this is not a
+                // validator's signature over THIS id" — not the ordering rule,
+                // which a two-element array would trip first for the same reason.
+                signatures: quorum(&[&v1], &signed_id),
+                ..restated
+            }),
+            accounts(&restated_id),
+        ),
+        &[&owner],
+    )
+    .await
+    .expect_err("signatures for another id must not verify");
+    assert!(is_custom(&err, NOT_ENOUGH_SIGNATURES), "expected NotEnoughSignatures, got {err:?}");
+
+    let recv = fx.ctx.banks_client.get_account(receiver_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&recv), 0, "not one unit moved");
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&vault), 5_000_000_000, "the vault is untouched");
 }

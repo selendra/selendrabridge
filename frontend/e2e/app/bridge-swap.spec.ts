@@ -1,6 +1,8 @@
 import { test, expect, startApp, connectWallet, gotoView } from "../fixtures/app";
 import { driftChain, sentTransactions, ACCOUNT } from "../fixtures/wallet";
 import { GATE_A, ROUTER_A, ROUTER_B, STABLE_B, TOKEN_18 } from "../fixtures/backend";
+import { SENT_SIGNATURE } from "../../src/wallet/eth";
+import { bytesToHex, keccak256 } from "../../src/wallet/keccak";
 
 /**
  * BridgeView, "swap on arrival": swap locally → bridge the stable → swap again
@@ -12,18 +14,22 @@ import { GATE_A, ROUTER_A, ROUTER_B, STABLE_B, TOKEN_18 } from "../fixtures/back
  * stable sits on the destination router with nothing in the UI able to move it.
  */
 
-const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+// Derived from the app's own signature constant: a literal would go stale the
+// next time the event changes, and a stale topic0 shows up as "no Sent event"
+// rather than as a failing hash.
+const SENT_TOPIC0 = bytesToHex(keccak256(new TextEncoder().encode(SENT_SIGNATURE)));
 const SUBMISSION_ID = "0x" + "11".repeat(32);
 const DEBRIDGE_ID = "0x" + "22".repeat(32);
 
 const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, "0");
 const addrWord = (a: string) => a.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 
-/** A `Sent` log the way the gate emits it: amount at word 0, nonce at word 4. */
+/** A `Sent` log the way the gate emits it: amount(0), bridgeDecimals(1),
+ *  chainIdFrom(2), chainIdTo(3), off(receiver)(4), nonce(5). */
 const sentLog = {
   address: GATE_A,
   topics: [SENT_TOPIC0, SUBMISSION_ID, DEBRIDGE_ID],
-  data: "0x" + word(1000n) + word(0) + word(0) + word(0) + word(7n),
+  data: "0x" + word(1000n) + word(6) + word(0) + word(0) + word(0) + word(7n),
 };
 
 const BAL = 1000n * 10n ** 18n;
@@ -159,15 +165,19 @@ test.describe("the swapAndBridge → finalize lifecycle", () => {
     const txs = await sentTransactions(page);
     const finalize = txs[txs.length - 1];
     expect(finalize.to.toLowerCase()).toBe(ROUTER_B);
-    expect(finalize.data.slice(0, 10)).toBe("0xc2c1fffb");
+    expect(finalize.data.slice(0, 10)).toBe("0x705f6b62");
     // It executes on the DESTINATION chain, not the transfer's origin.
     expect(finalize.chainId).toBe("0x53a"); // 1338
 
     const words = finalize.data.slice(10).match(/.{64}/g)!;
     expect("0x" + words[0]).toBe(DEBRIDGE_ID); // from topics[2]
     expect(BigInt("0x" + words[1])).toBe(1000n); // amount, from data word 0
-    expect(BigInt("0x" + words[2])).toBe(1337n); // chainIdFrom
-    expect(BigInt("0x" + words[3])).toBe(7n); // nonce, from data word 4
+    // H-2: the wire scale is carried through from the log, not guessed. Without
+    // it the call names a different submissionId and `finalize` finds no
+    // delivery — the failure is silent-looking, so it is pinned here.
+    expect(BigInt("0x" + words[2])).toBe(6n); // bridgeDecimals, from data word 1
+    expect(BigInt("0x" + words[3])).toBe(1337n); // chainIdFrom
+    expect(BigInt("0x" + words[4])).toBe(7n); // nonce, from data word 5
   });
 
   test("does not reinterpret the destination switch as picking a new corridor", async ({ page }) => {

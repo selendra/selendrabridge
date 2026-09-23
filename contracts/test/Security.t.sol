@@ -229,7 +229,7 @@ contract SecurityTest is Test {
         // any claim must revert on the pause guard before touching signatures
         bytes[] memory sigs = new bytes[](0);
         vm.expectRevert(Gate.EnforcedPause.selector);
-        gate.claim(bytes32(0), 1 ether, 1337, 0, abi.encodePacked(address(0xCAFE)), "", "", sigs);
+        gate.claim(bytes32(0), 1 ether, 18, 1337, 0, abi.encodePacked(address(0xCAFE)), "", "", sigs);
     }
 
     function test_Unpause_ResumesSend() public {
@@ -326,12 +326,12 @@ contract SecurityTest is Test {
         for (uint256 i; i < 2; i++) {
             bytes memory bad = i == 0 ? long180 : odd;
             vm.expectRevert(Gate.BadReceiver.selector);
-            gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, bad, "", "");
+            gate.computeSubmissionId(bytes32(0), 1, 18, 1337, 1338, 0, bad, "", "");
         }
 
         // The two legitimate widths still hash, so nothing real is affected.
-        gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, new bytes(20), "", "");
-        gate.computeSubmissionId(bytes32(0), 1, 1337, 1338, 0, new bytes(32), "", "");
+        gate.computeSubmissionId(bytes32(0), 1, 18, 1337, 1338, 0, new bytes(20), "", "");
+        gate.computeSubmissionId(bytes32(0), 1, 18, 1337, 1338, 0, new bytes(32), "", "");
     }
 
     /// The same guard has to hold on the entry points that used to skip it — a
@@ -339,7 +339,7 @@ contract SecurityTest is Test {
     function test_Cancel_RefusesAnAmbiguousReceiverWidth() public {
         bytes[] memory none = new bytes[](0);
         vm.expectRevert(Gate.BadReceiver.selector);
-        gate.cancel(bytes32(0), 1, 1337, 0, new bytes(180), "", "", none);
+        gate.cancel(bytes32(0), 1, 18, 1337, 0, new bytes(180), "", "", none);
     }
 
 }

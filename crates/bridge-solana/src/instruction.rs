@@ -31,6 +31,9 @@ pub struct SendArgs {
 pub struct ClaimArgs {
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    /// H-2: the source's wire scale. Inside the submissionId, and checked against
+    /// the destination's own registration.
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub nonce: u64,
     /// 32-byte Solana token account (EVM→Solana).
@@ -146,6 +149,7 @@ pub struct GovernanceSchedule {
 pub struct CancelArgs {
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub nonce: u64,
     pub receiver: Vec<u8>,
@@ -161,6 +165,7 @@ pub struct CancelArgs {
 pub struct RefundArgs {
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    pub bridge_decimals: u8,
     pub chain_id_to: u64,
     pub nonce: u64,
     pub receiver: Vec<u8>,

@@ -652,6 +652,7 @@ mod tests {
         let id = bridge_core::submission_id(
             domain,
             debridge_id,
+            6,
             U256::from(100u64),
             U256::from(1u64),
             U256::from(2u64),
@@ -663,6 +664,7 @@ mod tests {
             bridge_domain: format!("{domain:#x}"),
             debridge_id: format!("{debridge_id:#x}"),
             amount: "100".into(),
+            bridge_decimals: Some(6),
             chain_id_from: 1,
             chain_id_to: 2,
             nonce: 7,

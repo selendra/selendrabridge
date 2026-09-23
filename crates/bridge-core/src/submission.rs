@@ -13,6 +13,11 @@ pub struct Submission {
     /// stale config can never make a validator sign for the wrong generation.
     pub bridge_domain: B256,
     pub debridge_id: B256,
+    /// Wire scale `amount` is denominated in, as the SOURCE gate registered it
+    /// (H-2). Inside the id, so recomputing with any other value produces an id
+    /// the gate never minted — which is what a scale mis-registration now looks
+    /// like everywhere, instead of a payout off by a power of ten.
+    pub bridge_decimals: u8,
     pub amount: U256,
     pub chain_id_from: U256,
     pub chain_id_to: U256,
@@ -29,6 +34,7 @@ impl Submission {
             None => submission_id(
                 self.bridge_domain,
                 self.debridge_id,
+                self.bridge_decimals,
                 self.amount,
                 self.chain_id_from,
                 self.chain_id_to,
@@ -38,6 +44,7 @@ impl Submission {
             Some(auto) => submission_id_with_auto(
                 self.bridge_domain,
                 self.debridge_id,
+                self.bridge_decimals,
                 self.amount,
                 self.chain_id_from,
                 self.chain_id_to,
@@ -63,6 +70,7 @@ impl Submission {
         Submission {
             bridge_domain,
             debridge_id: ev.debridgeId,
+            bridge_decimals: ev.bridgeDecimals,
             amount: ev.amount,
             chain_id_from: ev.chainIdFrom,
             chain_id_to: ev.chainIdTo,

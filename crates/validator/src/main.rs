@@ -444,8 +444,6 @@ async fn scan_source(
                     allowlist.as_ref(),
                     bridge_domain,
                     &scale_guard,
-                    &failover.active_provider(),
-                    gate,
                 )
                 .await
                 {
@@ -516,8 +514,6 @@ async fn handle_log(
     allowlist: Option<&Allowlist>,
     bridge_domain: B256,
     scale: &scale::ScaleGuard,
-    source_provider: &alloy::providers::DynProvider,
-    source_gate: Address,
 ) -> anyhow::Result<bool> {
     let decoded = Gate::Sent::decode_log(&log.inner).context("decode Sent")?;
     let ev = &decoded.data;
@@ -598,16 +594,18 @@ async fn handle_log(
         }
     }
 
-    // H-2: the submissionId does not commit to the scale the amount is in, so a
-    // destination registered one digit off pays a power of ten wrong on an
-    // ORDINARY transfer. `claim` is permissionless, so withholding the signature
-    // is the only thing that still stops it — see `scale`. Fails CLOSED: an
-    // unverifiable far end is exactly the dangerous case. The nonce is consumed
-    // either way (the transfer really happened), so the sequence stays intact.
+    // H-2: the submissionId now commits to the scale (`ev.bridgeDecimals` is in
+    // the preimage), and `claim` refuses a scale that is not the destination's
+    // own registration — so a mis-scaled corridor can no longer pay out wrong.
+    // What it CAN still do is strand every transfer into it, unclaimable, to be
+    // walked back through cancel -> refund. Refusing to sign turns that into one
+    // warning at the first transfer instead of a queue of stuck users, so this
+    // still runs and still fails CLOSED. The nonce is consumed either way (the
+    // transfer really happened), so the sequence stays intact.
     // `?`: a read that failed in transit is not a verdict. Propagating it fails
     // the batch, which leaves the cursor put and rolls the nonces back, so the
     // transfer is re-examined next tick instead of being withheld for good.
-    match scale.verdict(source_provider, source_gate, ev.token, chain_to, ev.debridgeId).await? {
+    match scale.verdict(ev.bridgeDecimals, chain_to, ev.debridgeId).await? {
         scale::Verdict::Agree(_) => {}
         scale::Verdict::Mismatch { source, destination } => {
             warn!(
@@ -617,10 +615,12 @@ async fn handle_log(
                 chain_to,
                 source_bridge_decimals = source,
                 destination_bridge_decimals = destination,
-                "BRIDGE DECIMALS MISMATCH — the two gates disagree about this asset's \
-                 scale, so a claim would pay out a power of ten wrong. Withholding \
-                 signature (nonce advanced). Both registrations are write-once: fixing \
-                 this needs a gate upgrade or a new mesh generation."
+                "BRIDGE DECIMALS MISMATCH — the source signed this transfer at one \
+                 scale and the destination would pay it at another, so the claim can \
+                 never verify there. Withholding signature (nonce advanced); the \
+                 transfer is recoverable through cancel -> refund. Both registrations \
+                 are write-once: fixing the corridor needs a gate upgrade or a new \
+                 mesh generation."
             );
             runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
             return Ok(true);

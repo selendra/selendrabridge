@@ -132,7 +132,7 @@ contract RefundTest is Test {
     function _cancel(bytes[] memory sigs) internal returns (bytes32 id) {
         vm.chainId(CHAIN_DST);
         id = dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
         );
         vm.chainId(CHAIN_SRC);
     }
@@ -141,14 +141,14 @@ contract RefundTest is Test {
     function _claim(bytes[] memory sigs) internal returns (bytes32 id) {
         vm.chainId(CHAIN_DST);
         id = dstGate.claim(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
         );
         vm.chainId(CHAIN_SRC);
     }
 
     function _refund(bytes[] memory sigs) internal returns (bytes32) {
         return srcGate.refund(
-            address(token), debridgeId, AMOUNT, CHAIN_DST, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
+            address(token), debridgeId, AMOUNT, 18, CHAIN_DST, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER, sigs
         );
     }
 
@@ -182,7 +182,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(Gate.AlreadyExecuted.selector);
         dstGate.claim(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, submissionId)
         );
         vm.chainId(CHAIN_SRC);
@@ -196,7 +196,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(Gate.AlreadyExecuted.selector);
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, _cancelId())
         );
         vm.chainId(CHAIN_SRC);
@@ -223,12 +223,12 @@ contract RefundTest is Test {
         // must demonstrably have been locked HERE.
         uint256 ghostNonce = 99;
         bytes32 ghostId = BridgeHash.getSubmissionId(
-            TEST_BRIDGE_DOMAIN, debridgeId, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
+            TEST_BRIDGE_DOMAIN, debridgeId, 18, AMOUNT, CHAIN_SRC, CHAIN_DST, ghostNonce, receiver
         );
 
         vm.expectRevert(abi.encodeWithSelector(Gate.NotSent.selector, ghostId));
         srcGate.refund(
-            address(token), debridgeId, AMOUNT, CHAIN_DST, ghostNonce, receiver, EMPTY_AUTO,
+            address(token), debridgeId, AMOUNT, 18, CHAIN_DST, ghostNonce, receiver, EMPTY_AUTO,
             EMPTY_SENDER, _one(v1pk, BridgeHash.getRefundId(ghostId))
         );
     }
@@ -249,7 +249,7 @@ contract RefundTest is Test {
 
         vm.prank(attacker);
         srcGate.refund(
-            address(token), debridgeId, AMOUNT, CHAIN_DST, NONCE, receiver, EMPTY_AUTO,
+            address(token), debridgeId, AMOUNT, 18, CHAIN_DST, NONCE, receiver, EMPTY_AUTO,
             abi.encodePacked(attacker), _one(v1pk, _refundId())
         );
 
@@ -267,7 +267,7 @@ contract RefundTest is Test {
             abi.encodeWithSelector(Gate.TokenMismatch.selector, debridgeId, address(other))
         );
         srcGate.refund(
-            address(other), debridgeId, AMOUNT, CHAIN_DST, NONCE, receiver, EMPTY_AUTO,
+            address(other), debridgeId, AMOUNT, 18, CHAIN_DST, NONCE, receiver, EMPTY_AUTO,
             EMPTY_SENDER, _one(v1pk, _refundId())
         );
     }
@@ -371,7 +371,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, submissionId)
         );
         vm.chainId(CHAIN_SRC);
@@ -381,7 +381,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, _refundId())
         );
         vm.chainId(CHAIN_SRC);
@@ -403,7 +403,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(Gate.AlreadyExecuted.selector);
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, _cancelId())
         );
         vm.chainId(CHAIN_SRC);
@@ -414,7 +414,7 @@ contract RefundTest is Test {
         dstGate.setThreshold(2);
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 1, 2));
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, _cancelId())
         );
         vm.chainId(CHAIN_SRC);
@@ -424,7 +424,7 @@ contract RefundTest is Test {
         vm.chainId(CHAIN_DST);
         vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(strangerPk, _cancelId())
         );
         vm.chainId(CHAIN_SRC);
@@ -435,7 +435,7 @@ contract RefundTest is Test {
         dstGate.pause();
         vm.expectRevert(Gate.EnforcedPause.selector);
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, _cancelId())
         );
         vm.chainId(CHAIN_SRC);
@@ -511,7 +511,7 @@ contract RefundTest is Test {
 
             vm.expectRevert(Gate.BadReceiver.selector);
             dstGate.claim(
-                debridgeId, WIDE_AMOUNT, CHAIN_SRC, nonce,
+                debridgeId, WIDE_AMOUNT, 18, CHAIN_SRC, nonce,
                 wide, EMPTY_AUTO, EMPTY_SENDER, sigs
             );
 
@@ -537,7 +537,7 @@ contract RefundTest is Test {
         // Destination burns it (the transfer can never be delivered).
         vm.chainId(CHAIN_DST);
         dstGate.cancel(
-            debridgeId, WIDE_AMOUNT, CHAIN_SRC, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, WIDE_AMOUNT, 18, CHAIN_SRC, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, BridgeHash.getCancelId(id))
         );
         assertTrue(dstGate.cancelled(id), "destination must be burned");
@@ -545,7 +545,7 @@ contract RefundTest is Test {
         // Source returns the funds to whoever locked them.
         vm.chainId(CHAIN_SRC);
         srcGate.refund(
-            address(token), debridgeId, WIDE_AMOUNT, CHAIN_DST, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            address(token), debridgeId, WIDE_AMOUNT, 18, CHAIN_DST, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, BridgeHash.getRefundId(id))
         );
 
@@ -561,7 +561,7 @@ contract RefundTest is Test {
     function test_Claim_ExactWidthReceiver_StillWorks() public {
         vm.chainId(CHAIN_DST);
         dstGate.claim(
-            debridgeId, AMOUNT, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, AMOUNT, 18, CHAIN_SRC, NONCE, receiver, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, submissionId)
         );
         assertEq(

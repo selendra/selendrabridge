@@ -185,6 +185,11 @@ struct SubmissionRow {
     bridge_domain: Option<String>,
     debridge_id: String,
     amount: String,
+    /// NULL for rows predating the wire scale (H-2) — see the schema comment.
+    /// `SMALLINT` on the wire; narrowed back to `u8` in `into_record`, where an
+    /// out-of-range value becomes `None` and so fails the id binding rather than
+    /// wrapping into some other scale.
+    bridge_decimals: Option<i16>,
     chain_id_from: i64,
     chain_id_to: i64,
     nonce: i64,
@@ -282,6 +287,7 @@ impl SubmissionRow {
             bridge_domain: self.bridge_domain.unwrap_or_default(),
             debridge_id: self.debridge_id,
             amount: self.amount,
+            bridge_decimals: self.bridge_decimals.and_then(|d| u8::try_from(d).ok()),
             chain_id_from: self.chain_id_from as u64,
             chain_id_to: self.chain_id_to as u64,
             nonce: self.nonce as u64,
@@ -400,9 +406,9 @@ where
 {
     sqlx::query(
         "INSERT INTO submissions \
-         (submission_id, bridge_domain, debridge_id, amount, chain_id_from, chain_id_to, nonce, \
-          receiver, auto_params, native_sender, token) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+         (submission_id, bridge_domain, debridge_id, amount, bridge_decimals, chain_id_from, \
+          chain_id_to, nonce, receiver, auto_params, native_sender, token) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
          ON CONFLICT (submission_id) DO UPDATE \
            SET token = COALESCE(submissions.token, EXCLUDED.token)",
     )
@@ -410,6 +416,7 @@ where
     .bind(record.bridge_domain.to_ascii_lowercase())
     .bind(record.debridge_id.to_ascii_lowercase())
     .bind(&record.amount)
+    .bind(record.bridge_decimals.map(i16::from))
     .bind(record.chain_id_from as i64)
     .bind(record.chain_id_to as i64)
     .bind(record.nonce as i64)
@@ -1747,6 +1754,7 @@ mod tests {
             bridge_domain: format!("0x{}", "d0".repeat(32)),
             debridge_id: format!("0x{}", "22".repeat(32)),
             amount: "100".into(),
+            bridge_decimals: Some(6),
             chain_id_from: 1,
             chain_id_to: 2,
             nonce: 1,

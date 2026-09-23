@@ -301,6 +301,13 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @param amount the WIRE amount, in the asset's bridge decimals (see
     ///        {BridgeDecimals}) — what the submissionId commits to, not the local
     ///        amount locked.
+    /// @param bridgeDecimals the scale `amount` is denominated in, as THIS gate
+    ///        has it registered. Inside the submissionId (H-2), so it is not a
+    ///        hint: a destination that has the asset registered at a different
+    ///        scale computes a different id and can never claim this transfer.
+    ///        Emitted anyway because an observer has no other way to read the
+    ///        source's registration, and every off-chain component needs it to
+    ///        reproduce the id.
     /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
     ///        (which commits to `debridgeId`, a one-way hash of it), so it is
     ///        emitted explicitly — the refund relayer needs the concrete address
@@ -309,6 +316,7 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes32 indexed submissionId,
         bytes32 indexed debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 chainIdTo,
         bytes receiver,
@@ -410,6 +418,13 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @dev bridge decimals must not exceed the token's own, and the scale
     ///      between them must fit a uint256 power of ten
     error InvalidBridgeDecimals(address token, uint8 bridgeDecimals, uint8 localDecimals);
+    /// @notice H-2. The wire scale the validators signed is not the one this gate
+    ///         would pay the asset out at. The signatures are perfectly valid —
+    ///         for a transfer denominated differently from anything this gate can
+    ///         settle. Paying it out anyway is the power-of-ten drain.
+    /// @param signed the scale inside the submissionId (the source's registration)
+    /// @param registered what this gate has for the same asset
+    error BridgeScaleMismatch(bytes32 debridgeId, uint8 signed, uint8 registered);
     /// @dev the amount carries precision below the asset's bridge decimals; it
     ///      would not survive the conversion, so it is refused rather than
     ///      silently truncated. `unit` is the smallest bridgeable step.
@@ -445,6 +460,12 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///      anything wider on BOTH claim and cancel, so such a transfer could
     ///      neither be delivered nor refunded (finding H-3).
     error AmountTooWide(uint256 amount);
+
+    /// @notice {initializeV2} was called on a gate that is still running. The
+    ///         submissionId format changed with the wire scale (H-2), so any
+    ///         transfer in flight across the upgrade can never be settled again;
+    ///         the gate must be paused and drained first.
+    error MigrationRequiresPause();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -543,6 +564,22 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         deployed by {initialize} at this version (that one is already at
     ///         version 1 with the state seeded correctly — for a fresh gate this
     ///         function is a no-op it should never need).
+    ///
+    ///         H-2 UPDATE — WHAT THIS CAN NO LONGER DO. The wire scale is now part
+    ///         of the submissionId preimage, so an id minted by the pre-decimals
+    ///         implementation cannot be reproduced by this one AT ALL: not with
+    ///         identity scale, not with any scale. Every in-flight transfer of a
+    ///         gate upgraded in place therefore becomes unclaimable AND
+    ///         unrefundable — `sentBy` is keyed by an id nothing will compute
+    ///         again. Seeding the registry, which used to make an in-place
+    ///         upgrade settle correctly, now only makes it settle NOTHING.
+    ///
+    ///         So the migration is no longer "upgrade and carry on". It is:
+    ///         {pause} the old implementation, let every outstanding transfer
+    ///         claim or refund under it, and only then upgrade. {paused} is
+    ///         required below to make the first step unskippable; the operator
+    ///         still owns the second, which no contract can verify (`sentBy` is a
+    ///         mapping with no enumeration). Drain before you migrate.
     function initializeV2(address[] calldata legacyTokens, uint256[] calldata legacyChains)
         external
         reinitializer(2)
@@ -550,6 +587,9 @@ contract Gate is Initializable, UUPSUpgradeable {
         // `upgradeToAndCall` delegatecalls this with the caller preserved, so the
         // owner check is the same one every other privileged entrypoint runs.
         if (msg.sender != owner) revert NotOwner();
+        // Migrating a gate that is still accepting transfers strands whatever is
+        // in flight across the id-format change (see above). Halt first.
+        if (!paused) revert MigrationRequiresPause();
 
         for (uint256 i = 0; i < legacyTokens.length; i++) {
             address token = legacyTokens[i];
@@ -970,6 +1010,11 @@ contract Gate is Initializable, UUPSUpgradeable {
         // Everything below — the id, the width cap, the event — is in the wire
         // amount; only the token transfer uses the local one.
         uint256 wireAmount = toBridgeAmount(token, amount);
+        // The scale `wireAmount` is denominated in goes INTO the id (H-2), so the
+        // destination cannot settle this transfer under a different one. Read
+        // after {toBridgeAmount}, which is what guarantees the registration
+        // exists at all.
+        uint8 wireDecimals = bridgeDecimalsOf[token].bridgeDecimals;
         // The receiver is only ever hashed and emitted here (never dereferenced on
         // this chain), but we still pin its width to the destination address size:
         // 20 = EVM address, 32 = Solana/non-EVM account key. A wrong length means a
@@ -987,7 +1032,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes memory nativeSender = abi.encodePacked(msg.sender);
 
         submissionId = _idFor(
-            debridgeId, wireAmount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            wireDecimals,
+            wireAmount,
+            block.chainid,
+            chainIdTo,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
 
         // Effects BEFORE the external transfer (checks-effects-interactions):
@@ -1002,6 +1055,7 @@ contract Gate is Initializable, UUPSUpgradeable {
             submissionId,
             debridgeId,
             wireAmount,
+            wireDecimals,
             block.chainid,
             chainIdTo,
             receiver,
@@ -1033,11 +1087,16 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         ascending. This both de-duplicates signers and bounds gas.
     /// @param amount the WIRE amount from the source `Sent` event; the payout is
     ///               {toLocalAmount} of it, emitted in `Claimed`
+    /// @param bridgeDecimals the scale `amount` is denominated in, from the source
+    ///               `Sent` event. It is inside the submissionId, so it is what
+    ///               the validators signed — and it must equal this gate's own
+    ///               registration or the payout would be off by a power of ten.
     /// @param nativeSender the packed source-chain sender; required to recompute
     ///                     the id when `autoParams` is non-empty (else ignored)
     function claim(
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 nonce,
         bytes calldata receiver,
@@ -1063,7 +1122,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (!isSealed) revert NotSealed();
 
         submissionId = _idFor(
-            debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            bridgeDecimals,
+            amount,
+            chainIdFrom,
+            block.chainid,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
 
         if (executed[submissionId]) revert AlreadyExecuted();
@@ -1075,6 +1142,21 @@ contract Gate is Initializable, UUPSUpgradeable {
 
         address localToken = tokenOf[debridgeId];
         if (localToken == address(0)) revert UnknownAsset(debridgeId);
+
+        // H-2. The id binds `bridgeDecimals` to the SIGNATURES; this binds the
+        // signatures to the PAYOUT. Without it the two halves never meet: the
+        // caller supplies the source's scale (it must, or the id would not
+        // verify) while {toLocalAmount} converts with this gate's own — so a gate
+        // registered at 3 against a mesh at 6 pays out 1000x on every transfer,
+        // to any user, with every signature valid. Refuse instead. A mis-scaled
+        // corridor now cannot move one token in either direction, which is the
+        // whole point: a mesh-wide constant must fail loudly, not arithmetically.
+        BridgeDecimals memory scale = bridgeDecimalsOf[localToken];
+        if (!scale.set) revert BridgeDecimalsUnset(localToken);
+        if (scale.bridgeDecimals != bridgeDecimals) {
+            revert BridgeScaleMismatch(debridgeId, bridgeDecimals, scale.bridgeDecimals);
+        }
+
         address to = _toAddress(receiver);
         // `amount` is the wire amount the validators signed; pay it out in this
         // token's own decimals.
@@ -1123,9 +1205,17 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         incident it is a state change worth freezing. The asymmetry is
     ///         deliberate: {refund} only returns funds already locked and already
     ///         burned on the far side, so it can create no new exposure.
+    /// @param bridgeDecimals the scale from the source `Sent` event. Hashed into
+    ///        the id and nothing else — DELIBERATELY not checked against this
+    ///        gate's registry, because cancelling is the recovery path for a
+    ///        transfer this gate cannot settle, including one whose asset it has
+    ///        never registered or has registered at the wrong scale. Supplying a
+    ///        value the source did not use simply yields an id no validator
+    ///        signed, so it needs no check of its own.
     function cancel(
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 nonce,
         bytes calldata receiver,
@@ -1134,7 +1224,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes[] calldata signatures
     ) external whenNotPaused returns (bytes32 submissionId) {
         submissionId = _idFor(
-            debridgeId, amount, chainIdFrom, block.chainid, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            bridgeDecimals,
+            amount,
+            chainIdFrom,
+            block.chainid,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
 
         // Already claimed (or already cancelled) — either way it is spent here,
@@ -1169,10 +1267,15 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         It cannot create exposure. Halting it would trap exactly the users
     ///         an incident stranded, for as long as the incident lasted, which is
     ///         the opposite of what the breaker is for.
+    /// @param bridgeDecimals the scale this gate denominated the transfer in when
+    ///        it locked the funds. Hashed into the id, so a wrong value produces
+    ///        an id with no `sentBy` entry and reverts `NotSent` — the binding is
+    ///        the lookup itself.
     function refund(
         address token,
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdTo,
         uint256 nonce,
         bytes calldata receiver,
@@ -1181,7 +1284,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes[] calldata signatures
     ) external returns (bytes32 submissionId) {
         submissionId = _idFor(
-            debridgeId, amount, block.chainid, chainIdTo, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            bridgeDecimals,
+            amount,
+            block.chainid,
+            chainIdTo,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
 
         if (refunded[submissionId]) revert AlreadyRefunded(submissionId);
@@ -1221,10 +1332,11 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///      the old implementation, whose amounts were raw local units. Returning
     ///      `amount` unchanged is exactly what that transfer locked.
     ///
-    ///      This is what keeps {refund}'s never-halting promise true through an
-    ///      in-place upgrade even if the operator skipped {initializeV2} (M-2). It
-    ///      cannot over-pay: the alternative multiplier is always >= 1, so the
-    ///      unregistered case pays the smallest amount the token could mean.
+    ///      Since H-2 that branch is unreachable in practice — a legacy id cannot
+    ///      be recomputed under the new preimage, so `sentBy` never resolves for
+    ///      one and {refund} reverts `NotSent` long before here. It is kept as the
+    ///      conservative arm of a `set` check that still has to exist: it cannot
+    ///      over-pay, because the alternative multiplier is always >= 1.
     function _refundLocalAmount(address token, uint256 amount) internal view returns (uint256) {
         BridgeDecimals memory d = bridgeDecimalsOf[token];
         if (!d.set) return amount;
@@ -1235,6 +1347,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     function computeSubmissionId(
         bytes32 debridgeId,
         uint256 amount,
+        uint8 bridgeDecimals,
         uint256 chainIdFrom,
         uint256 chainIdTo,
         uint256 nonce,
@@ -1243,7 +1356,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes calldata nativeSender
     ) external view returns (bytes32) {
         return _idFor(
-            debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver, autoParams, nativeSender
+            debridgeId,
+            bridgeDecimals,
+            amount,
+            chainIdFrom,
+            chainIdTo,
+            nonce,
+            receiver,
+            autoParams,
+            nativeSender
         );
     }
 
@@ -1253,6 +1374,7 @@ contract Gate is Initializable, UUPSUpgradeable {
 
     function _idFor(
         bytes32 debridgeId,
+        uint8 bridgeDecimals,
         uint256 amount,
         uint256 chainIdFrom,
         uint256 chainIdTo,
@@ -1283,13 +1405,14 @@ contract Gate is Initializable, UUPSUpgradeable {
         // computes is scoped to this deployment generation.
         if (autoParams.length == 0) {
             return BridgeHash.getSubmissionId(
-                bridgeDomain, debridgeId, amount, chainIdFrom, chainIdTo, nonce, receiver
+                bridgeDomain, debridgeId, bridgeDecimals, amount, chainIdFrom, chainIdTo, nonce, receiver
             );
         }
         AutoParamsTo memory ap = abi.decode(autoParams, (AutoParamsTo));
         return BridgeHash.getSubmissionIdWithAuto(
             bridgeDomain,
             debridgeId,
+            bridgeDecimals,
             amount,
             chainIdFrom,
             chainIdTo,

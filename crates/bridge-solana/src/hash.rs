@@ -52,27 +52,35 @@ pub fn debridge_id(native_chain_id: u64, native_token: &[u8; 20]) -> [u8; 32] {
     keccak(&p)
 }
 
-/// The 8-field packed base of every submissionId, unhashed (matches
+/// The 9-field packed base of every submissionId, unhashed (matches
 /// `BridgeHash.packedSubmission`).
 ///
 /// `bridge_domain` is the deployment generation, and must equal the domain the
 /// EVM gates were initialized with. Without it an attestation from a superseded
 /// deployment stays valid against a redeployed one.
+///
+/// `bridge_decimals` is the wire scale `amount` is denominated in (H-2), as the
+/// gate that minted the id had the asset registered. A single byte, and the
+/// reason a scale mis-registration on either end now produces two ids that never
+/// meet instead of a payout off by a power of ten.
+#[allow(clippy::too_many_arguments)]
 fn packed_submission(
     bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
+    bridge_decimals: u8,
     amount: &[u8; 32],
     chain_id_from: u64,
     chain_id_to: u64,
     nonce: u64,
     receiver: &[u8],
 ) -> Vec<u8> {
-    let mut p = Vec::with_capacity(32 * 7 + receiver.len());
+    let mut p = Vec::with_capacity(32 * 7 + 1 + receiver.len());
     p.extend_from_slice(&be32(SUBMISSION_PREFIX));
     p.extend_from_slice(bridge_domain);
     p.extend_from_slice(debridge_id);
     p.extend_from_slice(&be32(chain_id_from));
     p.extend_from_slice(&be32(chain_id_to));
+    p.push(bridge_decimals);
     p.extend_from_slice(amount);
     p.extend_from_slice(receiver);
     p.extend_from_slice(&be32(nonce));
@@ -80,9 +88,11 @@ fn packed_submission(
 }
 
 /// submissionId for a transfer WITHOUT an execution payload.
+#[allow(clippy::too_many_arguments)]
 pub fn submission_id(
     bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
+    bridge_decimals: u8,
     amount: &[u8; 32],
     chain_id_from: u64,
     chain_id_to: u64,
@@ -92,6 +102,7 @@ pub fn submission_id(
     keccak(&packed_submission(
         bridge_domain,
         debridge_id,
+        bridge_decimals,
         amount,
         chain_id_from,
         chain_id_to,
@@ -101,9 +112,11 @@ pub fn submission_id(
 }
 
 /// submissionId for a transfer WITH an execution payload.
+#[allow(clippy::too_many_arguments)]
 pub fn submission_id_with_auto(
     bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
+    bridge_decimals: u8,
     amount: &[u8; 32],
     chain_id_from: u64,
     chain_id_to: u64,
@@ -114,6 +127,7 @@ pub fn submission_id_with_auto(
     let mut p = packed_submission(
         bridge_domain,
         debridge_id,
+        bridge_decimals,
         amount,
         chain_id_from,
         chain_id_to,

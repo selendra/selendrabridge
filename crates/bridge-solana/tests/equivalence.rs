@@ -29,6 +29,8 @@ struct Fixture {
     bridge_domain: String,
     #[serde(rename = "debridgeId")]
     debridge_id: String,
+    #[serde(rename = "bridgeDecimals")]
+    bridge_decimals: u8,
     amount: String,
     #[serde(rename = "chainIdFrom")]
     chain_id_from: u64,
@@ -96,6 +98,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
             hash::submission_id_with_auto(
                 &bridge_domain,
                 &debridge_id,
+                f.bridge_decimals,
                 &amount,
                 f.chain_id_from,
                 f.chain_id_to,
@@ -107,6 +110,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
             hash::submission_id(
                 &bridge_domain,
                 &debridge_id,
+                f.bridge_decimals,
                 &amount,
                 f.chain_id_from,
                 f.chain_id_to,
@@ -120,6 +124,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
             bridge_core::submission_id_with_auto(
                 bridge_domain.into(),
                 debridge_id.into(),
+                f.bridge_decimals,
                 U256::from_str_radix(&f.amount, 10).unwrap(),
                 U256::from(f.chain_id_from),
                 U256::from(f.chain_id_to),
@@ -137,6 +142,7 @@ fn solana_hash_matches_solidity_fixtures_and_bridge_core() {
             bridge_core::submission_id(
                 bridge_domain.into(),
                 debridge_id.into(),
+                f.bridge_decimals,
                 U256::from_str_radix(&f.amount, 10).unwrap(),
                 U256::from(f.chain_id_from),
                 U256::from(f.chain_id_to),

@@ -136,6 +136,11 @@ pub struct ClaimArgs {
     pub debridge_id: [u8; 32],
     /// WIRE amount (bridge decimals), exactly as the source `Sent` carried it.
     pub amount: u64,
+    /// H-2: the scale `amount` is denominated in, from the source `Sent`. Inside
+    /// the submissionId, so it is what the validators signed — and it must equal
+    /// this gate's own registration for the asset, or the payout would be off by
+    /// a power of ten.
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub nonce: u64,
     pub receiver: Vec<u8>,
@@ -315,6 +320,11 @@ fn consume_governance(
 pub struct CancelArgs {
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    /// The source's wire scale. Hashed into the id and nothing else — cancelling
+    /// is the recovery path for a transfer this gate CANNOT settle, including one
+    /// whose asset it never registered, so there is no registration to check it
+    /// against. A wrong value yields an id no validator signed.
+    pub bridge_decimals: u8,
     pub chain_id_from: u64,
     pub nonce: u64,
     pub receiver: Vec<u8>,
@@ -333,6 +343,10 @@ pub struct CancelArgs {
 pub struct RefundArgs {
     pub debridge_id: [u8; 32],
     pub amount: u64,
+    /// The scale this gate denominated the transfer in when it locked the funds.
+    /// Hashed into the id, so a wrong value lands on a `["sent", id]` PDA that
+    /// does not exist — the binding is the lookup itself.
+    pub bridge_decimals: u8,
     pub chain_id_to: u64,
     pub nonce: u64,
     pub receiver: Vec<u8>,
@@ -1078,6 +1092,17 @@ pub enum GateError {
     /// claim cannot be paid in this mint. `Custom(24)`.
     #[error("amount overflows u64 at this mint's decimals")]
     AmountOverflow,
+    /// H-2: the wire scale the validators signed is not the one this gate has
+    /// registered for the asset, so paying the transfer out would be off by a
+    /// power of ten. `Custom(25)`. Mirrors `Gate.BridgeScaleMismatch`.
+    ///
+    /// Unreachable on a correctly wired mesh, and NOT the only thing standing in
+    /// the way of one that is not: the scale is inside the submissionId, so a
+    /// mismatched claim usually fails the quorum first. This catches the one case
+    /// the quorum cannot — a caller restating the transfer at this gate's own
+    /// scale, which is what makes the ids diverge in the first place.
+    #[error("wire scale does not match this gate's registration for the asset")]
+    BridgeScaleMismatch,
 }
 
 /// Pure init-time validator-set rule (host-testable; `init` itself cannot run
@@ -1161,6 +1186,7 @@ fn amount_word(v: u64) -> [u8; 32] {
 fn submission_id(
     bridge_domain: &[u8; 32],
     debridge_id: &[u8; 32],
+    bridge_decimals: u8,
     amount: u64,
     chain_id_from: u64,
     chain_id_to: u64,
@@ -1174,8 +1200,12 @@ fn submission_id(
     let ct = be32(chain_id_to);
     let amt = amount_word(amount);
     let nz = be32(nonce);
-    // packedSubmission = prefix|bridgeDomain|debridgeId|chainIdFrom|chainIdTo|amount|receiver|nonce
-    let base: &[&[u8]] = &[&prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz];
+    // H-2: the wire scale rides between chainIdTo and amount, as one raw byte —
+    // `abi.encodePacked(uint8)` — because `amount` means nothing without it.
+    let bd = [bridge_decimals];
+    // packedSubmission =
+    //   prefix|bridgeDomain|debridgeId|chainIdFrom|chainIdTo|bridgeDecimals|amount|receiver|nonce
+    let base: &[&[u8]] = &[&prefix, bridge_domain, debridge_id, &cf, &ct, &bd, &amt, receiver, &nz];
     match auto {
         None => keccak::hashv(base).to_bytes(),
         Some(a) => {
@@ -1187,8 +1217,8 @@ fn submission_id(
             let ns = keccak::hashv(&[native_sender]).to_bytes();
             // keccak(packedSubmission || fee || flags || keccak(fallback) || keccak(data) || keccak(nativeSender))
             keccak::hashv(&[
-                &prefix, bridge_domain, debridge_id, &cf, &ct, &amt, receiver, &nz, &fee, &flags,
-                &fb, &data, &ns,
+                &prefix, bridge_domain, debridge_id, &cf, &ct, &bd, &amt, receiver, &nz, &fee,
+                &flags, &fb, &data, &ns,
             ])
             .to_bytes()
         }
@@ -1427,6 +1457,7 @@ fn process_cancel(program_id: &Pubkey, accounts: &[AccountInfo], args: CancelArg
     let id = submission_id(
         &cfg.bridge_domain,
         &args.debridge_id,
+        args.bridge_decimals,
         args.amount,
         args.chain_id_from,
         cfg.chain_id,
@@ -1517,6 +1548,7 @@ fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo], args: RefundArg
     let id = submission_id(
         &cfg.bridge_domain,
         &args.debridge_id,
+        args.bridge_decimals,
         args.amount,
         cfg.chain_id,
         args.chain_id_to,
@@ -1831,9 +1863,12 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
 
     let nonce = cfg.nonce(args.chain_id_to);
     let native_sender = payer.key.to_bytes();
+    // H-2: the scale goes into the id, read from the registry that produced
+    // `wire_amount` a few lines above — the two can never disagree.
     let id = submission_id(
         &cfg.bridge_domain,
         &args.debridge_id,
+        asset.bridge_decimals,
         wire_amount,
         cfg.chain_id,
         args.chain_id_to,
@@ -1875,7 +1910,16 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
 
     // Emit the Sent event as structured program data for the validator's source,
     // carrying the registered mint as the locked asset identity (H5).
-    emit_sent(&id, &args, wire_amount, cfg.chain_id, nonce, &native_sender, &asset.mint.to_bytes());
+    emit_sent(
+        &id,
+        &args,
+        wire_amount,
+        asset.bridge_decimals,
+        cfg.chain_id,
+        nonce,
+        &native_sender,
+        &asset.mint.to_bytes(),
+    );
 
     // Lock: user -> vault (SPL CPI).
     let transfer = spl_token::instruction::transfer(
@@ -1939,9 +1983,24 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     let (recv_mint, _recv_owner) = receiver_token_account(receiver_token, token_program.key)?;
     verify_asset_binding(&asset, token_program.key, vault.key, &vault_mint, &recv_mint)?;
 
+    // H-2. The id binds the scale to the SIGNATURES; this binds the signatures to
+    // the PAYOUT. The caller must pass the source's scale for the id to verify at
+    // all, while `to_local` converts with this gate's own — so without the check
+    // a gate registered one digit off pays a power of ten on every transfer, with
+    // every signature valid. Refuse instead.
+    if args.bridge_decimals != asset.bridge_decimals {
+        msg!(
+            "wire scale {} != registered {}",
+            args.bridge_decimals,
+            asset.bridge_decimals
+        );
+        return Err(GateError::BridgeScaleMismatch.into());
+    }
+
     let id = submission_id(
         &cfg.bridge_domain,
         &args.debridge_id,
+        args.bridge_decimals,
         args.amount,
         args.chain_id_from,
         cfg.chain_id,
@@ -2220,6 +2279,7 @@ struct SentEvent {
     debridge_id: [u8; 32],
     mint: [u8; 32],
     amount: u64,
+    bridge_decimals: u8,
     chain_id_from: u64,
     chain_id_to: u64,
     nonce: u64,
@@ -2229,7 +2289,10 @@ struct SentEvent {
 }
 
 const SENT_EVENT_TAG: &[u8] = b"BRIDGE_SENT";
-const SENT_EVENT_VERSION: u8 = 1;
+/// Bumped to 2 by H-2: the event carries `bridge_decimals` now, without which
+/// an observer cannot recompute the submissionId. Must equal
+/// `bridge_solana::relayer::SENT_EVENT_VERSION`.
+const SENT_EVENT_VERSION: u8 = 2;
 
 /// M-2 lifecycle events. Same `sol_log_data` framing and versioning as
 /// [`SentEvent`], so the indexer decodes all three the same way. These are what
@@ -2270,10 +2333,12 @@ fn emit_lifecycle(
 /// Emit the `Sent` event via `sol_log_data` (base64 program data in the tx logs)
 /// so the validator's Solana source can decode it with
 /// `bridge_solana::relayer::parse_sent_log_line`.
+#[allow(clippy::too_many_arguments)]
 fn emit_sent(
     id: &[u8; 32],
     args: &SendArgs,
     wire_amount: u64,
+    bridge_decimals: u8,
     chain_id_from: u64,
     nonce: u64,
     native_sender: &[u8],
@@ -2285,6 +2350,7 @@ fn emit_sent(
         debridge_id: args.debridge_id,
         mint: *mint,
         amount: wire_amount,
+        bridge_decimals,
         chain_id_from,
         chain_id_to: args.chain_id_to,
         nonce,
@@ -2324,6 +2390,95 @@ mod c1_tests {
 
     fn pid() -> Pubkey {
         Pubkey::new_unique()
+    }
+
+    /// THE SACRED HASH, pinned for the PROGRAM's own implementation.
+    ///
+    /// `bridge-solana`'s `hash` module is locked to the Foundry fixtures by its
+    /// own equivalence test, and that crate is a dev-dependency here — so
+    /// comparing against it transitively pins this file to Solidity.
+    ///
+    /// The no-auto branch was already covered end-to-end (`account_level.rs`
+    /// rebuilds the preimage by hand and the handlers refuse a wrong id), but the
+    /// WITH-AUTO branch was covered by nothing: it is a second, hand-written
+    /// field list in `submission_id`, and a transfer carrying an execution
+    /// payload would simply fail `NotEnoughSignatures` for ever if it drifted.
+    /// H-2 added a field to both lists, which is exactly the kind of edit that
+    /// gets applied to one and not the other.
+    #[test]
+    fn the_programs_submission_id_matches_the_shared_implementation() {
+        let domain = [0xD0u8; 32];
+        let did = [0x22u8; 32];
+        let receiver = vec![0xABu8; 32];
+        let native_sender = vec![0x11u8; 20];
+        let (amount, bridge_decimals, from, to, nonce) = (1_500_000u64, 6u8, 1337u64, 7_565_164u64, 3u64);
+
+        let plain = submission_id(
+            &domain, &did, bridge_decimals, amount, from, to, nonce, &receiver, None,
+            &native_sender,
+        );
+        assert_eq!(
+            plain,
+            bridge_solana::hash::submission_id(
+                &domain,
+                &did,
+                bridge_decimals,
+                &bridge_solana::hash::amount_word(amount as u128),
+                from,
+                to,
+                nonce,
+                &receiver,
+            )
+        );
+
+        let wire = AutoParamsWire {
+            execution_fee: 1_000_000_000_000_000_000,
+            flags: 2,
+            fallback_address: vec![0xF0, 0x0D],
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut fee = [0u8; 32];
+        fee[16..].copy_from_slice(&wire.execution_fee.to_be_bytes());
+        let mut flags = [0u8; 32];
+        flags[24..].copy_from_slice(&wire.flags.to_be_bytes());
+        let with_auto = submission_id(
+            &domain, &did, bridge_decimals, amount, from, to, nonce, &receiver, Some(&wire),
+            &native_sender,
+        );
+        assert_eq!(
+            with_auto,
+            bridge_solana::hash::submission_id_with_auto(
+                &domain,
+                &did,
+                bridge_decimals,
+                &bridge_solana::hash::amount_word(amount as u128),
+                from,
+                to,
+                nonce,
+                &receiver,
+                &bridge_solana::hash::AutoParams {
+                    execution_fee: fee,
+                    flags,
+                    fallback_address: wire.fallback_address.clone(),
+                    data: wire.data.clone(),
+                    native_sender: native_sender.clone(),
+                },
+            )
+        );
+        assert_ne!(plain, with_auto, "the two forms must be distinguishable");
+
+        // And the scale is load-bearing in BOTH forms.
+        for auto in [None, Some(&wire)] {
+            let other = submission_id(
+                &domain, &did, bridge_decimals + 1, amount, from, to, nonce, &receiver, auto,
+                &native_sender,
+            );
+            let same = submission_id(
+                &domain, &did, bridge_decimals, amount, from, to, nonce, &receiver, auto,
+                &native_sender,
+            );
+            assert_ne!(other, same, "bridgeDecimals must change the id");
+        }
     }
 
     // A config account is trusted ONLY when it is the canonical ["config"] PDA

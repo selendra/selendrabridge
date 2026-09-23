@@ -69,9 +69,11 @@ Because keccak is not invertible, `Gate.Sent` also emits the concrete `token` ad
 ```
 submissionId = keccak256(abi.encodePacked(
     SUBMISSION_PREFIX,   // uint256(1)
+    bridgeDomain,        // bytes32 — deployment generation
     debridgeId,
     chainIdFrom,
     chainIdTo,
+    bridgeDecimals,      // uint8 — ONE raw byte, not a word
     amount,
     receiver,            // dynamic bytes
     nonce
@@ -83,12 +85,16 @@ Follow `BridgeHash.packedSubmission`, not intuition.
 
 `amount` here is the **wire amount**, in the asset's *bridge decimals* — never a local token amount. See §2.3.
 
+`bridgeDecimals` is that scale, and it is in the preimage for the same reason `bridgeDomain` is: it is a value the whole mesh must agree on, and a disagreement has to fail LOUDLY rather than arithmetically. `amount` is a bare integer; what it is worth is decided entirely by the scale each gate registered. Before this field existed, a source at 6 and a destination at 3 produced the *same* id for a transfer the destination then paid out 1000× — to any user, permissionlessly, with every signature valid and nothing on-chain able to notice. Each gate now hashes the scale it itself registered, so the two ids diverge and the claim simply never verifies. `Gate.claim` additionally refuses a wire scale that is not its own registration, which is what binds the signed value to the payout rather than only to the hash.
+
+It is packed as a single byte (`abi.encodePacked(uint8)`), between two fixed-width words. Everywhere else — calldata, the `Sent` event — it is `abi.encode`d and occupies a full 32-byte word.
+
 **Transfer id, with an execution payload.**
-The seven-field packed base above, with five more fields appended before hashing:
+The nine-field packed base above, with five more fields appended before hashing:
 
 ```
 submissionId = keccak256(abi.encodePacked(
-    <the 7-field packed base>,
+    <the 9-field packed base>,
     autoParams.executionFee,
     autoParams.flags,
     keccak256(autoParams.fallbackAddress),
@@ -116,7 +122,7 @@ Without domain separation, the signature that authorises *paying out* a transfer
 An attacker who collected a normal quorum of transfer signatures could replay them to cancel the transfer, then replay them again to refund it, and take the money twice.
 
 Two things prevent that.
-The prefix differs, and the preimage length differs: a cancel or refund preimage is 64 bytes, while a submission preimage is at least 224 bytes.
+The prefix differs, and the preimage length differs: a cancel or refund preimage is 64 bytes, while a submission preimage is at least 225 bytes.
 Crossing the domains would require a keccak256 preimage collision.
 
 This is enforced on-chain and tested.
@@ -136,10 +142,12 @@ So every asset has ONE **bridge decimals** value `D`, the same on every gate and
 | --- | --- | --- |
 | `send(token, local)` | source | locks `local`; reverts `InexactAmount` unless `local % unit == 0` |
 | `Sent.amount`, submissionId, signatures, store, keeper | everywhere | `wire = local / unit` |
-| `claim(…, wire, …)` | destination | pays `wire × unit_dest` |
+| `claim(…, wire, D, …)` | destination | reverts `BridgeScaleMismatch` unless `D` is its own registration; else pays `wire × unit_dest` |
 | `refund(…, wire, …)` | source | returns `wire × unit_source` = exactly what was locked |
 
 Scaling up is always exact because `D` is the minimum, so no chain pays out more or less than was locked, and there is no rounding anywhere. Exact-or-revert is deliberate: a send never silently drops dust. `SwapRouter.swapAndBridge`, which bridges a pool output it cannot choose, rounds down to a whole unit and returns the remainder to the caller.
+
+`D` is also inside the submissionId (§2.1), so a mis-registered corridor cannot settle at all in either direction — every transfer into it strands and is recovered through cancel → refund, instead of paying out a power of ten wrong. Validators still refuse to sign across a mismatch, which turns that into one warning at the first transfer rather than a queue of stuck users.
 
 `D` is registered per local token: `Gate.setBridgeDecimals(token, D)` (write-once; delayed by `GOVERNANCE_DELAY` once sealed, like a corridor, because a lower `D` on a destination multiplies every claim) and `RegisterAsset { debridge_id, bridge_decimals }` on Solana. `setLocalToken` refuses a token without it, so no corridor can exist that cannot convert. The deploy script derives `D` as the minimum on-chain decimals across the asset's deployments and mint, unless `assets[].bridge_decimals` pins it.
 

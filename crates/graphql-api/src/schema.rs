@@ -349,6 +349,13 @@ pub struct Submission {
     pub debridge_id: String,
     /// uint256 as a decimal string (avoids JSON precision loss).
     pub amount: String,
+    /// The wire scale `amount` is denominated in, AS SIGNED — it is inside the
+    /// submissionId (H-2), so this is the transfer's own scale and not an
+    /// opinion about it. Exposed through the `bridgeDecimals` resolver below,
+    /// which prefers it over any chain lookup. `None` only on rows written
+    /// before the scale existed, which can no longer be settled at all.
+    #[graphql(skip)]
+    pub bridge_decimals: Option<u8>,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub nonce: u64,
@@ -382,6 +389,7 @@ impl Submission {
             submission_id: rec.submission_id,
             debridge_id: rec.debridge_id,
             amount: rec.amount,
+            bridge_decimals: rec.bridge_decimals,
             chain_id_from: rec.chain_id_from,
             chain_id_to: rec.chain_id_to,
             nonce: rec.nonce,
@@ -406,12 +414,19 @@ impl Submission {
     /// figure is the one a client can always get, which is how M-11 rendered a
     /// 1,000-token transfer as `0`.
     ///
-    /// Resolved from the registry, else from the source gate's
-    /// `bridgeDecimalsOf(token)`; see [`ApiState::amount_scale`]. Null when
-    /// neither can answer — then `amount` is raw units of an unknown scale and
-    /// must be shown as such.
+    /// Since H-2 the scale is INSIDE the submissionId, so the record carries the
+    /// exact value the validators signed — no RPC, and nothing to disagree with.
+    /// It is preferred whenever present.
+    ///
+    /// The chain lookup survives only for rows written before that: the registry,
+    /// else the source gate's `bridgeDecimalsOf(token)` (see
+    /// [`ApiState::amount_scale`]). Null when neither can answer — then `amount`
+    /// is raw units of an unknown scale and must be shown as such.
     #[graphql(complexity = "CHAIN_READ_COST")]
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
+        if let Some(signed) = self.bridge_decimals {
+            return Some(signed);
+        }
         state(ctx).amount_scale(&self.debridge_id, self.chain_id_from, &self.token).await
     }
 
@@ -1196,6 +1211,12 @@ pub struct SubmissionInput {
     pub bridge_domain: String,
     pub debridge_id: String,
     pub amount: String,
+    /// The wire scale `amount` is denominated in (H-2). Also part of the
+    /// submissionId preimage, so like `bridgeDomain` a wrong value only earns a
+    /// rejection. Optional on the wire so a pre-H-2 client gets a clear id
+    /// mismatch rather than a schema error, but a record without it can never
+    /// bind — the id is not reproducible at all.
+    pub bridge_decimals: Option<u8>,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub nonce: u64,
@@ -1232,6 +1253,7 @@ impl Mutation {
             bridge_domain: input.bridge_domain,
             debridge_id: input.debridge_id,
             amount: input.amount,
+            bridge_decimals: input.bridge_decimals,
             chain_id_from: input.chain_id_from,
             chain_id_to: input.chain_id_to,
             nonce: input.nonce,
@@ -1313,6 +1335,96 @@ mod tests {
         let msg = store_error(e).message;
         assert_eq!(msg, "signature store unavailable");
         assert!(!msg.contains("internal-store"));
+    }
+
+    /// H-2. `bridgeDecimals` on a submission is now a SIGNED field: it is inside
+    /// the submissionId, so the record carries the exact scale the validators
+    /// attested. The resolver must serve that, not go and ask a chain — which is
+    /// also why this asserts with NO registry and NO configured gates. Under the
+    /// old resolver that configuration could only answer `null`.
+    #[tokio::test]
+    async fn a_submissions_wire_scale_comes_from_the_record_not_from_a_chain_read() {
+        use bridge_core::store::SubmissionRecord;
+
+        let dir = std::env::temp_dir().join(format!("graphql-api-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rec = SubmissionRecord {
+            submission_id: String::new(),
+            bridge_domain: format!("0x{}", "d0".repeat(32)),
+            debridge_id: format!("0x{}", "22".repeat(32)),
+            amount: "1500000".into(),
+            bridge_decimals: Some(9),
+            chain_id_from: 1337,
+            chain_id_to: 1338,
+            nonce: 4,
+            receiver: format!("0x{}", "ab".repeat(20)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: String::new(),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        };
+        rec.submission_id =
+            format!("{:#x}", bridge_core::store::canonical_submission_id(&rec).unwrap());
+        std::fs::write(
+            dir.join(format!("{}.json", rec.submission_id.trim_start_matches("0x"))),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        // A pre-H-2 row alongside it: same shape, no scale, a distinct nonce so
+        // it is a different id.
+        let mut legacy = rec.clone();
+        legacy.nonce = 5;
+        legacy.submission_id =
+            format!("{:#x}", bridge_core::store::canonical_submission_id(&legacy).unwrap());
+        legacy.bridge_decimals = None;
+        std::fs::write(
+            dir.join(format!("{}.json", legacy.submission_id.trim_start_matches("0x"))),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let schema = async_graphql::Schema::build(
+            Query,
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .data(ApiState {
+            backend: Arc::new(StoreBackend::file(&dir).unwrap()),
+            threshold: Some(2),
+            // Deliberately empty: nothing here can answer a scale question.
+            chains: Chains::new(),
+            registry: vec![],
+            swaps: Swaps::new(),
+        })
+        .finish();
+
+        let res = schema
+            .execute(&format!(
+                r#"{{ submission(submissionId: "{}") {{ bridgeDecimals }} }}"#,
+                rec.submission_id
+            ))
+            .await;
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["submission"]["bridgeDecimals"], 9, "{json}");
+
+        let res = schema
+            .execute(&format!(
+                r#"{{ submission(submissionId: "{}") {{ bridgeDecimals }} }}"#,
+                legacy.submission_id
+            ))
+            .await;
+        let json = res.data.into_json().unwrap();
+        assert_eq!(
+            json["submission"]["bridgeDecimals"],
+            serde_json::Value::Null,
+            "a row with no signed scale must stay null rather than invent one: {json}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Round 5, H-7. Every field that costs an upstream round trip must carry a

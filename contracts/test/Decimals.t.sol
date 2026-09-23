@@ -114,18 +114,18 @@ contract DecimalsTest is Test {
     function test_EighteenToSix_PaysTheSameValue() public {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_18, address(tst18));
         vm.expectEmit(false, true, false, false);
-        emit Gate.Sent(bytes32(0), did, 1_500_000, CHAIN_18, CHAIN_6, receiver, 0, "", "", address(tst18));
+        emit Gate.Sent(bytes32(0), did, 1_500_000, 6, CHAIN_18, CHAIN_6, receiver, 0, "", "", address(tst18));
         bytes32 id = _send18(1.5e18, CHAIN_6);
 
         // the id commits to the WIRE amount
         assertEq(
             id,
-            gate18.computeSubmissionId(did, 1_500_000, CHAIN_18, CHAIN_6, 0, receiver, "", abi.encodePacked(user))
+            gate18.computeSubmissionId(did, 1_500_000, 6, CHAIN_18, CHAIN_6, 0, receiver, "", abi.encodePacked(user))
         );
         assertEq(tst18.balanceOf(address(gate18)), 1_000_000e18 + 1.5e18, "locks the LOCAL amount");
 
         vm.chainId(CHAIN_6);
-        gate6.claim(did, 1_500_000, CHAIN_18, 0, receiver, "", "", _sign(id));
+        gate6.claim(did, 1_500_000, 6, CHAIN_18, 0, receiver, "", "", _sign(id));
         assertEq(tst6.balanceOf(receiverAddr), 1.5e6, "1.5 TST at 6 decimals");
     }
 
@@ -133,7 +133,7 @@ contract DecimalsTest is Test {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_18, address(tst18));
         bytes32 id = _send18(2.25e18, CHAIN_9);
         vm.chainId(CHAIN_9);
-        gate9.claim(did, 2_250_000, CHAIN_18, 0, receiver, "", "", _sign(id));
+        gate9.claim(did, 2_250_000, 6, CHAIN_18, 0, receiver, "", "", _sign(id));
         assertEq(tst9.balanceOf(receiverAddr), 2.25e9);
     }
 
@@ -147,7 +147,7 @@ contract DecimalsTest is Test {
         vm.stopPrank();
 
         vm.chainId(CHAIN_18);
-        gate18.claim(BridgeHash.getDebridgeId(CHAIN_6, address(tst6)), 3_750_000, CHAIN_6, 0, receiver, "", "", _sign(id));
+        gate18.claim(BridgeHash.getDebridgeId(CHAIN_6, address(tst6)), 3_750_000, 6, CHAIN_6, 0, receiver, "", "", _sign(id));
         assertEq(tst18.balanceOf(receiverAddr), 3.75e18);
     }
 
@@ -190,7 +190,7 @@ contract DecimalsTest is Test {
 
         vm.chainId(CHAIN_18);
         gate18.refund(
-            address(tst18), did, 4_200_000, CHAIN_6, 0, receiver, "", "", _sign(BridgeHash.getRefundId(id))
+            address(tst18), did, 4_200_000, 6, CHAIN_6, 0, receiver, "", "", _sign(BridgeHash.getRefundId(id))
         );
         assertEq(tst18.balanceOf(user), before, "refund is the full local amount");
     }
@@ -314,11 +314,15 @@ contract DecimalsTest is Test {
         assertEq(local, address(0));
     }
 
-    /// THE FINDING ITSELF. A destination registered one digit off pays a power of
-    /// ten too much on an ORDINARY user's transfer — no attacker input anywhere,
-    /// and the submissionId is byte-identical either way, which is exactly why
-    /// nothing on-chain catches it.
-    function test_AMisregisteredDestinationOverpaysByAPowerOfTen() public {
+    /// THE FINDING ITSELF, NOW CLOSED. A destination registered one digit off
+    /// used to pay a power of ten too much on an ORDINARY user's transfer — no
+    /// attacker input anywhere — because the submissionId was byte-identical
+    /// either way and nothing on-chain could tell the two scales apart.
+    ///
+    /// The scale is in the preimage now, so the same wiring mistake produces two
+    /// ids that never meet. This test walks the whole original attack and asserts
+    /// the money does not move, at both places it is now stopped.
+    function test_AMisregisteredDestinationCannotSettleAtAll() public {
         uint256 badChain = CHAIN_9 + 1;
         address[] memory vals = new address[](1);
         vals[0] = vm.addr(v1pk);
@@ -337,20 +341,77 @@ contract DecimalsTest is Test {
         bytes32 id = _send18(1e18, badChain); // the user sends exactly 1 TST
 
         vm.chainId(badChain);
-        bad.claim(did, 1_000_000, CHAIN_18, 0, receiver, "", "", _sign(id));
 
-        // 1 TST locked, 1,000 TST released. Each gate behaved exactly as
-        // configured — only the two ends DISAGREEING is wrong, and neither can
-        // see the other.
-        assertEq(tstBad.balanceOf(receiverAddr), 1_000e9, "overpaid by 10^3");
+        // 1) The honest keeper's claim. It carries the scale the source signed —
+        //    it must, or the signature would not verify — and the destination
+        //    refuses it rather than converting with its own.
+        vm.expectRevert(abi.encodeWithSelector(Gate.BridgeScaleMismatch.selector, did, BRIDGE_DEC, 3));
+        bad.claim(did, 1_000_000, BRIDGE_DEC, CHAIN_18, 0, receiver, "", "", _sign(id));
 
-        // The discrepancy is visible in one call from each side, which is what
-        // the off-chain refusal is built on.
+        // 2) The same claim restated in the destination's own scale, which is what
+        //    an operator "fixing" the mismatch by hand would try. Now the id is a
+        //    different hash, so the validator signature is over some other
+        //    transfer and the threshold simply does not verify. There is no third
+        //    combination: the scale that matches the signatures is rejected by the
+        //    registry, and the scale the registry accepts has no signatures.
+        vm.expectRevert(abi.encodeWithSelector(Gate.NotEnoughSignatures.selector, 0, 1));
+        bad.claim(did, 1_000_000, 3, CHAIN_18, 0, receiver, "", "", _sign(id));
+
+        assertEq(tstBad.balanceOf(receiverAddr), 0, "not one unit moved");
+        assertFalse(bad.executed(id), "and the transfer is still live to cancel + refund");
+
+        // The mismatch is still visible in one call from each side, which is what
+        // the off-chain refusal is built on — it just is no longer the only thing
+        // standing between a typo and a drain.
         (, uint8 srcBd,,) = gate6.bridgeDecimalsFor(did); // a correctly wired peer
         (, uint8 dstBd,,) = bad.bridgeDecimalsFor(did);
         assertEq(srcBd, BRIDGE_DEC);
         assertEq(dstBd, 3);
         assertTrue(srcBd != dstBd, "a validator comparing these refuses to sign");
+    }
+
+    /// The mirror image: the SOURCE is the gate with the typo. The scale it
+    /// hashes is its own, so its transfers are unclaimable on a correctly wired
+    /// destination too — the failure is symmetric, which is what "loud" means
+    /// here. Left stranded rather than paid at the wrong rate, and a stranded
+    /// transfer has the cancel -> refund path.
+    function test_AMisregisteredSourceCannotSettleEither() public {
+        uint256 badChain = CHAIN_9 + 1;
+        address[] memory vals = new address[](1);
+        vals[0] = vm.addr(v1pk);
+
+        vm.chainId(badChain);
+        Gate bad = deployTestGate(vals, 1);
+        DecToken tstBad = new DecToken("TST", 9);
+        bad.setBridgeDecimals(address(tstBad), 3); // the typo, on the SOURCE now
+        bad.setSupportedChain(CHAIN_9 + 2, true);
+        bad.seal();
+        tstBad.mint(user, 10e9);
+
+        vm.startPrank(user);
+        tstBad.approve(address(bad), type(uint256).max);
+        bytes32 id = bad.send(address(tstBad), 1e9, CHAIN_9 + 2, receiver, "");
+        vm.stopPrank();
+
+        bytes32 did = BridgeHash.getDebridgeId(badChain, address(tstBad));
+
+        // A correctly wired destination for that asset: the mesh scale, 6.
+        uint256 dstChain = CHAIN_9 + 2;
+        vm.chainId(dstChain);
+        Gate good = deployTestGate(vals, 1);
+        DecToken tstGood = new DecToken("TST", 9);
+        good.setBridgeDecimals(address(tstGood), BRIDGE_DEC);
+        good.setLocalToken(did, address(tstGood));
+        good.seal();
+        tstGood.mint(address(good), 1_000_000e9);
+
+        // 1 TST left the source, so the wire amount is 1000 — at scale 3. Read at
+        // the mesh's scale of 6 that is 0.001 TST: the destination would have
+        // paid a thousandth of the transfer and stranded the rest for ever. It
+        // refuses instead.
+        vm.expectRevert(abi.encodeWithSelector(Gate.BridgeScaleMismatch.selector, did, 3, BRIDGE_DEC));
+        good.claim(did, 1000, 3, badChain, 0, receiver, "", "", _sign(id));
+        assertEq(tstGood.balanceOf(receiverAddr), 0);
     }
 
 }
@@ -446,13 +507,13 @@ contract DecimalsRouterTest is Test {
         bytes32 did = BridgeHash.getDebridgeId(CHAIN_A, address(usdA));
         bytes memory recv = abi.encodePacked(address(routerB));
         bytes memory sender = abi.encodePacked(address(routerA));
-        assertEq(id, gateA.computeSubmissionId(did, wire, CHAIN_A, CHAIN_B, 0, recv, autoParams, sender));
+        assertEq(id, gateA.computeSubmissionId(did, wire, 6, CHAIN_A, CHAIN_B, 0, recv, autoParams, sender));
 
         vm.chainId(CHAIN_B);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(v1pk, MessageHashUtils.toEthSignedMessageHash(id));
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = abi.encodePacked(r, s, v);
-        routerB.claimAndFinalize(did, wire, CHAIN_A, 0, recv, autoParams, sender, sigs);
+        routerB.claimAndFinalize(did, wire, 6, CHAIN_A, 0, recv, autoParams, sender, sigs);
 
         // `wire` USDb (6 decimals) swapped at TT = 2.0 → wire * 1e12 / 2 TT units
         assertEq(tt.balanceOf(finalReceiver), poolB.quote(address(usdB), address(tt), wire));
@@ -556,7 +617,7 @@ contract DecimalsRouterScaledTest is Test {
                 data: abi.encode(address(tt), finalReceiver, uint256(0))
             })
         );
-        assertEq(l.id, gateA.computeSubmissionId(l.did, l.wire, CHAIN_A, CHAIN_B, 0, l.recv, l.autoParams, l.sender));
+        assertEq(l.id, gateA.computeSubmissionId(l.did, l.wire, 6, CHAIN_A, CHAIN_B, 0, l.recv, l.autoParams, l.sender));
         vm.chainId(CHAIN_B);
     }
 
@@ -568,12 +629,12 @@ contract DecimalsRouterScaledTest is Test {
 
     function _finalize(address who, Leg memory l) internal {
         vm.prank(who);
-        routerB.finalize(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender);
+        routerB.finalize(l.did, l.wire, 6, CHAIN_A, 0, l.recv, l.autoParams, l.sender);
     }
 
     function test_Destination_SwapsTheLocalAmountTheClaimReleased() public {
         Leg memory l = _send();
-        routerB.claimAndFinalize(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
+        routerB.claimAndFinalize(l.did, l.wire, 6, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
 
         // 3180e18 USDb at TT = 2.0 -> 1590 TT. Swapping the wire amount instead
         // (3180e6 units) would pay 1590e6 TT units — a trillionth.
@@ -583,7 +644,7 @@ contract DecimalsRouterScaledTest is Test {
 
     function test_Destination_DeferredDebtAndFallbackAreInLocalUnits() public {
         Leg memory l = _send();
-        gateB.claim(l.did, l.wire, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
+        gateB.claim(l.did, l.wire, 6, CHAIN_A, 0, l.recv, l.autoParams, l.sender, _sigs(l.id));
         poolB.pause();
 
         _finalize(address(0xBAD), l);

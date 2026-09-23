@@ -119,7 +119,8 @@ echo "  src: token=$TOKEN_SRC gate=$GATE_SRC"
 echo "  dst: gate=$GATE_DST  (UNFUNDED, UNREGISTERED — every claim reverts)"
 # Bridge decimals on the SOURCE only (send needs it); identity, TestToken is 18-dec.
 # The destination stays deliberately unregistered, as above.
-set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+BRIDGE_DEC=18
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" "$BRIDGE_DEC"
 
 # M-1: `claim` reverts on an unsealed gate. Sealing BOTH gates here is not
 # cosmetic: the destination is deliberately left with no `setLocalToken`, and an
@@ -249,9 +250,9 @@ cast send "$GATE_SRC" "send(address,uint256,uint256,bytes,bytes)" \
   "$TOKEN_SRC" $AMOUNT $DST_CHAIN "$RECEIVER" "0x" \
   --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 
-SUB=$(cast call "$GATE_SRC" "computeSubmissionId(bytes32,uint256,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
+SUB=$(cast call "$GATE_SRC" "computeSubmissionId(bytes32,uint256,uint8,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
   "$(cast keccak "$(cast abi-encode --packed "f(uint256,address)" $SRC_CHAIN "$TOKEN_SRC")")" \
-  "$AMOUNT" "$SRC_CHAIN" "$DST_CHAIN" 0 \
+  "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$DST_CHAIN" 0 \
   "$(cast abi-encode --packed "f(address)" "$RECEIVER")" "0x" "0x" --rpc-url $SRC_RPC)
 echo "  submissionId=$SUB"
 echo "  sender debited: $BAL_BEFORE -> $(bal "$TOKEN_SRC" $ACC0 $SRC_RPC)"
@@ -283,9 +284,10 @@ echo "        ok (destination executed=$(cast call "$GATE_DST" "executed(bytes32
 
 echo "  [3/4] a claim can never land now (double-spend guard) ..."
 CLAIM_SIG=$(cast wallet sign --private-key $V1K "$SUB")
-if cast send "$GATE_DST" "claim(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+if cast send "$GATE_DST" "claim(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
      "$(cast keccak "$(cast abi-encode --packed "f(uint256,address)" $SRC_CHAIN "$TOKEN_SRC")")" \
-     "$AMOUNT" "$SRC_CHAIN" 0 "$(cast abi-encode --packed "f(address)" "$RECEIVER")" "0x" "0x" "[$CLAIM_SIG]" \
+     "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" 0 "$(cast abi-encode --packed "f(address)" "$RECEIVER")" "0x" "0x" \
+     "[$CLAIM_SIG]" \
      --rpc-url $DST_RPC --private-key $KEY0 >/dev/null 2>&1; then
   fail "claim() succeeded AFTER cancel — double-spend!"
 fi

@@ -55,7 +55,7 @@ contract Sandwicher {
         IERC20(stable).approve(address(pool), cost);
         pool.swap(stable, tokenOut, cost, 0, address(this));
 
-        router.finalize(a.debridgeId, a.amount, a.chainIdFrom, a.nonce, a.receiver, a.autoParams, a.nativeSender);
+        router.finalize(a.debridgeId, a.amount, 6, a.chainIdFrom, a.nonce, a.receiver, a.autoParams, a.nativeSender);
 
         uint256 got = IERC20(tokenOut).balanceOf(address(this));
         IERC20(tokenOut).approve(address(pool), got);
@@ -197,7 +197,7 @@ contract SwapRouterTest is Test {
 
         // the id the router returned must equal the canonical id we rebuild
         bytes32 rebuilt = gateA.computeSubmissionId(
-            leg.debridgeId, leg.amount, CHAIN_A, CHAIN_B, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, CHAIN_B, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(leg.id, rebuilt, "source id mismatch");
     }
@@ -219,7 +219,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         bytes[] memory sigs = _sign(v1pk, leg.id);
         bytes32 got = routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
 
         assertEq(got, leg.id, "finalized id mismatch");
@@ -244,7 +244,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         bytes32 cancelId = BridgeHash.getCancelId(leg.id);
         gateB.cancel(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams,
             leg.nativeSender, _sign(v1pk, cancelId)
         );
         assertTrue(gateB.executed(leg.id), "cancel did not burn the transfer");
@@ -255,7 +255,7 @@ contract SwapRouterTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(SwapRouter.NotDelivered.selector, leg.id));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
 
         assertEq(tt.balanceOf(finalReceiver), 0, "receiver paid for a cancelled transfer");
@@ -272,14 +272,14 @@ contract SwapRouterTest is Test {
         bytes[] memory sigs = _sign(v1pk, leg.id);
         // a keeper claims into the router (stable released to routerB)
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
         assertEq(usdB.balanceOf(address(routerB)), leg.amount, "stable not delivered to router");
 
         // a permissionless finalize completes the swap
         vm.prank(address(0xDEAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(tt.balanceOf(finalReceiver), 1590e18, "final swap did not run");
         assertEq(usdB.balanceOf(address(routerB)), 0, "stable not fully consumed");
@@ -294,7 +294,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         vm.expectRevert(abi.encodeWithSelector(SwapRouter.NotDelivered.selector, leg.id));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
     }
 
@@ -307,12 +307,12 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         bytes[] memory sigs = _sign(v1pk, leg.id);
         routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
 
         vm.expectRevert(abi.encodeWithSelector(SwapRouter.AlreadyFinalized.selector, leg.id));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
     }
 
@@ -331,7 +331,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         bytes[] memory sigs = _sign(v1pk, leg.id);
         routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
 
         // Deferred, not settled: the stable is still at the router and the transfer
@@ -345,7 +345,7 @@ contract SwapRouterTest is Test {
         // The receiver, not a keeper, decides to take the stable (M-7).
         vm.prank(finalReceiver);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
 
         // The window proved the condition durable: no TT paid, stable refunded.
@@ -368,14 +368,14 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
         // The attacker's finalize achieves nothing.
         vm.prank(address(0xBAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertFalse(routerB.finalized(leg.id), "attacker must not settle the transfer");
         assertEq(usdB.balanceOf(finalReceiver), 0, "attacker must not force the stable out");
@@ -384,7 +384,7 @@ contract SwapRouterTest is Test {
         // they actually asked for.
         _seed(poolB, tt, 1_000_000e18);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertGt(tt.balanceOf(finalReceiver), 0, "the real swap must complete once possible");
         assertEq(usdB.balanceOf(finalReceiver), 0, "no stable downgrade");
@@ -398,20 +398,20 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
         poolB.pause();
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertFalse(routerB.finalized(leg.id), "a pause must not settle anything");
         assertEq(usdB.balanceOf(finalReceiver), 0, "a pause must not force the stable out");
 
         poolB.unpause();
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertGt(tt.balanceOf(finalReceiver), 0, "the swap must complete after the incident");
         assertTrue(routerB.finalized(leg.id));
@@ -424,12 +424,12 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 1_000_000e18);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertFalse(routerB.finalized(leg.id), "must not settle under the signed floor");
         assertEq(usdB.balanceOf(finalReceiver), 0, "must not downgrade under the signed floor");
@@ -440,7 +440,7 @@ contract SwapRouterTest is Test {
         vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
         vm.prank(finalReceiver);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(usdB.balanceOf(finalReceiver), leg.amount, "funds must never strand");
         assertTrue(routerB.finalized(leg.id));
@@ -455,7 +455,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         bytes[] memory sigs = _sign(v1pk, leg.id);
         routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
         );
         assertEq(usdB.balanceOf(finalReceiver), leg.amount, "stable intent not delivered");
     }
@@ -501,7 +501,7 @@ contract SwapRouterTest is Test {
         // Deliver the stable to routerB on chain B, exactly as a keeper would.
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
@@ -517,7 +517,7 @@ contract SwapRouterTest is Test {
         vm.prank(address(0xBAD));
         vm.expectPartialRevert(SwapRouter.InsufficientGas.selector);
         routerB.finalize{gas: 200_000}(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
         );
 
@@ -530,7 +530,7 @@ contract SwapRouterTest is Test {
         // With adequate gas the honest path runs and the user gets their TOKEN.
         uint256 expectedTt = poolB.quote(address(usdB), address(tt), leg.amount);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertTrue(routerB.finalized(leg.id), "honest finalize must complete");
@@ -548,7 +548,7 @@ contract SwapRouterTest is Test {
 
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
@@ -556,7 +556,7 @@ contract SwapRouterTest is Test {
 
         // A delisting can be reversed, so the first attempt only starts the clock.
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertFalse(routerB.finalized(leg.id), "must not settle inside the window");
@@ -564,7 +564,7 @@ contract SwapRouterTest is Test {
         vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
         vm.prank(finalReceiver);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(
@@ -592,13 +592,13 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         // Defer it: the stable is now held on the user's behalf.
         vm.prank(address(0xDEAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(routerB.owedStable(), leg.amount, "owed not tracked");
 
@@ -629,7 +629,7 @@ contract SwapRouterTest is Test {
         poolB.setPrice(address(tt), TT_PRICE);
         vm.prank(address(0xDEAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertGt(tt.balanceOf(finalReceiver), 0, "delivery must still complete");
         assertEq(usdB.balanceOf(finalReceiver), 0, "no stable downgrade");
@@ -645,7 +645,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         assertEq(routerB.owedStable(), 0, "an unobserved claim is invisible to owedStable");
@@ -666,7 +666,7 @@ contract SwapRouterTest is Test {
         vm.warp(block.timestamp + 1 hours);
         vm.prank(address(0xDEAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(tt.balanceOf(finalReceiver), 1590e18, "user must be paid in TT");
 
@@ -718,7 +718,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         assertEq(routerB.owedStable(), 0, "invisible to owedStable");
@@ -737,7 +737,7 @@ contract SwapRouterTest is Test {
         poolB.setPrice(address(tt), TT_PRICE);
         vm.prank(address(0xDEAD));
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(tt.balanceOf(finalReceiver), 1590e18, "user still paid in TT");
     }
@@ -818,7 +818,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         assertEq(routerB.owedStable(), 0, "a straight-through delivery owes nothing");
@@ -835,14 +835,14 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         routerB.claimAndFinalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         assertEq(routerB.owedStable(), leg.amount, "deferred delivery must be owed");
 
         vm.warp(block.timestamp + routerB.FALLBACK_GRACE());
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(routerB.owedStable(), 0, "fallback must clear the debt");
@@ -868,7 +868,7 @@ contract SwapRouterTest is Test {
     function _finalizeAs(address who, Leg memory leg) internal {
         vm.prank(who);
         routerB.finalize(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
     }
 
@@ -879,7 +879,7 @@ contract SwapRouterTest is Test {
         leg = _sourceLeg(1e18, address(tt), 0); // wants 1590 TT
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
     }
@@ -961,7 +961,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         poolB.pause();
@@ -985,7 +985,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
@@ -1025,7 +1025,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
         Sandwicher atk = new Sandwicher();
@@ -1055,7 +1055,7 @@ contract SwapRouterTest is Test {
         vm.prank(address(0xBAD));
         vm.expectPartialRevert(SwapRouter.InsufficientGas.selector);
         routerB.finalize{gas: 150_000}(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
         );
         assertEq(routerB.deferredSince(leg.id), 0, "a starved call must not start the clock");
         assertEq(routerB.owedStable(), 0);
@@ -1075,7 +1075,7 @@ contract SwapRouterTest is Test {
         Leg memory leg = _sourceLeg(1e18, address(tt), 0);
         vm.chainId(CHAIN_B);
         gateB.claim(
-            leg.debridgeId, leg.amount, CHAIN_A, leg.nonce,
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
             leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
         );
 
@@ -1086,7 +1086,7 @@ contract SwapRouterTest is Test {
             (bool ok,) = address(routerB).call{gas: gas_}(
                 abi.encodeCall(
                     SwapRouter.finalize,
-                    (leg.debridgeId, leg.amount, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender)
+                    (leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender)
                 )
             );
             if (ok) {
@@ -1111,7 +1111,7 @@ contract SwapRouterTest is Test {
             (bool ok,) = address(routerB).call{gas: gas_}(
                 abi.encodeCall(
                     SwapRouter.finalize,
-                    (blocked.debridgeId, blocked.amount, CHAIN_A, blocked.nonce, blocked.receiver, blocked.autoParams, blocked.nativeSender)
+                    (blocked.debridgeId, blocked.amount, 6, CHAIN_A, blocked.nonce, blocked.receiver, blocked.autoParams, blocked.nativeSender)
                 )
             );
             bool deferred = routerB.deferredSince(blocked.id) != 0;

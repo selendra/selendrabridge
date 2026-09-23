@@ -5,6 +5,7 @@
 // `cast sig` and are asserted by the contract ABIs.
 
 import { b58decode } from "./solana";
+import { bytesToHex, keccak256 } from "./keccak";
 
 /** An EIP-1193 `request` function (from the connected wallet). */
 export type Eip1193Request = (args: { method: string; params?: unknown[] }) => Promise<unknown>;
@@ -23,7 +24,7 @@ const SEL = {
   swap: "d5bcb9b5", // swap(address,address,uint256,uint256,address)
   send: "565443e9", // send(address,uint256,uint256,bytes,bytes)
   swapAndBridge: "07c1462d", // swapAndBridge(address,uint256,uint256,uint256,address,address,uint256)
-  finalize: "c2c1fffb", // finalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes)
+  finalize: "705f6b62", // finalize(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes)
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
   gate: "7a0ebc88", // gate() — SwapRouter's immutable Gate
   bridgeUnit: "4e3ff796", // bridgeUnit(address) — Gate
@@ -212,17 +213,19 @@ export function encodeSwapIntent(finalToken: string, finalReceiver: string, fina
 export function encodeFinalize(
   debridgeId: string,
   amount: bigint,
+  bridgeDecimals: number,
   chainIdFrom: bigint,
   nonce: bigint,
   receiverHex: string,
   autoParamsHex: string,
   nativeSenderHex: string
 ): string {
-  // head: debridgeId, amount, chainIdFrom, nonce, off(receiver), off(autoParams), off(nativeSender) => 7 words.
+  // head: debridgeId, amount, bridgeDecimals, chainIdFrom, nonce, off(receiver),
+  // off(autoParams), off(nativeSender) => 8 words.
   const recvTail = encBytesTail(receiverHex);
   const autoTail = encBytesTail(autoParamsHex);
   const nsTail = encBytesTail(nativeSenderHex);
-  const offReceiver = BigInt(7 * 32);
+  const offReceiver = BigInt(8 * 32);
   const offAuto = offReceiver + BigInt(recvTail.length / 2);
   const offNs = offAuto + BigInt(autoTail.length / 2);
   return (
@@ -230,6 +233,7 @@ export function encodeFinalize(
     SEL.finalize +
     encBytes32(debridgeId) +
     encUint(amount) +
+    encUint(BigInt(bridgeDecimals)) +
     encUint(chainIdFrom) +
     encUint(nonce) +
     encUint(offReceiver) +
@@ -517,6 +521,8 @@ export function sendFinalize(
   router: string,
   debridgeId: string,
   amount: bigint,
+  /** The wire scale from the source `Sent` — part of the submissionId (H-2). */
+  bridgeDecimals: number,
   chainIdFrom: number,
   nonce: number,
   receiverHex: string,
@@ -530,7 +536,16 @@ export function sendFinalize(
     req,
     from,
     router,
-    encodeFinalize(debridgeId, amount, BigInt(chainIdFrom), BigInt(nonce), receiverHex, autoParamsHex, nativeSenderHex),
+    encodeFinalize(
+      debridgeId,
+      amount,
+      bridgeDecimals,
+      BigInt(chainIdFrom),
+      BigInt(nonce),
+      receiverHex,
+      autoParamsHex,
+      nativeSenderHex
+    ),
     executeOnChainId
   );
 }
@@ -565,13 +580,18 @@ export async function waitReceipt(req: Eip1193Request, hash: string, timeoutMs =
 }
 
 /**
- * topic0 of the Gate's `Sent` event:
- *   keccak256("Sent(bytes32,bytes32,uint256,uint256,uint256,bytes,uint256,bytes,bytes,address)")
- * Hardcoded because the frontend carries no keccak implementation. If the `Sent`
- * signature ever changes, recompute with:
- *   cast keccak "Sent(bytes32,bytes32,uint256,uint256,uint256,bytes,uint256,bytes,bytes,address)"
+ * topic0 of the Gate's `Sent` event.
+ *
+ * DERIVED, not hardcoded. It used to be a literal with a "recompute this if the
+ * signature changes" comment, from back when this file had no keccak — but the
+ * app grew one for the submissionId, and H-2 then added `bridgeDecimals` to the
+ * event. A stale literal does not fail loudly: `extractSent` simply finds no log
+ * and the user is told their transfer has no Sent event, with the real cause one
+ * hash comparison away. Computing it from the signature cannot go stale.
  */
-const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+export const SENT_SIGNATURE =
+  "Sent(bytes32,bytes32,uint256,uint8,uint256,uint256,bytes,uint256,bytes,bytes,address)";
+const SENT_TOPIC0 = bytesToHex(keccak256(new TextEncoder().encode(SENT_SIGNATURE)));
 
 /**
  * Pull `{submissionId, debridgeId, amount, nonce}` out of the `Sent` event the
@@ -586,7 +606,13 @@ const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898
 export function extractSent(
   logs: RawLog[],
   gate: string
-): { submissionId: string; debridgeId: string; amount: bigint; nonce: bigint } | null {
+): {
+  submissionId: string;
+  debridgeId: string;
+  amount: bigint;
+  bridgeDecimals: number;
+  nonce: bigint;
+} | null {
   const g = gate.toLowerCase();
   const log = logs.find(
     (l) => l.address?.toLowerCase() === g && l.topics[0]?.toLowerCase() === SENT_TOPIC0
@@ -594,11 +620,17 @@ export function extractSent(
   if (!log || log.topics.length < 3) return null;
   const data = strip0x(log.data);
   const wordAt = (i: number) => data.slice(i * 64, i * 64 + 64);
+  // Non-indexed words, in order: amount(0), bridgeDecimals(1), chainIdFrom(2),
+  // chainIdTo(3), off(receiver)(4), nonce(5), off(autoParams)(6),
+  // off(nativeSender)(7), token(8). `bridgeDecimals` is a uint8 but a non-indexed
+  // event field is abi.encode'd, so it occupies a full right-aligned word — it is
+  // only in the submissionId PREIMAGE that it is one raw byte.
   return {
     submissionId: log.topics[1],
     debridgeId: log.topics[2],
     amount: hexToBigInt("0x" + wordAt(0)),
-    nonce: hexToBigInt("0x" + wordAt(4)),
+    bridgeDecimals: Number(hexToBigInt("0x" + wordAt(1))),
+    nonce: hexToBigInt("0x" + wordAt(5)),
   };
 }
 

@@ -5,28 +5,38 @@
 //! Every transfer travels in a per-asset "bridge decimals" scale. `Gate.send`
 //! divides the locked local amount by the SOURCE gate's registered scale, and
 //! `Gate.claim` multiplies the wire amount by the DESTINATION gate's own
-//! registered scale. The submissionId commits to `debridgeId` and the amount —
-//! but NOT to the scale (`contracts/src/BridgeHash.sol`).
+//! registered scale. Two gates that disagree by one digit therefore pay a power
+//! of ten too much or too little on every claim of that asset. No attacker input
+//! is needed: an ordinary user's 1 TST becomes 1,000 TST for whoever receives
+//! it, and each gate is behaving exactly as configured.
 //!
-//! So two gates that disagree by one digit pay a power of ten too much or too
-//! little on every claim of that asset. No attacker input is needed: an ordinary
-//! user's 1 TST becomes 1,000 TST for whoever receives it, and the gate is
-//! behaving exactly as configured. Both registrations are write-once, so it
-//! cannot be corrected in place — only a new gate or a UUPS upgrade fixes it.
+//! ## What changed when the scale went into the submissionId
 //!
-//! ## Why the check has to be HERE
+//! The design half of H-2 landed: the preimage carries the scale now, and
+//! `Gate.claim` refuses a wire scale that is not its own registration. So the
+//! drain this module was written to prevent is closed on-chain, in both
+//! directions, without any validator's cooperation.
+//!
+//! This check is no longer the only thing standing in the way — but it is still
+//! worth running, and it moved UP the stack rather than out of it. A mis-scaled
+//! corridor now cannot settle at all: every transfer into it strands and has to
+//! be walked back through cancel -> refund. Refusing to sign turns that into one
+//! loud log line per corridor, at the first transfer, instead of a queue of
+//! stuck users. It is an operational guard now, not the last line of defence.
+//!
+//! ## Why it still belongs HERE and not in the keeper
 //!
 //! `Gate.claim` is permissionless: anyone holding a validator quorum can submit
 //! it. A check in the keeper would therefore stop only the honest submitter. The
-//! signature is the last thing that can be withheld, so the validators are the
-//! only component that can actually prevent the payout — which is why this runs
-//! before signing, and why it fails CLOSED.
+//! signature is the last thing that can be withheld.
 //!
 //! ## What it reads
 //!
-//! * source scale — `bridgeDecimalsOf(token)` on the source gate, keyed on the
-//!   `token` the `Sent` event carries. NOT `bridgeDecimalsFor(debridgeId)`: a
-//!   gate never maps its own outgoing id, so that would answer "unregistered".
+//! * source scale — NOT read at all any more. It is a field of the `Sent` event,
+//!   and since it is inside the submissionId it is the exact value this
+//!   validator is about to sign over; reading the source gate's registration
+//!   would only re-derive what the gate already put in the hash, at the cost of
+//!   an RPC round-trip per corridor.
 //! * EVM destination scale — `bridgeDecimalsFor(debridgeId)`, which resolves
 //!   `tokenOf` and the token's decimals in one atomic call. A gate deployed
 //!   before that function existed reverts on it, so the read FALLS BACK to the
@@ -93,7 +103,6 @@ pub struct ScaleGuard {
     /// `(chain_id_to, debridge_id) -> bridge decimals`, successful reads only.
     dest_cache: Mutex<HashMap<(u64, B256), u8>>,
     /// `token -> bridge decimals` on this scanner's own source gate.
-    source_cache: Mutex<HashMap<Address, u8>>,
     /// Chains we have already warned about, so an unconfigured peer does not
     /// print once per transfer.
     warned: Mutex<HashSet<u64>>,
@@ -118,7 +127,6 @@ impl ScaleGuard {
         ScaleGuard {
             peers,
             dest_cache: Mutex::new(HashMap::new()),
-            source_cache: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -145,11 +153,12 @@ impl ScaleGuard {
     /// single 429 on one validator could leave a legitimate transfer short of
     /// quorum forever; replaying live mesh8 traffic hit exactly that. `Unknown`
     /// is reserved for DEFINITIVE answers the chain itself gave.
+    /// `source` is the `bridgeDecimals` the `Sent` event carries — the scale the
+    /// submissionId commits to, and so the scale any claim of this transfer must
+    /// present to the destination gate.
     pub async fn verdict(
         &self,
-        source_provider: &DynProvider,
-        source_gate: Address,
-        token: Address,
+        source: u8,
         chain_id_to: u64,
         debridge_id: B256,
     ) -> anyhow::Result<Verdict> {
@@ -163,11 +172,6 @@ impl ScaleGuard {
                 );
             }
             return Ok(Verdict::Unknown("destination chain not configured on this validator"));
-        };
-
-        let source = match self.source_scale(source_provider, source_gate, token).await? {
-            Some(d) => d,
-            None => return Ok(Verdict::Unknown("source gate did not report bridge decimals")),
         };
 
         let key = (chain_id_to, debridge_id);
@@ -196,34 +200,6 @@ impl ScaleGuard {
         } else {
             Verdict::Mismatch { source, destination }
         })
-    }
-
-    async fn source_scale(
-        &self,
-        provider: &DynProvider,
-        gate: Address,
-        token: Address,
-    ) -> anyhow::Result<Option<u8>> {
-        if let Some(d) = self.source_cache.lock().await.get(&token) {
-            return Ok(Some(*d));
-        }
-        let out = match Gate::new(gate, provider).bridgeDecimalsOf(token).call().await {
-            Ok(v) => v,
-            Err(e) if is_definitive(&e) => {
-                warn!(%gate, %token, error = %e, "source gate does not answer bridgeDecimalsOf");
-                return Ok(None);
-            }
-            Err(e) => return Err(anyhow::anyhow!("reading source bridgeDecimalsOf on {gate}: {e}")),
-        };
-        // `set == false` on the source cannot happen for a token `send` accepted
-        // (it converts through the same registration), so treat it as a lying or
-        // wrong-address read rather than a corridor fact.
-        if !out.set {
-            warn!(%gate, %token, "source gate reports no bridge decimals for a token it just locked");
-            return Ok(None);
-        }
-        self.source_cache.lock().await.insert(token, out.bridgeDecimals);
-        Ok(Some(out.bridgeDecimals))
     }
 
     async fn evm_destination_scale(
@@ -449,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn an_unconfigured_destination_is_unknown_not_agree() {
         let v = guard()
-            .verdict(&dead_provider(), Address::repeat_byte(1), Address::repeat_byte(2), 1338, B256::repeat_byte(3))
+            .verdict(6, 1338, B256::repeat_byte(3))
             .await
             .expect("an unconfigured peer is a definitive answer, not a transport fault");
         assert!(matches!(v, Verdict::Unknown(_)), "got {v:?}");
@@ -461,16 +437,16 @@ mod tests {
     async fn the_unconfigured_warning_is_once_per_chain() {
         let g = guard();
         assert!(g.warned.lock().await.is_empty());
-        let p = dead_provider();
         for _ in 0..3 {
-            let _ = g.verdict(&p, Address::repeat_byte(1), Address::repeat_byte(2), 1338, B256::ZERO).await;
+            let _ = g.verdict(6, 1338, B256::ZERO).await;
         }
         assert_eq!(g.warned.lock().await.len(), 1);
     }
 
     /// A read that fails IN TRANSIT must surface as `Err` — retried with the
     /// cursor rolled back — never as `Unknown`, which withholds and moves on for
-    /// good. Here the source RPC refuses the connection outright.
+    /// good. Here the DESTINATION RPC refuses the connection outright. (The
+    /// source is no longer read at all: its scale rides in the signed event.)
     #[tokio::test]
     async fn a_transport_failure_is_retryable_not_a_withhold() {
         let g = ScaleGuard::new(
@@ -478,7 +454,7 @@ mod tests {
             vec![],
         );
         let r = g
-            .verdict(&dead_provider(), Address::repeat_byte(1), Address::repeat_byte(2), 1338, B256::ZERO)
+            .verdict(6, 1338, B256::ZERO)
             .await;
         assert!(r.is_err(), "a refused connection is not a verdict, got {r:?}");
     }
@@ -501,7 +477,7 @@ mod tests {
             vec![SolanaDestination { chain_id: 7565164, program_id: [9; 32], rpc: "http://127.0.0.1:1".into() }],
         );
         let _ = g
-            .verdict(&dead_provider(), Address::repeat_byte(1), Address::repeat_byte(2), 7565164, B256::ZERO)
+            .verdict(6, 7565164, B256::ZERO)
             .await;
         assert!(
             g.warned.lock().await.is_empty(),

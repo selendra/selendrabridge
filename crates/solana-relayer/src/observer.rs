@@ -292,6 +292,7 @@ mod tests {
             bridge_domain: format!("0x{}", "22".repeat(32)),
             debridge_id: format!("0x{}", "33".repeat(32)),
             amount: "1".into(),
+            bridge_decimals: Some(6),
             chain_id_from: from,
             chain_id_to: to,
             nonce: 0,

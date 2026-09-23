@@ -16,6 +16,9 @@ use bridge_solana::SOLANA_CHAIN_ID;
 
 const EVM_CHAIN_ID: u64 = 1337;
 const AMOUNT: u64 = 1000;
+/// The asset's wire scale — part of the submissionId since H-2, and what the
+/// destination gate's own registration must equal for the claim to settle.
+const BRIDGE_DECIMALS: u8 = 6;
 /// Deployment generation for the localnet mesh. This same value initializes the
 /// gate below AND goes into the submissionId, so the two cannot drift. A real
 /// deployment must use a fresh value per generation, or a superseded
@@ -53,6 +56,7 @@ async fn main() {
     let id = hash::submission_id(
         &LOCALNET_BRIDGE_DOMAIN,
         &debridge_id,
+        BRIDGE_DECIMALS,
         &amount_word(AMOUNT as u128),
         EVM_CHAIN_ID,
         SOLANA_CHAIN_ID,
@@ -84,6 +88,7 @@ async fn main() {
     let claim_ix = GateInstruction::Claim(ClaimArgs {
         debridge_id,
         amount: AMOUNT,
+        bridge_decimals: BRIDGE_DECIMALS,
         chain_id_from: EVM_CHAIN_ID,
         nonce,
         receiver: receiver.clone(),

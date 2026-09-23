@@ -57,6 +57,18 @@ pub struct SubmissionRecord {
     pub debridge_id: String,
     /// decimal string (uint256)
     pub amount: String,
+    /// H-2: the wire scale `amount` is denominated in, from the source `Sent`
+    /// event. Part of the submissionId preimage, so [`canonical_submission_id`]
+    /// cannot reproduce the id without it.
+    ///
+    /// `Option`, and `None` is a HARD FAILURE rather than a default, for the same
+    /// reason `bridge_domain` deserializes to an unparseable empty string: a
+    /// record written before the scale existed belongs to a generation whose ids
+    /// were computed from a different preimage. Defaulting it to 0 — a perfectly
+    /// valid scale — would silently recompute those records under a scale nobody
+    /// ever signed. Failing the id-binding check is the honest outcome.
+    #[serde(default)]
+    pub bridge_decimals: Option<u8>,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub nonce: u64,
@@ -114,6 +126,7 @@ impl SubmissionRecord {
             bridge_domain: format!("{bridge_domain:#x}"),
             debridge_id: format!("{:#x}", ev.debridgeId),
             amount: ev.amount.to_string(),
+            bridge_decimals: Some(ev.bridgeDecimals),
             chain_id_from,
             chain_id_to,
             nonce,
@@ -302,6 +315,7 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
         B256::from_str(&rec.bridge_domain).map_err(|_| StoreError::BadField("bridge_domain"))?;
     let debridge_id = B256::from_str(&rec.debridge_id).map_err(|_| StoreError::BadField("debridge_id"))?;
     let amount = U256::from_str(&rec.amount).map_err(|_| StoreError::BadField("amount"))?;
+    let bridge_decimals = rec.bridge_decimals.ok_or(StoreError::BadField("bridge_decimals"))?;
     let receiver = hex_bytes("receiver", &rec.receiver)?;
     let auto_params = hex_bytes("auto_params", &rec.auto_params)?;
     let native_sender = hex_bytes("native_sender", &rec.native_sender)?;
@@ -312,12 +326,20 @@ pub fn canonical_submission_id(rec: &SubmissionRecord) -> Result<alloy_primitive
     let auto = crate::decode_auto_params(&auto_params, &native_sender)
         .map_err(|_| StoreError::BadField("auto_params"))?;
     let id = match auto {
-        None => {
-            crate::submission_id(bridge_domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver)
-        }
+        None => crate::submission_id(
+            bridge_domain,
+            debridge_id,
+            bridge_decimals,
+            amount,
+            chain_from,
+            chain_to,
+            nonce,
+            &receiver,
+        ),
         Some(auto) => crate::submission_id_with_auto(
             bridge_domain,
             debridge_id,
+            bridge_decimals,
             amount,
             chain_from,
             chain_to,
@@ -599,6 +621,9 @@ mod tests {
     use crate::signer::encode_signature as encode_sig;
     use std::str::FromStr;
 
+    /// The wire scale `make_record` pretends the mesh registered for it.
+    const BRIDGE_DECIMALS: u8 = 6;
+
     /// The ERC-20 `make_record` pretends was locked on chain 1337.
     fn token() -> Address {
         Address::repeat_byte(0x11)
@@ -613,13 +638,22 @@ mod tests {
         let nonce = U256::from(0u64);
         let receiver = Address::repeat_byte(0xAB).to_vec();
         let domain = B256::repeat_byte(0xD0);
-        let id =
-            crate::submission_id(domain, debridge_id, amount, chain_from, chain_to, nonce, &receiver);
+        let id = crate::submission_id(
+            domain,
+            debridge_id,
+            BRIDGE_DECIMALS,
+            amount,
+            chain_from,
+            chain_to,
+            nonce,
+            &receiver,
+        );
         SubmissionRecord {
             submission_id: format!("{id:#x}"),
             bridge_domain: format!("{domain:#x}"),
             debridge_id: format!("{debridge_id:#x}"),
             amount: amount.to_string(),
+            bridge_decimals: Some(BRIDGE_DECIMALS),
             chain_id_from: 1337,
             chain_id_to: 1338,
             nonce: 0,
@@ -722,6 +756,48 @@ mod tests {
         let err = upsert_signature(&dir, rec.clone(), sign(&v1, &rec.submission_id)).unwrap_err();
         assert!(matches!(err, StoreError::IdMismatch { .. }), "got {err:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// H-2. The wire scale is inside the id, so a record that restates the same
+    /// transfer at a different scale is a different transfer — and the store must
+    /// say so rather than accept it under the real id. Without the scale in the
+    /// preimage both records hash identically and this rewrite is invisible: it
+    /// is exactly how a mis-scaled payout would be laundered through the quorum.
+    #[test]
+    fn rejects_a_record_restated_at_a_different_wire_scale() {
+        let dir = tmp_dir("rescale");
+        let v1 = PrivateKeySigner::random();
+        let rec = make_record();
+        assert_eq!(rec.bridge_decimals, Some(BRIDGE_DECIMALS), "premise");
+
+        let mut rescaled = rec.clone();
+        rescaled.bridge_decimals = Some(BRIDGE_DECIMALS + 3);
+        let err = upsert_signature(&dir, rescaled.clone(), sign(&v1, &rescaled.submission_id))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::IdMismatch { .. }), "got {err:?}");
+
+        // and the unchanged record still binds, so the rejection is about the
+        // scale and not about the fixture being broken.
+        upsert_signature(&dir, rec.clone(), sign(&v1, &rec.submission_id)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record written before the scale existed deserializes to `None`. It must
+    /// fail the binding rather than be recomputed under scale 0 — which is a
+    /// perfectly valid scale, and so would silently resurrect a superseded
+    /// generation's transfer as if it had been signed under this one.
+    #[test]
+    fn a_record_with_no_wire_scale_cannot_bind() {
+        let json = serde_json::to_value(make_record()).unwrap();
+        let mut map = json.as_object().unwrap().clone();
+        map.remove("bridge_decimals");
+        let legacy: SubmissionRecord =
+            serde_json::from_value(serde_json::Value::Object(map)).unwrap();
+        assert_eq!(legacy.bridge_decimals, None, "absent field, not defaulted to 0");
+        assert!(matches!(
+            canonical_submission_id(&legacy),
+            Err(StoreError::BadField("bridge_decimals"))
+        ));
     }
 
     #[test]

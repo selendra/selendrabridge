@@ -187,7 +187,7 @@ contract CorridorGovernanceTest is Test {
         // The honestly-attested id of a 1,000,000-unit transfer of the fake asset.
         uint256 amount = 1_000_000e18;
         bytes memory receiver = abi.encodePacked(attacker);
-        bytes32 id = gate.computeSubmissionId(debridgeId, amount, CHAIN_A, block.chainid, 0, receiver, "", "");
+        bytes32 id = gate.computeSubmissionId(debridgeId, amount, 18, CHAIN_A, block.chainid, 0, receiver, "", "");
         bytes[] memory sigs = _sign(v1pk, id);
 
         // Step 1 of the drain: point the fake corridor at USDC. Refused.
@@ -201,7 +201,7 @@ contract CorridorGovernanceTest is Test {
 
         // Step 2 therefore has no asset to release.
         vm.expectRevert(abi.encodeWithSelector(Gate.UnknownAsset.selector, debridgeId));
-        gate.claim(debridgeId, amount, CHAIN_A, 0, receiver, "", "", sigs);
+        gate.claim(debridgeId, amount, 18, CHAIN_A, 0, receiver, "", "", sigs);
 
         assertEq(usdc.balanceOf(attacker), 0, "not a single unit left the pot");
         assertEq(usdc.balanceOf(address(gate)), 1_000_000e18, "liquidity intact");
@@ -227,14 +227,14 @@ contract CorridorGovernanceTest is Test {
         usdc.mint(address(gate), 1_000_000e18);
         uint256 amount = 1_000_000e18;
         bytes memory receiver = abi.encodePacked(attacker);
-        bytes32 id = gate.computeSubmissionId(debridgeId, amount, CHAIN_A, block.chainid, 0, receiver, "", "");
+        bytes32 id = gate.computeSubmissionId(debridgeId, amount, 18, CHAIN_A, block.chainid, 0, receiver, "", "");
 
         // Registration is still instant during setup — that is the point of the phase.
         gate.setLocalToken(debridgeId, address(usdc));
         assertTrue(gate.inSetupPhase(), "still wiring");
 
         vm.expectRevert(Gate.NotSealed.selector);
-        gate.claim(debridgeId, amount, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
+        gate.claim(debridgeId, amount, 18, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
         assertEq(usdc.balanceOf(attacker), 0, "the H-1 hole is closed");
         assertEq(usdc.balanceOf(address(gate)), 1_000_000e18, "liquidity intact");
 
@@ -243,7 +243,7 @@ contract CorridorGovernanceTest is Test {
         // the registry is open, so the sealed state is reached by necessity
         // rather than by memory. Post-seal registrations take GOVERNANCE_DELAY.
         gate.seal();
-        gate.claim(debridgeId, amount, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
+        gate.claim(debridgeId, amount, 18, CHAIN_A, 0, receiver, "", "", _sign(v1pk, id));
         assertEq(usdc.balanceOf(attacker), amount, "owner key, three txs instead of two");
     }
 
@@ -342,7 +342,7 @@ contract CorridorGovernanceTest is Test {
         gate.setSupportedChain(CHAIN_TO, false);
         bytes32 did = BridgeHash.getDebridgeId(block.chainid, address(usdc));
         gate.refund(
-            address(usdc), did, 1 ether, CHAIN_TO, 0, receiver, "", "",
+            address(usdc), did, 1 ether, 18, CHAIN_TO, 0, receiver, "", "",
             _sign(v1pk, BridgeHash.getRefundId(id))
         );
         assertEq(usdc.balanceOf(user), 10 ether, "refund still works after de-listing");

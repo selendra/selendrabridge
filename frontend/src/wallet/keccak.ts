@@ -143,22 +143,33 @@ const SUBMISSION_PREFIX = 1n;
  * Field order is the contract's and is load-bearing: the receiver is packed at
  * its natural width (20 bytes for EVM, 32 for Solana) BETWEEN amount and nonce,
  * not padded to a word like the numbers around it.
+ *
+ * `bridgeDecimals` is the wire scale `amount` is denominated in (H-2), packed as
+ * ONE raw byte — `abi.encodePacked(uint8)`, not a word — between chainIdTo and
+ * amount. It is in the preimage because `amount` is a bare integer whose meaning
+ * depends entirely on it: without the scale, a gate registered one digit off
+ * computes the same id and pays out a power of ten too much.
  */
 export function submissionId(args: {
   bridgeDomain: string;
   debridgeId: string;
+  bridgeDecimals: number;
   amount: bigint;
   chainIdFrom: bigint;
   chainIdTo: bigint;
   nonce: bigint;
   receiver: Uint8Array;
 }): Uint8Array {
+  if (!Number.isInteger(args.bridgeDecimals) || args.bridgeDecimals < 0 || args.bridgeDecimals > 255) {
+    throw new Error(`bridgeDecimals must be a byte: ${args.bridgeDecimals}`);
+  }
   const parts = [
     word32(SUBMISSION_PREFIX),
     hexToBytes(args.bridgeDomain),
     hexToBytes(args.debridgeId),
     word32(args.chainIdFrom),
     word32(args.chainIdTo),
+    Uint8Array.of(args.bridgeDecimals),
     word32(args.amount),
     args.receiver,
     word32(args.nonce),

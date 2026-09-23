@@ -121,6 +121,7 @@ fn recompute(sent: &Sent, bridge_domain: &[u8; 32]) -> [u8; 32] {
         None => submission_id(
             bridge_domain,
             &sent.debridge_id,
+            sent.bridge_decimals,
             &amount_word(sent.amount as u128),
             sent.chain_id_from,
             sent.chain_id_to,
@@ -130,6 +131,7 @@ fn recompute(sent: &Sent, bridge_domain: &[u8; 32]) -> [u8; 32] {
         Some(auto) => submission_id_with_auto(
             bridge_domain,
             &sent.debridge_id,
+            sent.bridge_decimals,
             &amount_word(sent.amount as u128),
             sent.chain_id_from,
             sent.chain_id_to,
@@ -542,6 +544,9 @@ impl Scanner {
             bridge_domain: format!("0x{}", hex::encode(self.bridge_domain)),
             debridge_id: format!("0x{}", hex::encode(sent.debridge_id)),
             amount: sent.amount.to_string(),
+            // The scale the program hashed into the id (H-2), read off the same
+            // event this scanner recomputed from — never from config.
+            bridge_decimals: Some(sent.bridge_decimals),
             chain_id_from: sent.chain_id_from,
             chain_id_to: sent.chain_id_to,
             nonce: sent.nonce,
@@ -829,6 +834,7 @@ mod tests {
 
     fn sample() -> Sent {
         let mut s = Sent {
+            bridge_decimals: 9,
             submission_id: [0u8; 32],
             debridge_id: [0x22; 32],
             amount: 42_000,

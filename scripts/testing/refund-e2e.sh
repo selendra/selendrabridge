@@ -140,7 +140,8 @@ fi
 # Bridge decimals on the SOURCE token only (send needs it); identity, TestToken is
 # 18-dec. OTHER_TOKEN stays unregistered: refund() rejects it on TokenMismatch
 # before any conversion. The destination stays deliberately unregistered.
-set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" 18
+BRIDGE_DEC=18
+set_bridge_decimals "$SRC_RPC" "$KEY0" "$GATE_SRC" "$TOKEN_SRC" "$BRIDGE_DEC"
 
 # M-1: `claim` reverts on an unsealed gate. Sealing BOTH gates here is not
 # cosmetic: the destination is deliberately left with no `setLocalToken`, and an
@@ -174,13 +175,17 @@ NONCE=0
 GATE_DOMAIN=$(cast call "$GATE_SRC" "bridgeDomain()(bytes32)" --rpc-url $SRC_RPC)
 
 # submissionId = keccak(prefix(1), bridgeDomain, debridgeId, chainFrom, chainTo,
-#                       amount, receiver, nonce)   -- see BridgeHash.packedSubmission
+#                       bridgeDecimals, amount, receiver, nonce)
+#   -- see BridgeHash.packedSubmission. `bridgeDecimals` is ONE raw byte (uint8),
+#   not a word, and it is in there so the two ends cannot disagree about what
+#   `amount` means (H-2).
 SUBMISSION_ID=$(cast keccak "$(cast abi-encode --packed \
-  "f(uint256,bytes32,bytes32,uint256,uint256,uint256,bytes,uint256)" \
-  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$NONCE")")
+  "f(uint256,bytes32,bytes32,uint256,uint256,uint8,uint256,bytes,uint256)" \
+  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$BRIDGE_DEC" "$AMOUNT" \
+  "$RECEIVER_BYTES" "$NONCE")")
 
-ONCHAIN_ID=$(cast call "$GATE_SRC" "computeSubmissionId(bytes32,uint256,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
-  "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" --rpc-url $SRC_RPC)
+ONCHAIN_ID=$(cast call "$GATE_SRC" "computeSubmissionId(bytes32,uint256,uint8,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
+  "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" --rpc-url $SRC_RPC)
 check "locally-derived submissionId matches the gate's" "$SUBMISSION_ID" "$ONCHAIN_ID"
 
 SENT_BY=$(cast call "$GATE_SRC" "sentBy(bytes32)(address)" "$SUBMISSION_ID" --rpc-url $SRC_RPC)
@@ -198,35 +203,36 @@ SIG_REFUND=$(cast wallet sign --private-key $V1_KEY "$REFUND_ID")
 echo
 echo "=== domain separation: a transfer signature must authorise nothing else ==="
 reverts "cancel() rejects a replayed transfer signature" \
-  cast send "$GATE_DST" "cancel(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
+  cast send "$GATE_DST" "cancel(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
     --rpc-url $DST_RPC --private-key $KEY0
 reverts "refund() rejects a replayed transfer signature" \
-  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
+  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
     --rpc-url $SRC_RPC --private-key $KEY0
 reverts "refund() rejects a cancel attestation" \
-  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
+  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
     --rpc-url $SRC_RPC --private-key $KEY0
 
 echo
 echo "=== the gate must not refund what it never sent ==="
 GHOST_NONCE=99
 GHOST_ID=$(cast keccak "$(cast abi-encode --packed \
-  "f(uint256,bytes32,bytes32,uint256,uint256,uint256,bytes,uint256)" \
-  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$GHOST_NONCE")")
+  "f(uint256,bytes32,bytes32,uint256,uint256,uint8,uint256,bytes,uint256)" \
+  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$BRIDGE_DEC" "$AMOUNT" \
+  "$RECEIVER_BYTES" "$GHOST_NONCE")")
 GHOST_REFUND_ID=$(cast keccak "$(cast abi-encode --packed "f(uint256,bytes32)" $REFUND_PREFIX "$GHOST_ID")")
 GHOST_SIG=$(cast wallet sign --private-key $V1_KEY "$GHOST_REFUND_ID")
 reverts "refund() of a never-sent submissionId reverts (NotSent)" \
-  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$GHOST_NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$GHOST_SIG]" \
+  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$GHOST_NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$GHOST_SIG]" \
     --rpc-url $SRC_RPC --private-key $KEY0
 
 echo
 echo "=== phase 1: burn the transfer on the destination ==="
-cast send "$GATE_DST" "cancel(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-  "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
+cast send "$GATE_DST" "cancel(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+  "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
   --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
 EXECUTED=$(cast call "$GATE_DST" "executed(bytes32)(bool)" "$SUBMISSION_ID" --rpc-url $DST_RPC)
@@ -237,23 +243,23 @@ check "destination marks it cancelled" "$CANCELLED" "true"
 # THE double-spend guard: the transfer signatures are still perfectly valid, but
 # the destination is burned, so they can never release funds there again.
 reverts "claim() after cancel reverts (no double-spend)" \
-  cast send "$GATE_DST" "claim(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
+  cast send "$GATE_DST" "claim(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_TRANSFER]" \
     --rpc-url $DST_RPC --private-key $KEY0
 reverts "cancel() replay reverts" \
-  cast send "$GATE_DST" "cancel(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
+  cast send "$GATE_DST" "cancel(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$SRC_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_CANCEL]" \
     --rpc-url $DST_RPC --private-key $KEY0
 
 echo
 echo "=== phase 2: return the funds on the source ==="
 reverts "refund() with the wrong token reverts (TokenMismatch)" \
-  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$OTHER_TOKEN" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
+  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$OTHER_TOKEN" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
     --rpc-url $SRC_RPC --private-key $KEY0
 
-cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-  "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
+cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+  "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
   --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 
 BAL_AFTER=$(cast call "$TOKEN_SRC" "balanceOf(address)(uint256)" "$ACC0" --rpc-url $SRC_RPC | awk '{print $1}')
@@ -267,8 +273,8 @@ check "refunded flag set" "$REFUNDED" "true"
 check "sentBy cleared" "${SENT_BY_AFTER,,}" "0x0000000000000000000000000000000000000000"
 
 reverts "refund() replay reverts (AlreadyRefunded)" \
-  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
+  cast send "$GATE_SRC" "refund(address,bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+    "$TOKEN_SRC" "$DEBRIDGE_ID" "$AMOUNT" "$BRIDGE_DEC" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" "[$SIG_REFUND]" \
     --rpc-url $SRC_RPC --private-key $KEY0
 
 echo

@@ -1,6 +1,8 @@
 import { test, expect, startApp, connectWallet, gotoView, type ChainRpcSetup } from "../fixtures/app";
 import { driftChain, sentTransactions, walletCalls, ACCOUNT } from "../fixtures/wallet";
 import { CHAINS, GATE_A, GATE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
+import { SENT_SIGNATURE } from "../../src/wallet/eth";
+import { bytesToHex, keccak256 } from "../../src/wallet/keccak";
 
 /**
  * BridgeView, direct mode: the lock-and-emit path.
@@ -15,13 +17,14 @@ const BAL = 1000n * 10n ** 18n;
 const DEC_18 = { "313ce567": "12", "70a08231": BAL.toString(16), "dd62ed3e": "0", "4e3ff796": "1" };
 const APPROVED = { ...DEC_18, dd62ed3e: (2n ** 255n).toString(16) };
 
-const SENT_TOPIC0 = "0x8c7ee7a778ddf9672e509e70cf61fd826a6275ae6dd14c5e474b13898a1f2bbb";
+const SENT_TOPIC0 = bytesToHex(keccak256(new TextEncoder().encode(SENT_SIGNATURE)));
 const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, "0");
 /** What a real gate's `send` leaves in the receipt — the only proof funds locked. */
 const SENT_LOG = {
   address: GATE_A,
   topics: [SENT_TOPIC0, "0x" + "11".repeat(32), "0x" + "22".repeat(32)],
-  data: "0x" + word(10n ** 18n) + word(0) + word(0) + word(0) + word(0),
+  // amount(0), bridgeDecimals(1), chainIdFrom(2), chainIdTo(3), off(receiver)(4), nonce(5)
+  data: "0x" + word(10n ** 18n) + word(18) + word(0) + word(0) + word(0) + word(0),
 };
 
 const primaryButton = (page: import("@playwright/test").Page) => page.locator(".review-btn");

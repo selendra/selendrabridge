@@ -111,6 +111,8 @@ fn write_gate_send_fixture() {
     // that hashed the mint amount would derive a `sent` PDA the program refuses.
     const AMOUNT: u64 = 2_000_000_000;
     const BRIDGE_UNIT: u64 = 1_000;
+    /// The wire scale the unit above implies, and — since H-2 — part of the id.
+    const BRIDGE_DECIMALS: u8 = 6;
 
     let program = Pubkey::from_str(GATE).unwrap();
     let user = Pubkey::from_str(USER).unwrap();
@@ -123,6 +125,7 @@ fn write_gate_send_fixture() {
     let id = bridge_solana::hash::submission_id(
         &domain,
         &debridge_id,
+        BRIDGE_DECIMALS,
         &bridge_solana::hash::amount_word((AMOUNT / BRIDGE_UNIT) as u128),
         SOLANA_CHAIN,
         CHAIN_TO,
@@ -166,6 +169,7 @@ fn write_gate_send_fixture() {
         "debridgeId": format!("0x{DEBRIDGE_ID}"),
         "solanaChainId": SOLANA_CHAIN, "chainIdTo": CHAIN_TO,
         "nonce": NONCE, "amount": AMOUNT.to_string(), "bridgeUnit": BRIDGE_UNIT.to_string(),
+        "bridgeDecimals": BRIDGE_DECIMALS,
         "blockhash": BLOCKHASH,
         "submissionId": format!("0x{}", hex::encode(id)),
         "configPda": config.to_string(),

@@ -129,6 +129,9 @@ echo "  gateA now locks stable: $(cast call $STABLE_A 'balanceOf(address)(uint25
 echo
 echo "=== reconstruct the transfer + sign the submissionId ==="
 NONCE=0
+# DeployXSwap registers every stable at STABLE_BRIDGE_DECIMALS. It is inside the
+# submissionId (H-2), so every call that names this transfer must carry it.
+STABLE_BRIDGE_DEC=6
 # intent = abi.encode(finalToken, finalReceiver, finalMinOut)
 INTENT=$(cast abi-encode "f(address,address,uint256)" "$TT" "$FINAL_RECEIVER" 0)
 # autoParams = abi.encode(Gate.AutoParamsTo{0,0, fallback=finalReceiver(20b), data=intent})
@@ -138,8 +141,9 @@ NATIVE_SENDER=$ROUTER_A
 RECEIVER=$ROUTER_B  # the peer router the stable was bridged to
 
 SUB_ID=$(cast call "$GATE_A" \
-  "computeSubmissionId(bytes32,uint256,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
-  "$DEBRIDGE_ID" $STABLE_OUT $CHAIN_A $CHAIN_B $NONCE "$RECEIVER" "$AUTOPARAMS" "$NATIVE_SENDER" \
+  "computeSubmissionId(bytes32,uint256,uint8,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
+  "$DEBRIDGE_ID" $STABLE_OUT $STABLE_BRIDGE_DEC $CHAIN_A $CHAIN_B $NONCE "$RECEIVER" "$AUTOPARAMS" \
+  "$NATIVE_SENDER" \
   --rpc-url $SRC_RPC)
 echo "  submissionId = $SUB_ID"
 
@@ -154,8 +158,9 @@ echo "  expected TT out = $EXPECTED_TT"
 check "dest quote (1590e18)" "$EXPECTED_TT" "1590000000000000000000"
 
 cast send "$ROUTER_B" \
-  "claimAndFinalize(bytes32,uint256,uint256,uint256,bytes,bytes,bytes,bytes[])" \
-  "$DEBRIDGE_ID" $STABLE_OUT $CHAIN_A $NONCE "$RECEIVER" "$AUTOPARAMS" "$NATIVE_SENDER" "[$SIG]" \
+  "claimAndFinalize(bytes32,uint256,uint8,uint256,uint256,bytes,bytes,bytes,bytes[])" \
+  "$DEBRIDGE_ID" $STABLE_OUT $STABLE_BRIDGE_DEC $CHAIN_A $NONCE "$RECEIVER" "$AUTOPARAMS" \
+  "$NATIVE_SENDER" "[$SIG]" \
   --rpc-url $DST_RPC --private-key $KEY0 >"$LOGS/claim.log" 2>&1 \
   || { echo "  ❌ claimAndFinalize reverted"; tail -20 "$LOGS/claim.log"; exit 1; }
 

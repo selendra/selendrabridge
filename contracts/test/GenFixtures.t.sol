@@ -13,6 +13,7 @@ contract GenFixturesTest is Test {
         string name;
         bytes32 bridgeDomain;
         bytes32 debridgeId;
+        uint8 bridgeDecimals;
         uint256 amount;
         uint256 chainIdFrom;
         uint256 chainIdTo;
@@ -29,12 +30,20 @@ contract GenFixturesTest is Test {
     function _id(F memory f) internal pure returns (bytes32) {
         if (!f.hasAuto) {
             return BridgeHash.getSubmissionId(
-                f.bridgeDomain, f.debridgeId, f.amount, f.chainIdFrom, f.chainIdTo, f.nonce, f.receiver
+                f.bridgeDomain,
+                f.debridgeId,
+                f.bridgeDecimals,
+                f.amount,
+                f.chainIdFrom,
+                f.chainIdTo,
+                f.nonce,
+                f.receiver
             );
         }
         return BridgeHash.getSubmissionIdWithAuto(
             f.bridgeDomain,
             f.debridgeId,
+            f.bridgeDecimals,
             f.amount,
             f.chainIdFrom,
             f.chainIdTo,
@@ -56,6 +65,7 @@ contract GenFixturesTest is Test {
             '"name":"', f.name, '",',
             '"bridgeDomain":"', vm.toString(f.bridgeDomain), '",',
             '"debridgeId":"', vm.toString(f.debridgeId), '",',
+            '"bridgeDecimals":', vm.toString(uint256(f.bridgeDecimals)), ",",
             '"amount":"', vm.toString(f.amount), '",',
             '"chainIdFrom":', vm.toString(f.chainIdFrom), ",",
             '"chainIdTo":', vm.toString(f.chainIdTo), ",",
@@ -83,13 +93,14 @@ contract GenFixturesTest is Test {
     bytes32 constant DOMAIN_B = keccak256("selendra.bridge.mesh.v2");
 
     function test_WriteFixtures() public {
-        F[] memory fs = new F[](4);
+        F[] memory fs = new F[](5);
 
         // 1) plain transfer, no execution payload, EVM 20-byte receiver
         fs[0] = F({
             name: "no-auto",
             bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(1337, address(0x1234)),
+            bridgeDecimals: 18,
             amount: 100 ether,
             chainIdFrom: 1337,
             chainIdTo: 1338,
@@ -108,6 +119,7 @@ contract GenFixturesTest is Test {
             name: "with-auto",
             bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(1337, address(0xABCD)),
+            bridgeDecimals: 6,
             amount: 5_000_000,
             chainIdFrom: 1337,
             chainIdTo: 56,
@@ -126,6 +138,7 @@ contract GenFixturesTest is Test {
             name: "long-receiver",
             bridgeDomain: DOMAIN_A,
             debridgeId: BridgeHash.getDebridgeId(10, address(0x9999)),
+            bridgeDecimals: 0,
             amount: type(uint256).max,
             chainIdFrom: 10,
             chainIdTo: 7565164, // Solana-style large chain id
@@ -152,6 +165,30 @@ contract GenFixturesTest is Test {
             name: "domain-separated",
             bridgeDomain: DOMAIN_B,
             debridgeId: BridgeHash.getDebridgeId(1337, address(0x1234)),
+            bridgeDecimals: 18,
+            amount: 100 ether,
+            chainIdFrom: 1337,
+            chainIdTo: 1338,
+            nonce: 0,
+            receiver: abi.encodePacked(address(0xCAFE)),
+            hasAuto: false,
+            executionFee: 0,
+            flags: 0,
+            fallbackAddress: "",
+            data: "",
+            nativeSender: ""
+        });
+
+        // 5) every field of fixture 1, at a DIFFERENT wire scale. This is the H-2
+        //    regression at the hash layer: one operator registering an asset at 17
+        //    instead of 18 must make the ids diverge, because that is what stops
+        //    the mis-scaled gate settling a transfer it would pay out 10x on.
+        //    Spelled out rather than copied, for the aliasing reason above.
+        fs[4] = F({
+            name: "scale-separated",
+            bridgeDomain: DOMAIN_A,
+            debridgeId: BridgeHash.getDebridgeId(1337, address(0x1234)),
+            bridgeDecimals: 17,
             amount: 100 ether,
             chainIdFrom: 1337,
             chainIdTo: 1338,
@@ -166,6 +203,7 @@ contract GenFixturesTest is Test {
         });
 
         assertTrue(_id(fs[0]) != _id(fs[3]), "bridgeDomain must change the submissionId");
+        assertTrue(_id(fs[0]) != _id(fs[4]), "bridgeDecimals must change the submissionId");
 
         string memory json = "{\"fixtures\":[";
         for (uint256 i = 0; i < fs.length; i++) {

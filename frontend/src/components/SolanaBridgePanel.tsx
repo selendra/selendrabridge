@@ -179,6 +179,9 @@ export function SolanaBridgePanel({ solanaChain, chains, wallet }: Props) {
         nonce: BigInt(ctx.nonce),
         amount: amountBase,
         bridgeUnit: bridgeUnit ?? 1n,
+        // The gate's own registered scale, from the same `gateContext` the unit
+        // above came from — it is inside the submissionId (H-2).
+        bridgeDecimals: ctx.bridgeDecimals,
         receiver: hexToBytes(receiver.trim()),
       });
 

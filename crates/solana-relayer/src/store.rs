@@ -43,6 +43,15 @@ pub struct SubmissionRecord {
     pub debridge_id: String,
     /// decimal string (uint256 on the EVM side)
     pub amount: String,
+    /// H-2: the wire scale `amount` is denominated in. Part of the submissionId
+    /// preimage, so a record without it cannot reproduce its own id.
+    ///
+    /// `Option` and NOT defaultable to a number, for the same reason
+    /// `bridge_domain` is a strictly-parsed string here: scale 0 is a perfectly
+    /// valid registration, so defaulting would silently recompute a pre-scale
+    /// record under a scale nobody signed. `None` fails the binding instead.
+    #[serde(default)]
+    pub bridge_decimals: Option<u8>,
     pub chain_id_from: u64,
     pub chain_id_to: u64,
     pub nonce: u64,
@@ -368,6 +377,7 @@ mod tests {
             bridge_domain: format!("0x{}", "22".repeat(32)),
             debridge_id: format!("0x{}", "33".repeat(32)),
             amount: "1000000".into(),
+            bridge_decimals: Some(6),
             chain_id_from: 7_565_164,
             chain_id_to: 11_155_111,
             nonce: 0,

@@ -22,6 +22,8 @@ struct Fixture {
     bridge_domain: String,
     #[serde(rename = "debridgeId")]
     debridge_id: String,
+    #[serde(rename = "bridgeDecimals")]
+    bridge_decimals: u8,
     amount: String,
     #[serde(rename = "chainIdFrom")]
     chain_id_from: u64,
@@ -76,13 +78,14 @@ fn rust_matches_solidity_for_all_fixtures() {
     });
     let parsed: Fixtures = serde_json::from_str(&raw).expect("invalid fixtures json");
 
-    assert!(parsed.fixtures.len() >= 4, "expected at least 4 fixtures");
+    assert!(parsed.fixtures.len() >= 5, "expected at least 5 fixtures");
 
-    // The fixture set deliberately contains two entries identical in every field
-    // except `bridgeDomain`. If Rust ever stopped folding the domain into the
-    // preimage, both would hash the same and the per-fixture assertions below
-    // would still pass against a Solidity side that also (wrongly) agreed.
-    // Pinning the divergence here makes that regression impossible to miss.
+    // The fixture set deliberately contains entries identical in every field but
+    // one — `bridgeDomain` for one pair, `bridgeDecimals` for another. If Rust
+    // ever stopped folding either into the preimage, the pair would hash the same
+    // and the per-fixture assertions below would still pass against a Solidity
+    // side that also (wrongly) agreed. Pinning the divergence here makes that
+    // regression impossible to miss.
     let mut by_id = std::collections::HashMap::new();
     for f in &parsed.fixtures {
         if let Some(prev) = by_id.insert(&f.submission_id, &f.name) {
@@ -94,6 +97,7 @@ fn rust_matches_solidity_for_all_fixtures() {
         let sub = Submission {
             bridge_domain: f.bridge_domain.parse::<B256>().expect("bad bridgeDomain"),
             debridge_id: f.debridge_id.parse::<B256>().expect("bad debridgeId"),
+            bridge_decimals: f.bridge_decimals,
             amount: dec(&f.amount),
             chain_id_from: U256::from(f.chain_id_from),
             chain_id_to: U256::from(f.chain_id_to),
