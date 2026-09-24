@@ -188,6 +188,32 @@ debridge_id() { printf '0x%064x%s\n' "$1" "${2#0x}" | xargs cast keccak; }   # k
 scaled()      { local whole="$1" dec="$2"; [[ "$whole" =~ ^[0-9]+$ ]] || die "amount must be a whole number: $whole"
                 printf '%s%s\n' "$whole" "$(printf '0%.0s' $(seq 1 "$dec"))"; }
 
+# A read-only `cast call`, retried, with the failure VISIBLE.
+#
+# Two bugs in one, both bitten on a public endpoint (2026-09-24):
+#
+#   * `x="$(cast call ... 2>/dev/null | awk ...)"` under `set -e` + `pipefail`
+#     exits the script the instant the RPC blips — BEFORE the `|| die` on the
+#     next line can run. So the guard that exists to explain the failure is
+#     unreachable, and a transient timeout looks like a silent crash with no
+#     diagnostic anywhere. A deploy died mid-flight this way, leaving gates and
+#     tokens on chain that no record mentioned.
+#   * one blip should not end a deploy at all. These are idempotent reads.
+#
+# Prints nothing and returns non-zero when every attempt fails, so the caller's
+# own `|| die` stays in charge of the message.
+cast_read() {  # rpc target sig [args...]
+  local rpc="$1" target="$2" sig="$3"; shift 3
+  local out attempt
+  for attempt in 1 2 3 4 5; do
+    if out="$(cast call "$target" "$sig" "$@" --rpc-url "$rpc" 2>/dev/null)"; then
+      printf '%s\n' "$out"; return 0
+    fi
+    sleep $(( attempt * 2 ))
+  done
+  return 1
+}
+
 RUN_LOG_DIR="$(dirname "$OUT_FILE")/logs"
 mkdir -p "$RUN_LOG_DIR"
 
@@ -338,8 +364,8 @@ for sym in "${SYMS[@]:-}"; do
   [[ -z "${sym:-}" ]] && continue
   lowest=""; seen=""
   for cid in ${ASSET_CHAINS[$sym]:-}; do
-    d="$(cast call "${TOKEN[$sym|$cid]}" 'decimals()(uint8)' --rpc-url "${RPC[$cid]}" 2>/dev/null | awk '{print $1}')"
-    [[ "$d" =~ ^[0-9]+$ ]] || die "$sym on chain $cid: decimals() unreadable at ${TOKEN[$sym|$cid]}"
+    d="$(cast_read "${RPC[$cid]}" "${TOKEN[$sym|$cid]}" 'decimals()(uint8)' | awk '{print $1}')" || d=""
+    [[ "$d" =~ ^[0-9]+$ ]] || die "$sym on chain $cid: decimals() unreadable at ${TOKEN[$sym|$cid]} (5 attempts against ${RPC[$cid]})"
     seen+=" $cid:$d"; { [[ -z "$lowest" ]] || (( d < lowest )); } && lowest="$d"
   done
   if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
@@ -425,7 +451,7 @@ done
 # --- bridge decimals on every gate (write-once; must precede setLocalToken) --
 register_bridge_decimals() {  # chain_id sym
   local cid="$1" sym="$2" tok="${TOKEN[$2|$1]}" want="${BRIDGE_DEC[$2]}" cur isset curdec data aid
-  cur="$(cast call "${GATE[$cid]}" 'bridgeDecimalsOf(address)(bool,uint8,uint8)' "$tok" --rpc-url "${RPC[$cid]}" 2>/dev/null | tr '\n' ' ')"
+  cur="$(cast_read "${RPC[$cid]}" "${GATE[$cid]}" 'bridgeDecimalsOf(address)(bool,uint8,uint8)' "$tok" | tr '\n' ' ')" || cur=""
   read -r isset curdec _ <<<"$cur"
   if [[ "$isset" == "true" ]]; then
     [[ "$curdec" == "$want" ]] || die "chain $cid gate already has $sym at bridge decimals $curdec, this mesh needs $want — it is write-once; deploy a new gate"
@@ -642,8 +668,20 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     # endpoint or a containerised validator does not give you — it fails with
     # "Failed find any cluster node info for upcoming leaders" after a 20s stall.
     rpc_flag=(); [[ "$(j '.solana.program.use_rpc')" != "false" ]] && rpc_flag=(--use-rpc)
-    solana program deploy "$so" --url "$SOL_RPC" --keypair "$PAYER" "${rpc_flag[@]}" --output json > "$out" \
-      || { cat "$out"; die "solana program deploy failed"; }
+    # A program deploy is hundreds of sequential write transactions, and a public
+    # endpoint rate-limits long before the default 5 sign attempts are spent:
+    # the deploy dies with "Data writes to account failed: Max retries exceeded"
+    # and STRANDS the buffer's rent (~1-2 SOL) in an orphaned account. Raising the
+    # ceiling costs nothing when the endpoint is healthy. Observed on
+    # api.devnet.solana.com, 2026-09-24.
+    solana program deploy "$so" --url "$SOL_RPC" --keypair "$PAYER" "${rpc_flag[@]}" \
+      --max-sign-attempts 200 --output json > "$out" \
+      || { cat "$out"
+           # Tell the operator how to get the money back; the CLI prints a seed
+           # phrase for the buffer, but not this.
+           echo "recover the stranded buffer rent with:" >&2
+           echo "  solana program close --buffers --keypair $PAYER --url $SOL_RPC" >&2
+           die "solana program deploy failed"; }
     SOL_PROGRAM="$(jq -r '.programId' "$out")"
     info "program : $SOL_PROGRAM (deployed)"
   else
@@ -798,9 +836,17 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     seed_whole="$(j ".solana.assets[] | select(.symbol == \"$sym\") | .vault_seed // empty")"
     seed_from="$(jr ".solana.assets[] | select(.symbol == \"$sym\") | .seed_from")"
     if [[ -n "$seed_whole" && -n "$seed_from" ]]; then
-      spl-token transfer "$mint" "$seed_whole" "$vault" --from "$seed_from" \
-        --owner "$PAYER" --fee-payer "$PAYER" --url "$SOL_RPC" >/dev/null 2>&1 \
-        || die "seeding the $sym vault from $seed_from failed"
+      # `2>&1 >/dev/null` used to swallow the reason, and the reason is usually
+      # actionable: the seed source is a token account that a PREVIOUS generation
+      # already drained, so `vault_seed` asks for more than it holds and spl-token
+      # says exactly that ("Sender has insufficient funds, current balance is N").
+      # Losing that line turns a one-line fix into a blind hunt (2026-09-24).
+      if ! seed_err="$(spl-token transfer "$mint" "$seed_whole" "$vault" --from "$seed_from" \
+            --owner "$PAYER" --fee-payer "$PAYER" --url "$SOL_RPC" 2>&1)"; then
+        echo "$seed_err" >&2
+        die "seeding the $sym vault from $seed_from failed (see the spl-token error above; \
+if it is insufficient funds, either lower solana.assets[$sym].vault_seed or mint more to $seed_from)"
+      fi
       info "vault   : seeded $seed_whole $sym into $vault"
     fi
     vault_bal="$(spl-token balance --address "$vault" --url "$SOL_RPC" 2>/dev/null || echo 0)"

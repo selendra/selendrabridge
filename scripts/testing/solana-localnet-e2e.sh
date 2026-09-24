@@ -31,14 +31,18 @@ solana cluster-version --url "$RPC"
 echo "== payer =="
 KEY="$HOME/.config/solana/id.json"
 [ -f "$KEY" ] || solana-keygen new --no-bip39-passphrase --silent --outfile "$KEY"
-for i in 1 2 3 4 5; do solana airdrop 100 >/dev/null 2>&1 && break || sleep 2; done
-echo "payer $(solana address) balance $(solana balance)"
+# --keypair on every call: without it these read the CLI CONFIG's keypair_path,
+# which is NOT necessarily $KEY. When they differ the airdrop credits one account
+# and claim.mjs pays from another with a zero balance.
+for i in 1 2 3 4 5; do solana airdrop 100 --keypair "$KEY" >/dev/null 2>&1 && break || sleep 2; done
+echo "payer $(solana address --keypair "$KEY") balance $(solana balance --keypair "$KEY")"
 
 echo "== deploy =="
 # mktemp, not a fixed /tmp/deploy.json another local user could pre-create or
 # symlink (audit round 5, LOW).
 DEPLOY_JSON="$(mktemp)"; trap 'rm -f "$DEPLOY_JSON"' EXIT
-solana program deploy "$ROOT/crates/solana-gate/target/deploy/solana_gate.so" --output json > "$DEPLOY_JSON"
+solana program deploy "$ROOT/crates/solana-gate/target/deploy/solana_gate.so" \
+  --keypair "$KEY" --use-rpc --output json > "$DEPLOY_JSON"
 PROGRAM_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["programId"])' "$DEPLOY_JSON")"
 echo "programId $PROGRAM_ID"
 
