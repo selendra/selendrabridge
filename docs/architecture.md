@@ -188,6 +188,10 @@ One `Gate` per chain. It is both the source and the destination; the role depend
 
 Wiring order for every gate, before it is funded: `setSupportedChain` for each peer → `setBridgeDecimals` for each local token → `setLocalToken` for each inbound corridor → `seal()`. Both launchers do this and verify it.
 
+**The Solana gate has the same lifecycle since H-5 (2026-09-24), and on that VM it is not optional.** `Config.sealed` and `Config.setup_deadline` (`init + 7 days`; **zero means expired**) end the setup phase whichever comes first, `Seal` is the one-way owner instruction that closes it, and `claim` returns `NotSealed` until it lands — so an unsealed Solana gate accepts sends and signatures and settles nothing. Past the phase, `RegisterAsset` consumes a matured `["gov", registerAssetActionId(debridgeId, mint, vault, bridgeDecimals)]` schedule; the id commits to all four, so an approval cannot be respent at a different scale or onto a different vault.
+
+Separately, `["vault", vault]` commits a vault to a `{mint, bridgeDecimals}` pair and every `debridgeId` sharing that vault must agree (`VaultAssetMismatch`). This is NOT one asset per vault, and cannot be: a `debridgeId` is `keccak(sourceChainId, sourceToken)`, so one SPL mint reachable from three EVM chains is three ids against one vault, all legitimate. What the commitment buys is that a vault always pays out in the units it was funded in — the amplification a mis-scaled binding would otherwise have. A gate registered before H-5 carries no commitment until `register-asset` is re-run with its stored values, which needs no schedule because it changes nothing.
+
 The `executed` / `cancelled` split is a sharp edge worth internalising.
 `executed` means "spent", not "delivered".
 Any consumer that reads `executed` as proof of delivery must also check `cancelled`, or it will act on a payout that never happened.

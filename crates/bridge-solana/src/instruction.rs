@@ -106,6 +106,12 @@ pub enum GateInstruction {
     ///
     /// Accounts: `[config, signer(s), gov_pda(w)]`.
     CancelScheduledGovernance { action_id: [u8; 32] },
+    /// H-5: end the setup phase — from here on binding a NEW asset waits out
+    /// `GOVERNANCE_DELAY`, and only from here on will `claim` release anything.
+    /// Owner only, irreversible. Discriminant 14.
+    ///
+    /// Accounts: `[config(w), owner(s)]`.
+    Seal,
 }
 
 /// The program's `GOVERNANCE_DELAY`, in seconds: how long a scheduled validator
@@ -113,6 +119,9 @@ pub enum GateInstruction {
 pub const GOVERNANCE_DELAY_SECS: i64 = 48 * 60 * 60;
 /// The program's `GOVERNANCE_GRACE`: how long a matured schedule stays spendable.
 pub const GOVERNANCE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
+/// The program's `SETUP_WINDOW`: how long after `init` assets may still be bound
+/// in one transaction, if `Seal` has not already closed the phase (H-5).
+pub const SETUP_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// `keccak("addValidator" ‖ v)` — the action id `ScheduleGovernance` needs before
 /// `SetValidator { active: true }` will admit `v`. Must equal the program's
@@ -121,6 +130,29 @@ pub fn add_validator_action_id(v: &[u8; 20]) -> [u8; 32] {
     let mut p = Vec::with_capacity(12 + 20);
     p.extend_from_slice(b"addValidator");
     p.extend_from_slice(v);
+    crate::hash::keccak(&p)
+}
+
+/// `keccak("registerAsset" ‖ debridge_id ‖ mint ‖ vault ‖ bridge_decimals)` — the
+/// action id `ScheduleGovernance` needs before a SEALED gate will bind an asset
+/// (H-5). Must equal the program's `register_asset_action_id`; `solana-gate`'s
+/// account-level suite pins it.
+///
+/// It commits to every field the binding decides, so a matured approval cannot be
+/// respent on a different vault or a different wire scale — the two things the
+/// finding turns into a drain.
+pub fn register_asset_action_id(
+    debridge_id: &[u8; 32],
+    mint: &[u8; 32],
+    vault: &[u8; 32],
+    bridge_decimals: u8,
+) -> [u8; 32] {
+    let mut p = Vec::with_capacity(13 + 32 * 3 + 1);
+    p.extend_from_slice(b"registerAsset");
+    p.extend_from_slice(debridge_id);
+    p.extend_from_slice(mint);
+    p.extend_from_slice(vault);
+    p.push(bridge_decimals);
     crate::hash::keccak(&p)
 }
 

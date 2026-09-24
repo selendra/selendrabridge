@@ -33,6 +33,14 @@ pub struct ConfigAccount {
     pub max_corridors: u32,
     /// `(chain_id_to, next_nonce)` per governance-registered corridor.
     pub nonce_to: Vec<(u64, u64)>,
+    /// H-5: is the asset registry final? An unsealed gate releases nothing, and a
+    /// new asset binding on it needs no timelock. Appended to the program's
+    /// `Config`, so an account written before H-5 supplies these from its rent
+    /// padding — `false` and `0`, which is the fail-closed reading of both.
+    pub sealed: bool,
+    /// H-5: when the instant-registration phase ends by itself. ZERO MEANS
+    /// EXPIRED, not "no deadline".
+    pub setup_deadline: i64,
 }
 
 impl ConfigAccount {
@@ -62,6 +70,16 @@ impl AssetAccount {
     pub fn bridge_unit(&self) -> Option<u64> {
         10u64.checked_pow(self.local_decimals.checked_sub(self.bridge_decimals)? as u32)
     }
+}
+
+/// The gate's `["vault", vault]` commitment: what a vault's liquidity is (H-5).
+///
+/// One vault legitimately backs one asset arriving from several source chains, so
+/// this pins what they must agree on rather than naming a single `debridgeId`.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct VaultBindingAccount {
+    pub mint: Key,
+    pub bridge_decimals: u8,
 }
 
 /// Decode an account whose trailing bytes are rent padding.

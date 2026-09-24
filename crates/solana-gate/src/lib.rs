@@ -26,6 +26,12 @@
 //!     existence is the replay guard (a second claim fails to init it).
 //!   * **Sent PDA** (`["sent", submissionId]`) — source-side origin proof and
 //!     refund destination, with the cluster time the funds were locked.
+//!   * **Vault-binding PDA** (`["vault", vault]`) — the mint and the wire scale
+//!     a vault is committed to. A vault legitimately backs the SAME asset arriving
+//!     from several source chains (a debridgeId is per (chain, token), so a
+//!     3-chain mesh gives 3 ids for one SPL mint and one vault), so this records
+//!     the mint and scale rather than a single id: every id sharing a vault must
+//!     agree on both, and none of them can pay out in different units (H-5(b)).
 //!   * **Governance PDA** (`["gov", actionId]`) — a pending validator addition or
 //!     threshold decrease and the time it matures (H-2, audit round 4). Adding
 //!     signing power waits 48 h behind `ScheduleGovernance`; removing it is
@@ -197,6 +203,13 @@ pub enum GateInstruction {
     ///
     /// Accounts: `[config, signer(s), gov_pda(w)]`.
     CancelScheduledGovernance { action_id: [u8; 32] },
+    /// H-5: end the setup phase — from here on a NEW asset binding waits out
+    /// [`GOVERNANCE_DELAY`]. Owner only, IRREVERSIBLE, and a precondition for
+    /// `claim`. Appended last so discriminants 0..=13 stay byte-compatible with
+    /// `bridge_solana::instruction::GateInstruction`.
+    ///
+    /// Accounts: `[config(w), owner(s)]`.
+    Seal,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +274,61 @@ pub fn add_validator_action_id(v: &[u8; 20]) -> [u8; 32] {
 /// cannot be spent on `t = 1`.
 pub fn lower_threshold_action_id(t: u32) -> [u8; 32] {
     keccak::hashv(&[b"lowerThreshold", &be32(t as u64)]).to_bytes()
+}
+
+/// How long after [`process_init`] a brand-new gate may register assets
+/// instantly, in seconds. Mirrors `Gate.sol`'s `SETUP_WINDOW`.
+///
+/// H-5. `register_asset` was a plain instant owner action for ever, while the EVM
+/// gate had already put the same action behind [`GOVERNANCE_DELAY`] once its
+/// registry was final — and the registry is the whole of what stands between an
+/// owner key and the vaults. Wiring a fresh mesh registers every asset in one
+/// sitting against EMPTY vaults, so an instant path there protects no funds and
+/// is worth keeping; the phase simply has to END. A constant, not an
+/// owner-settable field, for the reason [`GOVERNANCE_DELAY`] is one.
+pub const SETUP_WINDOW: i64 = 7 * 24 * 60 * 60;
+
+/// The action id for binding `debridge_id` to exactly this mint, vault and wire
+/// scale: `keccak("registerAsset" ‖ debridge_id ‖ mint ‖ vault ‖ bridge_decimals)`.
+///
+/// H-5. The schedule commits to EVERY field the binding decides, so a matured
+/// approval cannot be spent on a different vault or a different scale — which is
+/// the entire content of the finding. `bridge_decimals` one digit low pays a power
+/// of ten out of the vault on a *legitimate user's* transfer (max amplification
+/// 10^19 at this program's own limit), and a fresh id pointed at an already-funded
+/// vault drains it outright. Both are now visible in the scheduled action id for
+/// [`GOVERNANCE_DELAY`] before they can happen, and the guardian can cancel them.
+pub fn register_asset_action_id(
+    debridge_id: &[u8; 32],
+    mint: &Pubkey,
+    vault: &Pubkey,
+    bridge_decimals: u8,
+) -> [u8; 32] {
+    keccak::hashv(&[
+        b"registerAsset",
+        debridge_id,
+        mint.as_ref(),
+        vault.as_ref(),
+        &[bridge_decimals],
+    ])
+    .to_bytes()
+}
+
+/// Pure H-5 setup-phase rule (host-testable): may an asset still be bound in one
+/// transaction, with no timelock?
+///
+/// Two independent ends to the phase, exactly as `Gate.inSetupPhase` has: the
+/// operator says so ([`Config::sealed`]) or the clock says so
+/// ([`Config::setup_deadline`]). Relying on the flag alone is the EVM side's
+/// finding M-1 — nothing forces an operator to call it, and a funded gate left
+/// unsealed keeps one-transaction registration for ever.
+///
+/// `setup_deadline == 0` means EXPIRED, not "no deadline". That is what makes the
+/// field safe to append to a gate that is already live: the bytes past a stored
+/// `Config` are zero, so an existing gate reads 0 and every registration takes
+/// the delayed path. Fail-closed.
+fn in_setup_phase(sealed: bool, setup_deadline: i64, now: i64) -> bool {
+    !sealed && setup_deadline != 0 && now <= setup_deadline
 }
 
 /// Pure timelock rule (host-testable): may a schedule with `ready_at` be
@@ -382,6 +450,16 @@ pub struct Config {
     /// (chainIdTo, nextNonce). One entry per GOVERNANCE-REGISTERED corridor —
     /// `send` never creates one. See [`process_register_corridor`].
     pub nonce_to: Vec<(u64, u64)>,
+    /// H-5: one-way flag. Once set, binding a NEW asset goes through
+    /// `ScheduleGovernance` + [`GOVERNANCE_DELAY`] like every other
+    /// power-granting owner action — and `claim` refuses to release anything
+    /// until it IS set, so sealing cannot be skipped by an operator who simply
+    /// forgets. Mirrors `Gate.isSealed`. See [`in_setup_phase`].
+    pub sealed: bool,
+    /// H-5: when the instant-registration phase stops regardless of whether
+    /// anyone remembered to `Seal`. Set once at init to `now + SETUP_WINDOW`.
+    /// ZERO MEANS EXPIRED — see [`in_setup_phase`].
+    pub setup_deadline: i64,
 }
 
 /// Borsh-serialized size of a [`Config`] holding `validators` validators and
@@ -404,7 +482,21 @@ fn config_space(validators: u32, corridors: u32) -> usize {
     + 1                             // paused
     + 4 + 4                         // max_validators, max_corridors
     + 4 + 16 * corridors as usize   // nonce_to: Vec<(u64, u64)>
+    + 1                             // sealed (H-5)
+    + 8                             // setup_deadline (H-5)
 }
+
+/// Spare bytes allocated beyond [`config_space`] at init, so the NEXT field
+/// appended to [`Config`] costs an existing gate nothing.
+///
+/// The same lesson as [`ASSET_CONFIG_SLACK`], one account up: `sealed` and
+/// `setup_deadline` grew the body by 9 bytes inside accounts that had been
+/// allocated exactly `config_space(max_validators, max_corridors)`. A live gate
+/// survives that only because its vectors are below capacity; a gate at capacity
+/// would have refused every write that reserializes the config — `send`,
+/// governance, the nonce bump — with no realloc path anywhere. Headroom here and
+/// the actual-size check in [`Config::store`] are the two halves of that fix.
+const CONFIG_SLACK: usize = 64;
 
 impl Config {
     fn is_validator(&self, a: &[u8; 20]) -> bool {
@@ -431,12 +523,25 @@ impl Config {
     /// no longer fits. Borsh's own failure would abort the transaction anyway;
     /// this reports the real reason instead of an opaque serialization error.
     fn store(&self, config_ai: &AccountInfo) -> ProgramResult {
-        let needed = config_space(
-            self.validators.len().max(self.max_validators as usize) as u32,
-            self.nonce_to.len().max(self.max_corridors as usize) as u32,
-        );
+        // The ACTUAL body, not the full declared capacity. Measuring capacity
+        // here is what made APPENDING a field to `Config` a brick: a gate sized
+        // for exactly `config_space(max_validators, max_corridors)` would refuse
+        // every write the moment the struct grew by one byte, killing `send`,
+        // governance and the nonce bump at once with no way back. Growth is
+        // bounded elsewhere — `max_validators` / `max_corridors` are enforced
+        // where the vectors grow, and init now allocates [`CONFIG_SLACK`] on top
+        // — so the strict check bought nothing the caps do not already give.
+        //
+        // It still has to happen BEFORE any byte is written: Borsh fills the
+        // slice progressively, so a mid-write failure would leave a config that
+        // no longer decodes.
+        let needed = config_space(self.validators.len() as u32, self.nonce_to.len() as u32);
         if needed > config_ai.data_len() {
-            msg!("config no longer fits its account; capacities were fixed at init");
+            msg!(
+                "config needs {} bytes, its account has {}",
+                needed,
+                config_ai.data_len()
+            );
             return Err(ProgramError::AccountDataTooSmall);
         }
         self.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
@@ -708,6 +813,124 @@ fn asset_write_allowed(
         return Ok(false);
     }
     Err(GateError::AssetAlreadyRegistered.into())
+}
+
+/// What a vault is committed to, stored in `["vault", vault]` (H-5(b)).
+///
+/// `bridge_decimals` is the field that does the work. `mint` is recorded so the
+/// account is self-describing and the comparison is total, but a mismatch there is
+/// UNREACHABLE today: `register_asset` already requires the vault's own SPL `mint`
+/// field to equal the mint being registered, which fires first. Kept for the same
+/// reason this program keeps its reserved error variants — the invariant is stated
+/// where it is enforced, not left implicit in another function's ordering.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VaultBinding {
+    pub mint: Pubkey,
+    pub bridge_decimals: u8,
+}
+
+/// Borsh size of a [`VaultBinding`].
+const VAULT_BINDING_LEN: usize = 33;
+
+/// Pure H-5(b) rule (host-testable): may a registration name a vault whose
+/// binding record currently reads `existing`?
+///
+/// `None` is an uncommitted vault (no record, or one allocated and never
+/// written). Otherwise the mint AND the wire scale must be the same.
+///
+/// WHY NOT ONE ASSET PER VAULT, which is what the finding asks for. A vault
+/// legitimately backs the SAME asset arriving from several source chains: a
+/// `debridgeId` is `keccak(sourceChainId, sourceToken)`, so mesh10's three EVM
+/// chains give THREE ids for one SPL mint and one vault, all of them correct.
+/// Refusing a vault "already named by another asset record" would have let the
+/// Solana leg accept TST from exactly one of them — the bridge would not work.
+/// (Nor can the program tell the cases apart: it cannot look inside a keccak hash
+/// to see which chain and token an id came from.)
+///
+/// So this enforces the part that IS checkable, and it is the part the drains use:
+/// the amplification. [`asset_write_allowed`] blocks repointing an id that exists
+/// and says nothing about a NEW id, so an owner could bind a fresh, well-formed
+/// `debridge_id` to the live, FUNDED vault at a scale three digits low and pay a
+/// power of ten out of it on the first transfer. With this, every id sharing a
+/// vault pays out in the same units as the vault was funded in.
+///
+/// What is left — a second id on a live vault at the CORRECT mint and scale, a
+/// 1:1 drain — is what [`SETUP_WINDOW`] and [`GOVERNANCE_DELAY`] cover instead:
+/// past the setup phase it is a scheduled action, visible for 48 h in the
+/// scheduled `["gov", registerAssetActionId]` PDA, and the guardian can cancel
+/// it. That is the same defence the EVM gate relies on for the same attack, and
+/// it is the honest limit of what the destination chain can know.
+fn vault_binding_allowed(
+    existing: Option<&VaultBinding>,
+    want: &VaultBinding,
+) -> Result<(), GateError> {
+    match existing {
+        None => Ok(()),
+        Some(b) if b == want => Ok(()),
+        Some(_) => Err(GateError::VaultAssetMismatch),
+    }
+}
+
+/// Commit `vault` to a mint and a wire scale in the program-owned PDA
+/// `["vault", vault]`, refusing one already committed to something else (H-5(b)).
+///
+/// A registry keyed BY THE VAULT is the only way to ask this question on this VM:
+/// a program cannot enumerate its own accounts, so "what is this vault already
+/// used for?" has to be one derivable address. Created through
+/// [`create_pda_account`], so pre-funding the address cannot block registration
+/// (M-5).
+///
+/// It is written on the idempotent re-run path too, which is how a vault bound by
+/// a pre-H-5 build of this program gets its record backfilled — re-running
+/// `register_asset` with the values already stored. Without that the check would
+/// be inert on every gate that is already live, which is all of them.
+fn bind_vault<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    binding_ai: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    vault: &Pubkey,
+    want: &VaultBinding,
+) -> ProgramResult {
+    let (expected, bump) = Pubkey::find_program_address(&[b"vault", vault.as_ref()], program_id);
+    if binding_ai.key != &expected {
+        msg!("vault binding account is not the canonical [\"vault\", vault] PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let written = binding_ai.owner == program_id && binding_ai.data_len() >= VAULT_BINDING_LEN;
+    let existing = if written {
+        let b = VaultBinding::deserialize(&mut &binding_ai.data.borrow()[..])
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        // A zero mint is "allocated but never written", not a commitment: no SPL
+        // mint is the default pubkey, and `register_asset` has already proved this
+        // one is a real mint account.
+        if b.mint == Pubkey::default() {
+            None
+        } else {
+            Some(b)
+        }
+    } else {
+        // Someone else's account at this address proves nothing about a binding,
+        // and must not be written into.
+        if !binding_ai.data_is_empty() && binding_ai.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+        None
+    };
+    vault_binding_allowed(existing.as_ref(), want)?;
+    if !written {
+        create_pda_account(
+            program_id,
+            payer,
+            binding_ai,
+            system_program,
+            &[b"vault", vault.as_ref()],
+            bump,
+            VAULT_BINDING_LEN,
+        )?;
+    }
+    want.serialize(&mut &mut binding_ai.data.borrow_mut()[..])?;
+    Ok(())
 }
 
 /// Pure C1 asset-binding gate (host-testable): the vault a send/claim touches and
@@ -1103,6 +1326,19 @@ pub enum GateError {
     /// scale, which is what makes the ids diverge in the first place.
     #[error("wire scale does not match this gate's registration for the asset")]
     BridgeScaleMismatch,
+    /// H-5: `claim` on a gate whose asset registry is not final yet. `Custom(26)`.
+    /// Mirrors `Gate.NotSealed`.
+    #[error("gate is not sealed — Seal it before it may release anything")]
+    NotSealed,
+    /// H-5: `Seal` on a gate that is already sealed. `Custom(27)`. Mirrors
+    /// `Gate.AlreadySealed`.
+    #[error("gate is already sealed")]
+    AlreadySealed,
+    /// H-5(b): the vault named by a registration is already committed to a
+    /// different mint or a different wire scale. `Custom(28)`. See
+    /// [`vault_binding_allowed`].
+    #[error("vault already backs a different mint or wire scale")]
+    VaultAssetMismatch,
 }
 
 /// Pure init-time validator-set rule (host-testable; `init` itself cannot run
@@ -1334,6 +1570,7 @@ pub fn process_instruction(
         GateInstruction::CancelScheduledGovernance { action_id } => {
             process_cancel_scheduled_governance(program_id, accounts, action_id)
         }
+        GateInstruction::Seal => process_seal(program_id, accounts),
     }
 }
 
@@ -1671,7 +1908,7 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
     // a lamport there before the deployer runs `init` — and `create_account`
     // would then fail with "already in use" forever, forcing a redeploy under a
     // new program id. The shared transfer+allocate+assign path tolerates it.
-    let space = config_space(args.max_validators, args.max_corridors);
+    let space = config_space(args.max_validators, args.max_corridors) + CONFIG_SLACK;
     create_pda_account(
         program_id,
         payer,
@@ -1701,6 +1938,13 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
         max_validators: args.max_validators,
         max_corridors: args.max_corridors,
         nonce_to: Vec::new(),
+        // H-5: the instant-registration phase opens here and closes on its own,
+        // whether or not anyone remembers to `Seal`. Until `Seal` lands, `claim`
+        // releases nothing — so a gate cannot be run in the unsealed state.
+        sealed: false,
+        setup_deadline: solana_program::clock::Clock::get()?
+            .unix_timestamp
+            .saturating_add(SETUP_WINDOW),
     };
     cfg.store(config_ai)?;
     msg!(
@@ -1709,6 +1953,10 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
         cfg.max_validators,
         cfg.threshold,
         cfg.max_corridors
+    );
+    msg!(
+        "setup phase open until {} — register assets, then Seal (claim is refused until then)",
+        cfg.setup_deadline
     );
     Ok(())
 }
@@ -1954,6 +2202,21 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     if cfg.paused {
         return Err(GateError::Paused.into());
     }
+    // H-5: funds only ever leave a gate whose asset registry is FINAL. Sealing
+    // used to be a runbook note consulted by no fund-moving instruction, so a
+    // gate that was funded and never sealed kept one-transaction registration for
+    // ever — the owner-key drain, waiting. Refusing here makes `Seal` unskippable.
+    //
+    // HONEST LIMIT, the same one `Gate.claim` documents: this defends against the
+    // FORGOTTEN procedure, not against the owner key. A malicious owner still
+    // registers a fake asset while unsealed, seals, and claims — three
+    // transactions instead of two, with no notice period. Closing that needs a
+    // cooling period between `Seal` and the first claim, which would make every
+    // new mesh wait 48 h for its first transfer; not taken here. Post-seal
+    // registrations DO get the delay.
+    if !cfg.sealed {
+        return Err(GateError::NotSealed.into());
+    }
 
     // C1: the vault a claim releases from must be the one the program registered
     // for the SIGNED debridge_id — not an arbitrary vault under the global
@@ -2143,13 +2406,32 @@ fn process_set_threshold(
 }
 
 /// Accounts: [config, owner(s,w), asset_pda(w), mint, vault, spl_token_program,
-///            system_program]
+///            system_program, vault_binding_pda(w), gov_pda(w)?]
 ///
 /// C1: owner-gated binding of a `debridge_id` to the SPL `mint` + `vault` that
 /// may back it. Creating the `["asset", debridge_id]` PDA is what later lets
 /// `send`/`claim` refuse any vault/mint that isn't the one governance signed off
 /// on. The vault must hold `mint` and be owned by the canonical vault-authority
 /// PDA, so a claim's `invoke_signed` can actually move its funds.
+///
+/// H-5, the two drains one instruction used to allow, and what stops each:
+///
+/// **(a) a mis-scaled binding, instantly.** The only check on `bridge_decimals`
+/// is that it fits the mint — a mesh at 6 and this gate at 3 means a legitimate
+/// 1 TST send pays 1000 TST out of the vault, repeatable until it is empty. The
+/// EVM gate had already put this action behind [`GOVERNANCE_DELAY`]; now so does
+/// this one, past the setup phase, and the action id commits to the scale itself
+/// so a matured approval cannot be respent at a different one.
+///
+/// **(b) a second `debridge_id` on a funded vault.** Its amplification is closed
+/// by [`bind_vault`] — every id sharing a vault must agree on the mint and the
+/// scale. A 1:1 second id is left to the timelock above, for the reason
+/// [`vault_binding_allowed`] explains at length: a vault backs one asset arriving
+/// from MANY source chains, so "one id per vault" is not a rule this bridge can
+/// have.
+///
+/// Governance is consumed as LATE as possible and never for a no-op, so a schedule
+/// is not burned by a call that was going to fail anyway or that changes nothing.
 fn process_register_asset(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2164,6 +2446,7 @@ fn process_register_asset(
     let vault = next_account_info(it)?;
     let token_program = next_account_info(it)?;
     let system_program = next_account_info(it)?;
+    let vault_binding_ai = next_account_info(it)?;
 
     let cfg = load_config(program_id, config_ai)?;
     if owner.key != &cfg.owner || !owner.is_signer {
@@ -2223,6 +2506,63 @@ fn process_register_asset(
         local_decimals: mint_state.decimals,
     };
     let space: usize = ASSET_CONFIG_LEN + ASSET_CONFIG_SLACK;
+
+    // Is this a re-run of a binding that is already there, byte for byte? Deploy
+    // scripts are re-runnable by design, and an identical write changes nothing
+    // the timelock protects — so it must not consume a schedule. It is also the
+    // path that BACKFILLS the vault binding for an asset registered by a pre-H-5
+    // build, which is why it is a no-op and no longer an early return.
+    let mut rerun = false;
+    if !asset_ai.data_is_empty() {
+        if asset_ai.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+        // H-1: WRITE-ONCE, exactly as `Gate.sol::setLocalToken` is.
+        //
+        // A claim commits to `debridge_id` — never to the mint or the vault — so
+        // the binding read at claim time decides what is actually paid out. If it
+        // could be repointed, an owner (or a compromised owner key) could let
+        // validators sign a transfer of asset X and then have those very same
+        // signatures release asset Y from a different vault, with no change to
+        // anything the validators attested.
+        //
+        // Registering a NEW corridor stays an owner action (delayed once the gate
+        // is sealed); changing a live one must not exist. Route a different asset
+        // through a fresh debridge_id instead.
+        let existing = decode_asset_config(&asset_ai.data.borrow())?;
+        rerun = !asset_write_allowed(&existing, &record)?;
+    }
+
+    // H-5(a): instant while the gate is being wired, timelocked once it is
+    // sealed or the setup window has run out. The action id commits to the mint,
+    // the vault AND the scale, so the 48 h is spent on exactly this binding.
+    if !rerun {
+        let now = solana_program::clock::Clock::get()?.unix_timestamp;
+        if !in_setup_phase(cfg.sealed, cfg.setup_deadline, now) {
+            let action_id =
+                register_asset_action_id(&debridge_id, mint.key, vault.key, bridge_decimals);
+            let gov_ai = next_account_info(it)
+                .map_err(|_| ProgramError::from(GateError::GovernanceNotScheduled))?;
+            consume_governance(program_id, gov_ai, &action_id)?;
+        }
+    }
+
+    // H-5(b): every debridgeId sharing this vault must pay out in the units the
+    // vault was funded in. Before the asset record is written, and on the re-run
+    // path too (the backfill).
+    bind_vault(
+        program_id,
+        owner,
+        vault_binding_ai,
+        system_program,
+        vault.key,
+        &VaultBinding { mint: *mint.key, bridge_decimals },
+    )?;
+
+    if rerun {
+        msg!("asset already registered with these exact values; no-op");
+        return Ok(());
+    }
     if asset_ai.data_is_empty() {
         // M-5 (round 4): a `debridge_id` is public in advance, so an attacker
         // could pre-fund every plausible asset PDA and `create_account` would
@@ -2238,29 +2578,38 @@ fn process_register_asset(
             bump,
             space,
         )?;
-    } else if asset_ai.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    } else {
-        // H-1: WRITE-ONCE, exactly as `Gate.sol::setLocalToken` is.
-        //
-        // A claim commits to `debridge_id` — never to the mint or the vault — so
-        // the binding read at claim time decides what is actually paid out. If it
-        // could be repointed, an owner (or a compromised owner key) could let
-        // validators sign a transfer of asset X and then have those very same
-        // signatures release asset Y from a different vault, with no change to
-        // anything the validators attested.
-        //
-        // Registering a NEW corridor stays an ordinary owner action; changing a
-        // live one must not exist. Route a different asset through a fresh
-        // debridge_id instead.
-        let existing = decode_asset_config(&asset_ai.data.borrow())?;
-        if !asset_write_allowed(&existing, &record)? {
-            msg!("asset already registered with these exact values; no-op");
-            return Ok(());
-        }
     }
     record.serialize(&mut &mut asset_ai.data.borrow_mut()[..])?;
     msg!("asset registered for debridge_id");
+    Ok(())
+}
+
+/// Accounts: [config(w), owner(s)]
+///
+/// H-5: end the setup phase. From here on a NEW asset binding waits out
+/// [`GOVERNANCE_DELAY`] behind `ScheduleGovernance`, and `claim` will release
+/// funds. IRREVERSIBLE, for the reason `Gate.seal` is: an owner who could
+/// un-seal would hold the delay only nominally.
+///
+/// Call it as the last wiring step and BEFORE provisioning vault liquidity — an
+/// unsealed gate that holds funds is the drain this finding is about. The order
+/// is safe because `claim` is refused until this lands, so nothing can be
+/// delivered into an unsealed gate in the meantime either.
+fn process_seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let owner = next_account_info(it)?;
+
+    let mut cfg = load_config(program_id, config_ai)?;
+    if owner.key != &cfg.owner || !owner.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if cfg.sealed {
+        return Err(GateError::AlreadySealed.into());
+    }
+    cfg.sealed = true;
+    cfg.store(config_ai)?;
+    msg!("gate sealed: a new asset binding now waits out GOVERNANCE_DELAY");
     Ok(())
 }
 
@@ -2729,6 +3078,8 @@ mod c1_tests {
                 max_validators: v,
                 max_corridors: c,
                 nonce_to: (0..c as u64).map(|i| (1000 + i, i)).collect(),
+                sealed: true,
+                setup_deadline: 0,
             };
             let actual = borsh::to_vec(&cfg).expect("serialize").len();
             assert_eq!(
@@ -2737,6 +3088,89 @@ mod c1_tests {
                 "config_space must match real Borsh output at capacity {v}/{c}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // H-5: the setup phase, the asset action id, and vault uniqueness
+    // -----------------------------------------------------------------------
+
+    /// The phase has to end on its OWN, not only when an operator remembers to
+    /// seal — that half is the EVM side's finding M-1, and it is why the deadline
+    /// exists next to the flag.
+    #[test]
+    fn the_setup_phase_ends_on_whichever_comes_first() {
+        let deadline = 1_000_000i64;
+        // Open: unsealed, before the deadline.
+        assert!(in_setup_phase(false, deadline, deadline - 1));
+        assert!(in_setup_phase(false, deadline, deadline), "the deadline itself is inclusive");
+        // Closed by the operator.
+        assert!(!in_setup_phase(true, deadline, deadline - 1));
+        // Closed by the clock, with nobody having sealed anything.
+        assert!(!in_setup_phase(false, deadline, deadline + 1));
+    }
+
+    /// The field is appended to a struct that is already live, so the bytes past
+    /// an existing `Config` decide how an existing gate behaves. They are zero.
+    #[test]
+    fn a_zero_deadline_reads_as_expired_not_as_forever() {
+        // What a gate deployed before H-5 decodes: sealed=false, deadline=0. It
+        // must land on the DELAYED path, never on an instant one that never ends.
+        assert!(!in_setup_phase(false, 0, 0));
+        assert!(!in_setup_phase(false, 0, 1));
+        assert!(!in_setup_phase(false, 0, i64::MAX));
+    }
+
+    /// A matured approval must authorise ONE binding: this vault, this mint, this
+    /// scale. Both drains in H-5 are a change to one of those three.
+    #[test]
+    fn the_asset_action_id_commits_to_every_field_the_binding_decides() {
+        let id = [7u8; 32];
+        let mint = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        let base = register_asset_action_id(&id, &mint, &vault, 6);
+
+        assert_eq!(base, register_asset_action_id(&id, &mint, &vault, 6), "must be deterministic");
+        // (a) the scale — an approval for 6 cannot be spent at 3, which is the
+        // 1000x payout.
+        assert_ne!(base, register_asset_action_id(&id, &mint, &vault, 3));
+        // (b) the vault — an approval cannot be redirected onto a funded one.
+        assert_ne!(base, register_asset_action_id(&id, &mint, &Pubkey::new_unique(), 6));
+        assert_ne!(base, register_asset_action_id(&id, &Pubkey::new_unique(), &vault, 6));
+        assert_ne!(base, register_asset_action_id(&[8u8; 32], &mint, &vault, 6));
+        // And it cannot collide with the other two action families.
+        assert_ne!(base, add_validator_action_id(&[0u8; 20]));
+        assert_ne!(base, lower_threshold_action_id(6));
+    }
+
+    /// H-5(b). `asset_write_allowed` blocks repointing an id; it says nothing
+    /// about a NEW id aimed at a vault that is already full. This is that check —
+    /// and the first case is the one that makes "one asset per vault", which the
+    /// finding asks for, the wrong rule.
+    #[test]
+    fn a_vault_backs_one_mint_at_one_scale() {
+        let mint = Pubkey::new_unique();
+        let bound = VaultBinding { mint, bridge_decimals: 6 };
+
+        // THE LEGITIMATE CASE the naive rule would have broken: a vault backs one
+        // asset arriving from several source chains, so several debridgeIds share
+        // it. They agree on the mint and the scale, which is all that matters.
+        assert_eq!(vault_binding_allowed(Some(&bound), &bound), Ok(()));
+        // An uncommitted vault.
+        assert_eq!(vault_binding_allowed(None, &bound), Ok(()));
+        // The amplification: a new id on this vault at a scale three digits low
+        // would pay 1000x out of it on the first transfer.
+        assert_eq!(
+            vault_binding_allowed(Some(&bound), &VaultBinding { mint, bridge_decimals: 3 }),
+            Err(GateError::VaultAssetMismatch)
+        );
+        // And a different mint cannot borrow this vault's liquidity.
+        assert_eq!(
+            vault_binding_allowed(
+                Some(&bound),
+                &VaultBinding { mint: Pubkey::new_unique(), bridge_decimals: 6 }
+            ),
+            Err(GateError::VaultAssetMismatch)
+        );
     }
 
     // `send` can no longer create a corridor — that is governance-only now, which
@@ -2876,6 +3310,8 @@ mod c1_tests {
             max_validators: 32,
             max_corridors: 8,
             nonce_to: vec![],
+            sealed: true,
+            setup_deadline: 0,
         }
     }
 

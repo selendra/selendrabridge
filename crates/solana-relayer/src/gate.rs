@@ -71,6 +71,14 @@ pub struct ConfigTail {
     pub max_validators: u32,
     pub max_corridors: u32,
     pub nonce_to: Vec<(u64, u64)>,
+    /// H-5: is the asset registry final? Until it is, `claim` releases nothing
+    /// and a new binding needs no timelock. Appended to the program's `Config`,
+    /// so a gate deployed before H-5 reads the zero padding past its stored body
+    /// — `false`, `0` — which is the fail-closed reading in both cases.
+    pub sealed: bool,
+    /// H-5: when the instant-registration phase ends on its own. ZERO MEANS
+    /// EXPIRED, not "no deadline".
+    pub setup_deadline: i64,
 }
 
 /// Decode the leading fields of the gate's `Config` account, returning the

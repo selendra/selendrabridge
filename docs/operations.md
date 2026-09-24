@@ -239,7 +239,8 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
 - **The value can only be the minimum across the mesh.** Adding a chain where the asset has FEWER decimals than the current bridge decimals needs a new generation: registrations are write-once, and lowering the value on existing gates would re-denominate in-flight transfers.
 - **Amounts in the store, indexer, keeper and API are wire amounts.** Format them with `bridgeDecimals` (returned on submissions, history rows and registry tokens).
 - **`send` refuses dust.** An amount that is not a whole multiple of `10^(tokenDecimals − bridgeDecimals)` reverts `InexactAmount` (Solana: `Custom(22)`). The UI rounds its Max button and names the limit.
-- **`gate-admin register-asset` requires `--bridge-decimals`**, and `gate-admin send --amount` is in the mint's decimals.
+- **`gate-admin register-asset` requires `--bridge-decimals`**, and `gate-admin send --amount` is in the mint's decimals. Read back what actually landed with `gate-admin asset-status --debridge-id 0x..`: it prints the stored mint, vault, bridge decimals and bridge unit, and whether the vault carries its H-5 commitment. The deploy script now does this after every registration and dies on a mismatch — the binding is write-once, so a wrong scale makes that corridor permanently unsettleable.
+- **Seal the Solana gate, and seal it last.** Since H-5 `claim` returns `NotSealed` (`Custom(26)`) until `gate-admin seal` has run, and afterwards a new asset binding needs `gate-admin schedule-governance --register-asset --debridge-id … --mint … --vault … --bridge-decimals …` plus the 48 h delay. `deploy-from-json.sh` runs it (honouring `gate.seal`); a gate left unsealed takes transfers and settles none of them.
 
 ---
 

@@ -3,9 +3,14 @@
 The H-2 fix changes the submissionId format, so it cannot go onto mesh9 — its
 gates are sealed and hold the old format. mesh10 is a fresh generation.
 
-Everything below is **staged and verified locally**; the only thing missing is
-permission to send real transactions. The sandbox refused the deploy with
-`[Real-World Transactions]`, so the commands are written out rather than run.
+**Status, 2026-09-24: mesh10 is LIVE, EVM and Solana.** All four routes were
+proved on it — EVM↔EVM, EVM→Solana, Solana→EVM, and a same-chain swap on each VM.
+The staging notes below are kept because they are the record of how it was wired
+and of the traps that cost two attempts; where a step says "not staged", it has
+since been done.
+
+**One thing is outstanding: the H-5 program upgrade on the Solana gate.** See
+"H-5: upgrading the live Solana gate" at the end.
 
 ## What is already done
 
@@ -143,3 +148,53 @@ the real backend, the real UI:
 
 Not covered locally: EVM↔Solana legs (no local Solana mesh wired up) and the
 same-chain swap UI test (the local pool lists one token).
+
+## H-5: upgrading the live Solana gate
+
+The gate program deployed on 2026-09-24 predates the H-5 fix, so on it
+`RegisterAsset` is still instant and unilateral and there is no `Seal`. The fix is
+in the tree and tested (audit report, "Fixes applied 2026-09-24"); what is left is
+an on-chain upgrade of `AJXTvmc4evk96wyWGhD2762S1bcq1qfiWwQpKHb2fD38` plus a
+backfill, because **the upgrade alone leaves the vault check inert**: the existing
+asset records have no `["vault", vault]` commitment, so a mis-scaled second
+`debridgeId` on a funded vault is still reachable until they exist.
+
+Backfilling is deliberately cheap — an identical re-registration consumes no
+governance schedule, because it changes nothing the timelock protects.
+
+```bash
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+cargo build-sbf --manifest-path crates/solana-gate/Cargo.toml   # 250,384 bytes
+
+GA=crates/solana-relayer/target/release/gate-admin
+PROG=AJXTvmc4evk96wyWGhD2762S1bcq1qfiWwQpKHb2fD38
+export SOL_RPC='<the Helius URL>'        # --rpc-env, never --rpc: the key would land in ps
+
+solana program deploy --program-id "$PROG" \
+  crates/solana-gate/target/deploy/solana_gate.so \
+  --use-rpc --keypair .solana/payer.json --url "$SOL_RPC"
+
+# Backfill: 6 registrations (2 assets × 3 source chains). Ids and vaults are in
+# config/deployments/testnet-mesh10.json under .solana.assets[].registrations.
+$GA --rpc-env SOL_RPC --keypair .solana/payer.json --program "$PROG" \
+  register-asset --debridge-id <ID> --mint <MINT> --vault <VAULT> --bridge-decimals <D>
+$GA --rpc-env SOL_RPC --keypair .solana/payer.json --program "$PROG" \
+  asset-status --debridge-id <ID>        # expect "committed to : mint … at scale D"
+
+# LAST. claim is refused until this lands.
+$GA --rpc-env SOL_RPC --keypair .solana/payer.json --program "$PROG" seal
+$GA --rpc-env SOL_RPC --keypair .solana/payer.json --program "$PROG" show   # sealed : true
+```
+
+Between the upgrade and `seal`, the Solana leg cannot claim. That is a halt, not a
+strand: nothing is burned and every transfer stays claimable afterwards. Do it in
+one sitting, and do not start it with transfers in flight towards Solana.
+
+Two notes on the upgrade itself, both learned the hard way on this deployment:
+`--use-rpc` is required (the default TPU path fails on Helius), and a failed
+deploy leaves an orphaned buffer holding ~2 SOL — recover it with
+`solana program show --buffers` then `solana program close <BUFFER>`.
+
+Afterwards, `deploy-from-json.sh` needs no change to stay correct: it reads back
+every registration with `asset-status`, dies if the stored scale disagrees with the
+EVM gates, and runs `seal` as the last gate step.

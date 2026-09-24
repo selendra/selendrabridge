@@ -25,12 +25,17 @@
 //!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey> --bridge-decimals N
 //!                    (N = the asset's mesh-wide bridge decimals; the SAME value every
 //!                    EVM gate registered with setBridgeDecimals)
+//!                    (past the setup phase this needs a matured schedule — see below)
+//!     seal           end the setup phase: IRREVERSIBLE, and required before the
+//!                    gate will claim anything
 //!     set-threshold --threshold N            (a DECREASE needs a matured schedule)
 //!     set-validator --validator 0x.. --active <bool>
 //!                                            (an ADDITION needs a matured schedule)
-//!     schedule-governance (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
-//!     cancel-governance   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
-//!     governance-status   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
+//!     schedule-governance (--add-validator 0x.. | --lower-threshold N | --action-id 0x..
+//!                          | --register-asset --debridge-id 0x.. --mint <pubkey>
+//!                            --vault <pubkey> --bridge-decimals N)
+//!     cancel-governance   (same selectors)
+//!     governance-status   (same selectors)
 //!     send --debridge-id 0x.. --amount N --chain-id-to N --receiver 0x..
 //!          --from-token-account <pubkey>
 //!     cancel --submission-id 0x.. --debridge-id 0x.. --wire-amount N --bridge-decimals N
@@ -42,6 +47,8 @@
 //!                                             read from the ["sent", id] record)
 //!            --signature 0x.. [--signature 0x..]
 //!     digest --submission-id 0x.. — print the cancel/refund digests to sign
+//!     asset-status --debridge-id 0x.. — what the gate has bound for that id, and
+//!                    what its vault is committed to (H-5). Read-only.
 //!     show
 //!
 //! AMOUNTS: `send --amount` is in MINT units (the program scales it down).
@@ -72,14 +79,31 @@
 //! RAISING the threshold are instant. `set-validator`/`set-threshold` print the
 //! action id they need, so a refused call tells you what to schedule.
 //!
+//! ## The setup phase (audit round 5, H-5)
+//!
+//! Binding an asset decides which mint and vault back a `debridgeId` AND at what
+//! wire scale, so past the setup phase it is power-granting too: a scale one digit
+//! low pays a power of ten out of the vault on an ordinary user's transfer, and a
+//! fresh `debridgeId` aimed at an already-funded vault drains it outright. So
+//! `register-asset` is instant only while the gate is in its setup phase — before
+//! `seal` and within `SETUP_WINDOW` of `init` — and behind the 48 h timelock after
+//! that. `register-asset` prints the action id it needs, and
+//! `schedule-governance --register-asset …` schedules exactly it.
+//!
+//! `claim` is refused until `seal` lands, so the wiring order is: init →
+//! register-corridor → register-asset → **seal** → fund the vaults.
+//!
+//! A vault backs exactly ONE asset: a second `debridgeId` naming a vault already
+//! recorded in `["vault", vault]` is refused (`Custom(28)`).
+//!
 //! The program UPGRADE authority cannot be timelocked by the program itself:
 //! put it behind a Squads / SPL-Governance timelock before any production use.
 
 use std::str::FromStr;
 
 use bridge_solana::instruction::{
-    add_validator_action_id, lower_threshold_action_id, GateInstruction, GovernanceSchedule,
-    InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS,
+    add_validator_action_id, lower_threshold_action_id, register_asset_action_id, GateInstruction,
+    GovernanceSchedule, InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS,
 };
 use borsh::BorshDeserialize as _;
 use solana_relayer::gate::{
@@ -115,14 +139,43 @@ fn parse_sigs(args: &Args) -> anyhow::Result<Vec<Vec<u8>>> {
 /// `governance-status` call names: exactly one of `--add-validator 0x..`,
 /// `--lower-threshold N` or a raw `--action-id 0x..`.
 fn governance_action_id(args: &Args) -> anyhow::Result<[u8; 32]> {
+    // H-5: the asset-binding action id is built from four values rather than one,
+    // so it gets its own selector instead of another slot in the tuple below.
+    if args.has("--register-asset") {
+        return Ok(register_asset_action(args)?.0);
+    }
     match (args.get("--add-validator"), args.get("--lower-threshold"), args.get("--action-id")) {
         (Some(v), None, None) => Ok(add_validator_action_id(&hex20(&v)?)),
         (None, Some(t), None) => Ok(lower_threshold_action_id(t.parse()?)),
         (None, None, Some(a)) => hex32(&a),
         _ => anyhow::bail!(
-            "name exactly one action: --add-validator 0x.. | --lower-threshold N | --action-id 0x.."
+            "name exactly one action: --add-validator 0x.. | --lower-threshold N | \
+             --action-id 0x.. | --register-asset (with --debridge-id/--mint/--vault/--bridge-decimals)"
         ),
     }
+}
+
+/// The four values an asset binding commits to, and the action id over them
+/// (H-5). Shared by `register-asset` and the `--register-asset` governance
+/// selector so the id a refused call prints is provably the one that schedules it.
+fn register_asset_action(args: &Args) -> anyhow::Result<([u8; 32], [u8; 32], Pubkey, Pubkey, u8)> {
+    let debridge_id = hex32(&args.req("--debridge-id")?)?;
+    let mint = Pubkey::from_str(&args.req("--mint")?)?;
+    let vault = Pubkey::from_str(&args.req("--vault")?)?;
+    // Required, never defaulted: a wrong value scales every transfer of the asset
+    // by a power of ten, and the binding is write-once.
+    let bridge_decimals: u8 = args
+        .req("--bridge-decimals")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--bridge-decimals: {e}"))?;
+    let action_id =
+        register_asset_action_id(&debridge_id, &mint.to_bytes(), &vault.to_bytes(), bridge_decimals);
+    Ok((action_id, debridge_id, mint, vault, bridge_decimals))
+}
+
+/// The H-5(b) vault-binding record: which `debridgeId` a vault backs.
+fn vault_binding_pda(program_id: &Pubkey, vault: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"vault", vault.as_ref()], program_id).0
 }
 
 fn gov_pda(program_id: &Pubkey, action_id: &[u8; 32]) -> Pubkey {
@@ -145,6 +198,10 @@ impl Args {
     }
     fn req(&self, name: &str) -> anyhow::Result<String> {
         self.get(name).ok_or_else(|| anyhow::anyhow!("missing required flag {name}"))
+    }
+    /// A bare flag with no value, e.g. `--register-asset`.
+    fn has(&self, name: &str) -> bool {
+        self.0.iter().any(|a| a == name)
     }
 }
 
@@ -197,6 +254,65 @@ fn run() -> anyhow::Result<()> {
         println!("Validators sign the EIP-191 digest of the id above — the same");
         println!("`personal_sign` shape as the EVM side, so `cast wallet sign` works:");
         println!("  cast wallet sign --private-key <key> <cancelId|refundId>");
+        return Ok(());
+    }
+
+    // H-5: what is actually on chain for an asset. A deploy that registered the
+    // wrong `--bridge-decimals` produces a gate that signs and quotes normally and
+    // then pays out a power of ten wrong (or, with the H-2 check, cannot settle at
+    // all), so the read-back is worth a command of its own.
+    if cmd == "asset-status" {
+        use bridge_solana::account::{decode, AssetAccount, VaultBindingAccount};
+        let debridge_id = hex32(&args.req("--debridge-id")?)?;
+        let (asset_pda, _) = Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
+        println!("debridgeId : 0x{}", hex::encode(debridge_id));
+        println!("asset PDA  : {asset_pda}");
+        match rpc.get_account(&asset_pda) {
+            Ok(acct) if acct.owner == program_id => {
+                match decode::<AssetAccount>(&acct.data) {
+                    Some(a) => {
+                        let mint = Pubkey::new_from_array(a.mint);
+                        let vault = Pubkey::new_from_array(a.vault);
+                        println!("  mint           : {mint}");
+                        println!("  vault          : {vault}");
+                        println!("  bridge decimals: {}", a.bridge_decimals);
+                        println!("  mint decimals  : {}", a.local_decimals);
+                        println!(
+                            "  bridge unit    : {}",
+                            a.bridge_unit().map(|u| u.to_string()).unwrap_or_else(|| "OVERFLOW".into())
+                        );
+                        // The H-5(b) commitment. Every debridgeId sharing this
+                        // vault must agree with it, and a gate registered before
+                        // H-5 has none until `register-asset` is re-run.
+                        let binding_pda = vault_binding_pda(&program_id, &vault);
+                        println!("  vault binding  : {binding_pda}");
+                        match rpc.get_account(&binding_pda) {
+                            Ok(b) if b.owner == program_id => match decode::<VaultBindingAccount>(&b.data) {
+                                Some(vb) => {
+                                    println!(
+                                        "    committed to : mint {} at scale {}",
+                                        Pubkey::new_from_array(vb.mint),
+                                        vb.bridge_decimals
+                                    );
+                                    if vb.mint != a.mint || vb.bridge_decimals != a.bridge_decimals {
+                                        println!("    MISMATCH against the asset record above");
+                                    }
+                                }
+                                None => println!("    UNREADABLE (layout drift?)"),
+                            },
+                            _ => println!(
+                                "    NOT COMMITTED — a pre-H-5 registration. Re-run \
+                                 `register-asset` with these exact values to backfill it \
+                                 (no schedule needed: an identical write is a no-op)"
+                            ),
+                        }
+                    }
+                    None => println!("  UNREADABLE (layout drift between program and gate-admin?)"),
+                }
+            }
+            Ok(_) => println!("  NOT REGISTERED (an account exists but the program does not own it)"),
+            Err(_) => println!("  NOT REGISTERED"),
+        }
         return Ok(());
     }
 
@@ -283,6 +399,39 @@ fn run() -> anyhow::Result<()> {
                                 for (chain, nonce) in &t.nonce_to {
                                     println!("    -> chain {chain}  next nonce {nonce}");
                                 }
+                                // H-5. An unsealed gate cannot claim at all, and
+                                // the runbook step that fixes it is one command,
+                                // so say which state this is in plain words.
+                                println!("  sealed       : {}", t.sealed);
+                                if t.sealed {
+                                    println!("    asset bindings are timelocked; claim is enabled");
+                                } else if t.setup_deadline == 0 {
+                                    // A deadline of 0 is not something an H-5 `init`
+                                    // can produce (it always stores now + 7 days), so
+                                    // these 9 bytes came from the account's rent
+                                    // padding: the config was written by an older
+                                    // program. Which of the two states that means
+                                    // depends on the program deployed RIGHT NOW,
+                                    // which this account cannot say — so say both
+                                    // rather than assert the wrong one.
+                                    println!(
+                                        "    written by a pre-H-5 program (setup_deadline 0 is padding, not a date)"
+                                    );
+                                    println!(
+                                        "    -> if the deployed program HAS H-5: bindings are timelocked and \
+                                         CLAIM IS REFUSED until `seal`"
+                                    );
+                                    println!(
+                                        "    -> if it does not: there is no seal rule at all, and \
+                                         `register-asset` is still instant and unilateral"
+                                    );
+                                } else {
+                                    println!(
+                                        "    setup phase until {} — bindings are instant, and \
+                                         CLAIM IS REFUSED until `seal`",
+                                        t.setup_deadline
+                                    );
+                                }
                             }
                             Err(e) => println!("  capacity/corridors UNREADABLE: {e}"),
                         }
@@ -348,18 +497,19 @@ fn run() -> anyhow::Result<()> {
                 AccountMeta::new_readonly(payer.pubkey(), true),
             ],
         ),
+        // H-5: instant during the setup phase, timelocked after `seal`. The gov
+        // account is ALWAYS attached so one command works in both states, and the
+        // action id is printed so a refused call tells you what to schedule.
         "register-asset" => {
-            let debridge_id = hex32(&args.req("--debridge-id")?)?;
-            let mint = Pubkey::from_str(&args.req("--mint")?)?;
-            let vault = Pubkey::from_str(&args.req("--vault")?)?;
-            // Required, never defaulted: a wrong value scales every transfer of
-            // the asset by a power of ten, and the binding is write-once.
-            let bridge_decimals: u8 = args
-                .req("--bridge-decimals")?
-                .parse()
-                .map_err(|e| anyhow::anyhow!("--bridge-decimals: {e}"))?;
+            let (action_id, debridge_id, mint, vault, bridge_decimals) =
+                register_asset_action(&args)?;
             let (asset_pda, _) =
                 Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
+            println!("registerAsset action id: 0x{}", hex::encode(action_id));
+            println!(
+                "(past the setup phase this needs `schedule-governance --register-asset …` {}h earlier)",
+                GOVERNANCE_DELAY_SECS / 3600
+            );
             (
                 GateInstruction::RegisterAsset { debridge_id, bridge_decimals }.to_bytes(),
                 vec![
@@ -370,6 +520,20 @@ fn run() -> anyhow::Result<()> {
                     AccountMeta::new_readonly(vault, false),
                     AccountMeta::new_readonly(Pubkey::from_str(SPL_TOKEN)?, false),
                     AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                    AccountMeta::new(vault_binding_pda(&program_id, &vault), false),
+                    AccountMeta::new(gov_pda(&program_id, &action_id), false),
+                ],
+            )
+        }
+        // H-5: IRREVERSIBLE. Also the step that makes the gate able to claim.
+        "seal" => {
+            println!("sealing {program_id}: asset bindings become timelocked, claim becomes possible");
+            println!("this cannot be undone — a gate that could un-seal would hold the delay in name only");
+            (
+                GateInstruction::Seal.to_bytes(),
+                vec![
+                    AccountMeta::new(config_pda, false),
+                    AccountMeta::new_readonly(payer.pubkey(), true),
                 ],
             )
         }

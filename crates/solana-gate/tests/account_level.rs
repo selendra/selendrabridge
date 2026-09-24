@@ -113,6 +113,10 @@ async fn setup_with_validators(
         max_validators,
         max_corridors,
         nonce_to: Vec::new(),
+        // H-5: a LIVE gate — wiring finished, setup phase closed. Anything that
+        // pays out needs this, and a test that wanted the open phase says so.
+        sealed: true,
+        setup_deadline: 0,
     };
     let space = config_space(max_validators, max_corridors);
     let mut data = vec![0u8; space];
@@ -749,6 +753,7 @@ fn the_host_mirror_encodes_every_instruction_the_program_decodes() {
         (host::GateInstruction::SetGuardian { guardian: [5u8; 32] }, "SetGuardian"),
         (host::GateInstruction::ScheduleGovernance { action_id: [0xA1; 32] }, "ScheduleGovernance"),
         (host::GateInstruction::CancelScheduledGovernance { action_id: [0xA2; 32] }, "CancelScheduledGovernance"),
+        (host::GateInstruction::Seal, "Seal"),
     ];
     for (host_ix, name) in cases {
         let bytes = host_ix.to_bytes();
@@ -774,6 +779,22 @@ fn the_host_mirror_encodes_every_instruction_the_program_decodes() {
     assert_eq!(
         borsh::to_vec(&GateInstruction::CancelScheduledGovernance { action_id: [0; 32] }).unwrap()[0],
         13
+    );
+    // H-5's `Seal` is the round-5 addition and must sit at 14 on both sides.
+    assert_eq!(host::GateInstruction::Seal.to_bytes()[0], 14);
+    assert_eq!(borsh::to_vec(&GateInstruction::Seal).unwrap()[0], 14);
+
+    // The asset action id is built independently on each side (Pubkey vs raw
+    // bytes, `keccak::hashv` vs a concatenated buffer), so it can drift silently:
+    // the schedule would land at one address and the consume would look at
+    // another, and `register-asset` would be permanently unschedulable on a
+    // sealed gate. Pin them against each other.
+    let mint = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    assert_eq!(
+        solana_gate::register_asset_action_id(&[0xC3; 32], &mint, &vault, 6),
+        host::register_asset_action_id(&[0xC3; 32], &mint.to_bytes(), &vault.to_bytes(), 6),
+        "the host mirror's registerAsset action id diverged from the program's"
     );
 }
 
@@ -1108,6 +1129,11 @@ fn vault_authority() -> Pubkey {
     Pubkey::find_program_address(&[b"vault_authority"], &PROGRAM_ID).0
 }
 
+/// H-5(b): the record of which `debridgeId` a vault backs.
+fn vault_binding_pda(vault: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"vault", vault.as_ref()], &PROGRAM_ID).0
+}
+
 fn asset_pda(debridge_id: &[u8; 32]) -> Pubkey {
     Pubkey::find_program_address(&[b"asset", debridge_id], &PROGRAM_ID).0
 }
@@ -1223,6 +1249,8 @@ async fn setup_with_asset_decimals(
         max_validators: 8,
         max_corridors: 4,
         nonce_to: vec![(DEST_CHAIN, 0)], // corridor pre-registered
+        sealed: true,  // H-5: claim releases nothing on an unsealed gate
+        setup_deadline: 0,
     };
     let mut cfg_data = vec![0u8; config_space(8, 4)];
     cfg.serialize(&mut &mut cfg_data[..]).unwrap();
@@ -1599,6 +1627,10 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
             max_validators: 8,
             max_corridors: 4,
             nonce_to: vec![],
+            // H-5: registering an asset in ONE transaction is the setup phase,
+            // which these tests are exercising.
+            sealed: false,
+            setup_deadline: i64::MAX,
         };
         let mut cfg_data = vec![0u8; config_space(8, 4)];
         cfg.serialize(&mut &mut cfg_data[..]).unwrap();
@@ -1632,6 +1664,7 @@ async fn register_asset_refuses_a_vault_someone_else_can_move() {
                 AccountMeta::new_readonly(vault, false),
                 AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new(vault_binding_pda(&vault), false),
             ],
         );
 
@@ -1686,6 +1719,8 @@ async fn a_registered_asset_cannot_be_repointed() {
         max_validators: 8,
         max_corridors: 4,
         nonce_to: vec![],
+        sealed: false,             // H-5: the setup phase, where this is instant
+        setup_deadline: i64::MAX,
     };
     let mut cfg_data = vec![0u8; config_space(8, 4)];
     cfg.serialize(&mut &mut cfg_data[..]).unwrap();
@@ -1727,6 +1762,7 @@ async fn a_registered_asset_cannot_be_repointed() {
                 AccountMeta::new_readonly(vault, false),
                 AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new(vault_binding_pda(&vault), false),
             ],
         )
     };
@@ -1802,6 +1838,8 @@ async fn register_asset_succeeds_when_the_pda_was_pre_funded_by_a_griefer() {
         max_validators: 8,
         max_corridors: 4,
         nonce_to: vec![],
+        sealed: false,             // H-5: the setup phase, where this is instant
+        setup_deadline: i64::MAX,
     };
     let mut cfg_data = vec![0u8; config_space(8, 4)];
     cfg.serialize(&mut &mut cfg_data[..]).unwrap();
@@ -1828,6 +1866,7 @@ async fn register_asset_succeeds_when_the_pda_was_pre_funded_by_a_griefer() {
             AccountMeta::new_readonly(vault, false),
             AccountMeta::new_readonly(spl_token::id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new(vault_binding_pda(&vault), false),
         ],
     );
     exec(&mut ctx, instruction, &[&owner])
@@ -2201,4 +2240,391 @@ async fn claim_refuses_a_wire_scale_this_gate_did_not_register() {
     assert_eq!(spl_balance(&recv), 0, "not one unit moved");
     let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
     assert_eq!(spl_balance(&vault), 5_000_000_000, "the vault is untouched");
+}
+
+// ---------------------------------------------------------------------------
+// H-5 (audit round 5), executed: `RegisterAsset` was instant and unilateral for
+// ever, and bound neither the vault nor the scale to anything.
+//
+// The EVM gate already made the same action wait — `Gate.setLocalToken` behind
+// `seal()` + `GOVERNANCE_DELAY` — and the registry is the whole of what stands
+// between an owner key and the vaults. On Solana it stayed a one-transaction
+// owner action, which bought two drains:
+//
+//   (a) a legitimate user's 1 TST send paid out as 1000 TST, for ever, because
+//       the binding named a scale three digits below the mesh's; and
+//   (b) a second, perfectly well-formed debridgeId bound to the LIVE, funded
+//       vault, drained with honest validator signatures over an asset no
+//       validator could tell apart.
+//
+// Nothing below needs a compromised key beyond the owner's, and nothing below
+// was possible to see coming: no schedule, no notice, no guardian veto.
+// ---------------------------------------------------------------------------
+
+/// `GateError::NotSealed` — `Custom(26)`.
+const NOT_SEALED: u32 = 26;
+/// `GateError::AlreadySealed` — `Custom(27)`.
+const ALREADY_SEALED: u32 = 27;
+/// `GateError::VaultAssetMismatch` — `Custom(28)`.
+const VAULT_ASSET_MISMATCH: u32 = 28;
+
+fn seal_ix(owner: Pubkey) -> Instruction {
+    ix(
+        GateInstruction::Seal,
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner, true),
+        ],
+    )
+}
+
+/// `RegisterAsset` with BOTH trailing accounts attached, which is what
+/// `gate-admin` sends: the vault binding (always read) and the governance
+/// schedule (read only once the setup phase is over).
+fn register_asset_ix(
+    owner: Pubkey,
+    debridge_id: [u8; 32],
+    mint: Pubkey,
+    vault: Pubkey,
+    bridge_decimals: u8,
+) -> Instruction {
+    let action = solana_gate::register_asset_action_id(&debridge_id, &mint, &vault, bridge_decimals);
+    ix(
+        GateInstruction::RegisterAsset { debridge_id, bridge_decimals },
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(owner, true),
+            AccountMeta::new(asset_pda(&debridge_id), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new(vault_binding_pda(&vault), false),
+            AccountMeta::new(gov_pda(&action), false),
+        ],
+    )
+}
+
+/// Read the config, apply `f`, write it back. Used to put a fixture into the
+/// pre-H-5 states that no instruction can produce any more — an unsealed live
+/// gate, or one whose `setup_deadline` is the zero a pre-H-5 account decodes to.
+async fn edit_config(ctx: &mut ProgramTestContext, f: impl FnOnce(&mut Config)) {
+    let mut acct = ctx.banks_client.get_account(config_pda()).await.unwrap().unwrap();
+    let mut cfg = Config::deserialize(&mut &acct.data[..]).expect("config decodes");
+    f(&mut cfg);
+    let mut data = vec![0u8; acct.data.len()];
+    cfg.serialize(&mut &mut data[..]).expect("config still fits");
+    acct.data = data;
+    ctx.set_account(&config_pda(), &acct.into());
+}
+
+/// The M-1 half of H-5: an unsealed gate must not pay anything out.
+///
+/// Sealing was a runbook note that no fund-moving instruction consulted, so a
+/// gate that was funded and never sealed kept one-transaction registration for
+/// ever — which is drain (b) sitting there, waiting for the owner key. Refusing
+/// the claim is what makes the step unskippable: an operator cannot run a bridge
+/// that pays out without it.
+#[tokio::test]
+async fn claim_is_refused_until_the_gate_is_sealed() {
+    let (v1, v2, v3) = (Validator::new(1), Validator::new(2), Validator::new(3));
+    let mut fx = setup_with_asset(vec![v1.address, v2.address, v3.address], 2, 1_000, 0).await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+
+    let receiver_token = Pubkey::new_unique();
+    fx.ctx.set_account(
+        &receiver_token,
+        &token_account(fx.mint, Pubkey::new_unique(), 0, COption::None, COption::None).into(),
+    );
+
+    // Back to the state the fixture would have been left in by `init` alone.
+    edit_config(&mut fx.ctx, |c| c.sealed = false).await;
+
+    let args = solana_gate::ClaimArgs {
+        debridge_id: fx.debridge_id,
+        amount: 250,
+        bridge_decimals: FIXTURE_BRIDGE_DECIMALS,
+        chain_id_from: DEST_CHAIN,
+        nonce: 0,
+        receiver: receiver_token.to_bytes().to_vec(),
+        auto: None,
+        native_sender: vec![0x11; 20],
+        signatures: vec![],
+    };
+    let id = claim_submission_id(&args);
+    let accounts = vec![
+        AccountMeta::new_readonly(config_pda(), false),
+        AccountMeta::new_readonly(asset_pda(&fx.debridge_id), false),
+        AccountMeta::new(executed_pda(&id), false),
+        AccountMeta::new(fx.owner.pubkey(), true),
+        AccountMeta::new(fx.vault, false),
+        AccountMeta::new(receiver_token, false),
+        AccountMeta::new_readonly(vault_authority(), false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+    ];
+    let claim = |sigs: Vec<Vec<u8>>| {
+        ix(
+            GateInstruction::Claim(solana_gate::ClaimArgs { signatures: sigs, ..args.clone() }),
+            accounts.clone(),
+        )
+    };
+
+    // A fully valid, threshold-signed claim. The ONLY thing wrong is the gate.
+    let err = exec(&mut fx.ctx, claim(quorum(&[&v1, &v2], &id)), &[&owner])
+        .await
+        .expect_err("an unsealed gate must release nothing");
+    assert!(is_custom(&err, NOT_SEALED), "expected NotSealed, got {err:?}");
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&vault), 1_000, "the vault is untouched");
+    assert!(
+        fx.ctx.banks_client.get_account(executed_pda(&id)).await.unwrap().is_none(),
+        "and the transfer is not burned — it is claimable once the gate is sealed"
+    );
+
+    // Seal it, and the very same claim goes through.
+    exec(&mut fx.ctx, seal_ix(fx.owner.pubkey()), &[&owner]).await.expect("owner may seal");
+    exec(&mut fx.ctx, claim(quorum(&[&v1, &v2], &id)), &[&owner])
+        .await
+        .expect("the same claim must succeed once the registry is final");
+    let recv = fx.ctx.banks_client.get_account(receiver_token).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&recv), 250, "paid out after sealing");
+
+    // Irreversible, for the reason `Gate.seal` is: an owner who could un-seal
+    // would hold the delay in name only.
+    let err = exec(&mut fx.ctx, seal_ix(fx.owner.pubkey()), &[&owner])
+        .await
+        .expect_err("sealing twice must be refused");
+    assert!(is_custom(&err, ALREADY_SEALED), "expected AlreadySealed, got {err:?}");
+}
+
+/// H-5(a), executed: past the setup phase an asset binding waits out the
+/// timelock, and the matured approval is spendable on EXACTLY that binding.
+///
+/// The scale is the payload of the drain: registered three digits low, a 1 TST
+/// send from the mesh pays 1000 TST out of the vault, repeatable until it is
+/// empty, with every validator signature honest. So the action id has to commit
+/// to the scale — which the second half of this test proves by trying to spend
+/// the approval at a different one.
+#[tokio::test]
+async fn registering_an_asset_on_a_sealed_gate_needs_a_matured_schedule() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await; // sealed: a live gate
+    let mint = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    let debridge_id = [0x51u8; 32];
+    ctx.set_account(&mint, &mint_account_with_decimals(9).into());
+    ctx.set_account(
+        &vault,
+        &token_account(mint, vault_authority(), 0, COption::None, COption::None).into(),
+    );
+
+    // 1. The old behaviour: one transaction, no notice, done.
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), debridge_id, mint, vault, 6), &[&owner])
+        .await
+        .expect_err("a sealed gate must not bind an asset instantly");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "expected GovernanceNotScheduled, got {err:?}");
+
+    // 2. Scheduled, but the delay has not run. This is the window the finding
+    //    removed entirely: 48 h in which anyone can read the pending action id
+    //    off the chain and the guardian can cancel it.
+    let action = solana_gate::register_asset_action_id(&debridge_id, &mint, &vault, 6);
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), debridge_id, mint, vault, 6), &[&owner])
+        .await
+        .expect_err("an immature schedule must not be spendable");
+    assert!(is_custom(&err, GOVERNANCE_NOT_READY), "expected GovernanceNotReady, got {err:?}");
+
+    advance_clock(&mut ctx, GOVERNANCE_DELAY + 1).await;
+
+    // 3. THE SUBSTITUTION: the approval matured for scale 6 — spend it at 3, the
+    //    1000x payout. The id is over the scale too, so there is no schedule at
+    //    that address at all.
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), debridge_id, mint, vault, 3), &[&owner])
+        .await
+        .expect_err("an approval for one scale must not bind another");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "expected GovernanceNotScheduled, got {err:?}");
+
+    // 4. The binding that was actually approved goes through.
+    exec(&mut ctx, register_asset_ix(owner.pubkey(), debridge_id, mint, vault, 6), &[&owner])
+        .await
+        .expect("a matured schedule must bind exactly what it named");
+    let stored = ctx.banks_client.get_account(asset_pda(&debridge_id)).await.unwrap().unwrap();
+    let asset = AssetConfig::deserialize(&mut &stored.data[..]).unwrap();
+    assert_eq!(asset.bridge_decimals, 6);
+    assert_eq!(asset.vault, vault);
+
+    // 5. One schedule, one binding. The approval is burned, so it cannot be
+    //    replayed onto anything.
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), [0x52u8; 32], mint, vault, 6), &[&owner])
+        .await
+        .expect_err("a consumed schedule must not authorise a second binding");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "expected GovernanceNotScheduled, got {err:?}");
+}
+
+/// H-5(b), executed: every debridgeId sharing a vault pays out in the same units.
+///
+/// The finding asks for one asset per vault, and this bridge cannot have that
+/// rule: a `debridgeId` is `keccak(sourceChainId, sourceToken)`, so the same SPL
+/// mint behind mesh10's three EVM chains is THREE ids against ONE vault, all
+/// correct. The first half of this test is that fan-out — it is the regression
+/// test for the naive rule, which would have let the Solana leg accept TST from
+/// exactly one chain.
+///
+/// What IS checkable is the amplification, and it is what the drain uses:
+/// `asset_write_allowed` blocks repointing an id that exists and says nothing
+/// about a NEW one, so the owner binds a fresh, well-formed id to the live,
+/// FUNDED vault at a scale three digits low — and the first honest transfer pays
+/// 1000x out of it.
+#[tokio::test]
+async fn a_second_debridge_id_on_a_live_vault_cannot_change_the_mint_or_the_scale() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    edit_config(&mut ctx, |c| {
+        c.sealed = false;
+        c.setup_deadline = i64::MAX; // the setup phase, where this was instant
+    })
+    .await;
+
+    let mint = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    ctx.set_account(&mint, &mint_account_with_decimals(9).into());
+    // The real vault, with real liquidity in it.
+    ctx.set_account(
+        &vault,
+        &token_account(mint, vault_authority(), 750_000_000, COption::None, COption::None).into(),
+    );
+
+    // 1. THE LEGITIMATE FAN-OUT: one asset, one vault, one id per source chain.
+    //    All three must register.
+    let from_chains = [[0xA0u8; 32], [0xA1u8; 32], [0xA2u8; 32]];
+    for did in from_chains {
+        exec(&mut ctx, register_asset_ix(owner.pubkey(), did, mint, vault, 6), &[&owner])
+            .await
+            .unwrap_or_else(|e| panic!("a source chain's own debridgeId must register: {e:?}"));
+    }
+    let binding = ctx.banks_client.get_account(vault_binding_pda(&vault)).await.unwrap().unwrap();
+    assert_eq!(binding.owner, PROGRAM_ID);
+    let bound = solana_gate::VaultBinding::deserialize(&mut &binding.data[..]).unwrap();
+    assert_eq!(bound.mint, mint);
+    assert_eq!(bound.bridge_decimals, 6, "the vault is committed to the units it holds");
+
+    // 2. THE AMPLIFICATION: a fourth id on the same funded vault at scale 3. On a
+    //    9-decimal mint that is a 10^6 multiplier on every claim.
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), [0xE0u8; 32], mint, vault, 3), &[&owner])
+        .await
+        .expect_err("a mis-scaled id must not be bound to a live vault");
+    assert!(is_custom(&err, VAULT_ASSET_MISMATCH), "expected VaultAssetMismatch, got {err:?}");
+    assert!(
+        ctx.banks_client.get_account(asset_pda(&[0xE0u8; 32])).await.unwrap().is_none(),
+        "and no shadow asset record exists to claim against"
+    );
+
+    // 3. Nor can a different mint borrow this vault's liquidity — and this one is
+    //    refused EARLIER, by the C1 check that the vault's own SPL `mint` field
+    //    must equal the mint being registered. So `VaultBinding::mint` never gets
+    //    to speak: it is recorded to make the commitment self-describing, not
+    //    because this path could otherwise reach it.
+    let other_mint = Pubkey::new_unique();
+    ctx.set_account(&other_mint, &mint_account_with_decimals(9).into());
+    let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), [0xE1u8; 32], other_mint, vault, 6), &[&owner])
+        .await
+        .expect_err("a different mint must not share a committed vault");
+    assert!(
+        format!("{err:?}").contains("InvalidAccountData"),
+        "expected the vault/mint check to refuse it first, got {err:?}"
+    );
+
+    // 4. A separate vault for the same mint at a DIFFERENT scale is still allowed:
+    //    this commits a vault, not a mint. (Whether that is wise is the operator's
+    //    call; the program only refuses to mix units inside one pot of funds.)
+    let second_vault = Pubkey::new_unique();
+    ctx.set_account(
+        &second_vault,
+        &token_account(mint, vault_authority(), 0, COption::None, COption::None).into(),
+    );
+    exec(&mut ctx, register_asset_ix(owner.pubkey(), [0xB0u8; 32], mint, second_vault, 3), &[&owner])
+        .await
+        .expect("a fresh vault carries its own commitment");
+
+    // 5. And the fan-out is still the idempotent no-op deploy scripts re-run.
+    exec(&mut ctx, register_asset_ix(owner.pubkey(), from_chains[0], mint, vault, 6), &[&owner])
+        .await
+        .expect("re-registering an identical binding must stay a no-op");
+}
+
+/// The upgrade path for a gate that is ALREADY live, which is the case that
+/// decides whether this fix is deployable at all.
+///
+/// A gate registered by a pre-H-5 build has asset records and funded vaults but
+/// no `["vault", vault]` bindings — so on the upgrade alone, drain (b) is still
+/// open: the attacker's fresh debridgeId finds an unbound vault and takes it.
+/// Closing it must not require a 48 h wait per asset, because that IS the window.
+///
+/// So re-running `register-asset` with the values already stored backfills the
+/// binding and consumes no schedule: an identical write changes nothing the
+/// timelock protects. That is the one-command migration, and this proves both
+/// halves of it — the backfill lands, and the drain is shut afterwards.
+#[tokio::test]
+async fn re_registering_a_pre_h5_asset_backfills_its_vault_binding_with_no_schedule() {
+    let (v1, v2) = (Validator::new(1), Validator::new(2));
+    // The fixture writes the asset record directly, exactly as the old program
+    // left it: no vault binding anywhere.
+    let mut fx = setup_with_asset(vec![v1.address, v2.address], 2, 400_000, 0).await;
+    let owner = Keypair::from_bytes(&fx.owner.to_bytes()).unwrap();
+    // A pre-H-5 config decodes `setup_deadline` from its zero padding, so the
+    // upgraded gate is on the DELAYED path from the first block. Fail-closed.
+    edit_config(&mut fx.ctx, |c| c.setup_deadline = 0).await;
+    assert!(
+        fx.ctx.banks_client.get_account(vault_binding_pda(&fx.vault)).await.unwrap().is_none(),
+        "premise: a pre-H-5 gate has no vault binding"
+    );
+
+    // 1. The drain, while the vault carries no commitment: a fresh debridgeId on
+    //    the funded vault at a scale below the mesh's, which pays a power of ten
+    //    out of it. It needs a schedule now (the gate is sealed), so it is at
+    //    least visible — but it is still reachable, which is why the backfill
+    //    matters, and why it must not itself cost 48 h.
+    let evil = [0xE1u8; 32];
+    let evil_scale = FIXTURE_BRIDGE_DECIMALS - 3;
+    let action = solana_gate::register_asset_action_id(&evil, &fx.mint, &fx.vault, evil_scale);
+    exec(&mut fx.ctx, schedule_governance(fx.owner.pubkey(), action), &[&owner]).await.unwrap();
+    advance_clock(&mut fx.ctx, GOVERNANCE_DELAY + 1).await;
+
+    // 2. THE MIGRATION: re-register the asset that is already there, byte for
+    //    byte. No schedule of its own, and it writes the binding.
+    exec(
+        &mut fx.ctx,
+        register_asset_ix(
+            fx.owner.pubkey(),
+            fx.debridge_id,
+            fx.mint,
+            fx.vault,
+            FIXTURE_BRIDGE_DECIMALS,
+        ),
+        &[&owner],
+    )
+    .await
+    .expect("an identical re-registration must need no schedule — it changes nothing");
+    let binding = fx.ctx.banks_client.get_account(vault_binding_pda(&fx.vault)).await.unwrap().unwrap();
+    let bound = solana_gate::VaultBinding::deserialize(&mut &binding.data[..]).unwrap();
+    assert_eq!(bound.mint, fx.mint, "the binding was backfilled");
+    assert_eq!(bound.bridge_decimals, FIXTURE_BRIDGE_DECIMALS);
+
+    // 3. The attacker's approval is still matured and still unspent — and now
+    //    lands on a vault whose units are pinned.
+    let err = exec(
+        &mut fx.ctx,
+        register_asset_ix(fx.owner.pubkey(), evil, fx.mint, fx.vault, evil_scale),
+        &[&owner],
+    )
+    .await
+    .expect_err("the funded vault must refuse foreign units after the backfill");
+    assert!(is_custom(&err, VAULT_ASSET_MISMATCH), "expected VaultAssetMismatch, got {err:?}");
+
+    // The asset record and the liquidity are exactly as they were.
+    let stored = fx.ctx.banks_client.get_account(asset_pda(&fx.debridge_id)).await.unwrap().unwrap();
+    let asset = AssetConfig::deserialize(&mut &stored.data[..]).unwrap();
+    assert_eq!(asset.vault, fx.vault);
+    assert_eq!(asset.bridge_decimals, FIXTURE_BRIDGE_DECIMALS);
+    let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
+    assert_eq!(spl_balance(&vault), 400_000, "not one unit moved during the migration");
 }

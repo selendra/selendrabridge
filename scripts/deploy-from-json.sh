@@ -705,6 +705,31 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     return 1
   }
 
+  # H-5: READ BACK what the gate actually stored, and compare it with the value
+  # every EVM gate was registered with.
+  #
+  # A registration is write-once and the scale is mesh-wide, so a wrong
+  # `--bridge-decimals` here does not fail — it produces a gate that quotes and
+  # signs normally and then cannot settle one transfer in either direction (H-2's
+  # BridgeScaleMismatch), or, before H-2, paid out a power of ten. The script knew
+  # what it asked for and never checked what landed; this is that check, and it
+  # runs per corridor because each id is its own account.
+  sol_verify_asset() {
+    local sym="$1" did="$2" whence="$3" want="${BRIDGE_DEC[$sym]}" got
+    local st; st="$(ga asset-status --debridge-id "$did" 2>&1)" || {
+      warn "could not read back $sym ($whence) from the gate — verify by hand: gate-admin asset-status --debridge-id $did"
+      return 0
+    }
+    got="$(sed -n 's/^  bridge decimals: *//p' <<<"$st" | head -1)"
+    [[ -n "$got" ]] || die "the gate has no asset record for $sym ($whence) after register-asset reported success:
+$st"
+    [[ "$got" == "$want" ]] || die "the Solana gate stored bridge decimals $got for $sym ($whence), but the EVM gates use $want. \
+The binding is WRITE-ONCE, so this corridor can never settle: a claim carries the source scale and is refused, and restating it \
+at $got hashes to an id no validator signed. Use a fresh debridgeId, or a new program generation."
+    grep -q "NOT COMMITTED" <<<"$st" && warn "$sym ($whence): the vault carries no H-5 commitment yet — re-run register-asset to backfill it"
+    return 0
+  }
+
   # Wait for the program account itself before touching it at all.
   for _ in $(seq 1 20); do
     solana program show "$SOL_PROGRAM" --url "$SOL_RPC" >/dev/null 2>&1 && break
@@ -812,6 +837,7 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       ga_retry register-asset --debridge-id "$did" --mint "$mint" --vault "$vault" \
         --bridge-decimals "${BRIDGE_DEC[$sym]:?no bridge decimals for $sym}" >/dev/null \
         || die "register-asset $sym (from chain $cid) failed"
+      sol_verify_asset "$sym" "$did" "$cid"
       info "asset   : $sym from chain $cid -> mint $mint"
       ids="$(jq -c --arg d "$did" --argjson c "$cid" '. + [{from_chain: $c, debridge_id: $d}]' <<<"$ids")"
     done
@@ -822,6 +848,7 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       ga_retry register-asset --debridge-id "$native_did" --mint "$mint" --vault "$vault" \
         --bridge-decimals "${BRIDGE_DEC[$sym]:?no bridge decimals for $sym}" >/dev/null \
         || die "register-asset $sym (solana-native id) failed"
+      sol_verify_asset "$sym" "$native_did" "solana-native"
       for cid in ${ASSET_CHAINS[$sym]:-}; do
         register_corridor "$cid" "$native_did" "${TOKEN[$sym|$cid]}" "register $sym inbound from Solana"
       done
@@ -856,6 +883,34 @@ if it is insufficient funds, either lower solana.assets[$sym].vault_seed or mint
       --argjson bd "${BRIDGE_DEC[$sym]:-null}" \
       '. + [{symbol: $s, mint: $m, vault: $v, bridge_decimals: $bd, registrations: $ids}]' <<<"$SOL_ASSETS")"
   done
+
+  # --- seal the Solana gate (H-5) — the last GATE wiring step ----------------
+  #
+  # Same rule as the EVM `seal()` below and for the same reason, and on this VM it
+  # is not optional: `claim` on an unsealed gate is refused outright, so a mesh
+  # whose Solana leg is never sealed accepts sends and signatures and then settles
+  # nothing. Afterwards a new asset binding is `schedule-governance --register-asset`
+  # + 48 h, which is what stops a stolen owner key from pointing a worthless
+  # debridgeId at a funded vault, or pointing a real one at the wrong scale.
+  #
+  # Ordering note: the vault seeding above happens BEFORE this, which the runbook
+  # would rather have the other way round. It is safe because nothing can be paid
+  # out of an unsealed gate at all — the window is this script's own remaining
+  # seconds, under the key that is already signing every line of it.
+  if [[ "$SEAL" == "true" ]]; then
+    show="$(ga show 2>&1)" || { echo "$show"; die "gate-admin show failed before seal"; }
+    if grep -qE '^  sealed *: *true' <<<"$show"; then
+      info "seal    : already sealed"
+    elif grep -qE '^  sealed *:' <<<"$show"; then
+      ga_retry seal >/dev/null || die "gate-admin seal failed — the gate will not claim until it is sealed"
+      info "seal    : sealed (new asset bindings now wait out the 48h timelock)"
+    else
+      # A gate deployed from a pre-H-5 program has no `sealed` field to report.
+      warn "seal    : this program predates H-5 (no seal instruction) — upgrade it before relying on the timelock"
+    fi
+  else
+    warn "seal    : gate.seal = false — the Solana gate stays unsealed, and an UNSEALED SOLANA GATE CANNOT CLAIM AT ALL. Dev only."
+  fi
 
   # --- the Solana swap pool (a SEPARATE program from the gate) ---------------
   #
