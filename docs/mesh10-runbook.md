@@ -9,8 +9,9 @@ The staging notes below are kept because they are the record of how it was wired
 and of the traps that cost two attempts; where a step says "not staged", it has
 since been done.
 
-**One thing is outstanding: the H-5 program upgrade on the Solana gate.** See
-"H-5: upgrading the live Solana gate" at the end.
+**H-5 was deployed to the Solana gate on 2026-09-25** — upgraded, backfilled,
+sealed, and both directions re-proved against it. The section at the end is now the
+record of how it was done (and the ProgramData trap it hit), not a pending task.
 
 ## What is already done
 
@@ -151,13 +152,18 @@ same-chain swap UI test (the local pool lists one token).
 
 ## H-5: upgrading the live Solana gate
 
-The gate program deployed on 2026-09-24 predates the H-5 fix, so on it
-`RegisterAsset` is still instant and unilateral and there is no `Seal`. The fix is
-in the tree and tested (audit report, "Fixes applied 2026-09-24"); what is left is
-an on-chain upgrade of `AJXTvmc4evk96wyWGhD2762S1bcq1qfiWwQpKHb2fD38` plus a
-backfill, because **the upgrade alone leaves the vault check inert**: the existing
-asset records have no `["vault", vault]` commitment, so a mis-scaled second
-`debridgeId` on a funded vault is still reachable until they exist.
+**DONE 2026-09-25.** Kept as the procedure, because the next generation will need it.
+
+The gate deployed on 2026-09-24 predated the H-5 fix: `RegisterAsset` was instant and
+unilateral and there was no `Seal`. The upgrade alone would have left the vault check
+**inert** — the existing asset records had no `["vault", vault]` commitment, so a
+mis-scaled second `debridgeId` on a funded vault stayed reachable until they existed.
+
+**THE TRAP: ProgramData had no headroom.** The original deploy allocated exactly
+244,789 bytes for a 244,744-byte program — 1×, not the usual 2× — and the new artifact
+is 250,384. `solana program extend <PROGRAM_ID> 30000` first, or the deploy fails and
+leaves a buffer holding ~2 SOL. Check with
+`getAccountInfo(<ProgramData>) .space` before starting.
 
 Backfilling is deliberately cheap — an identical re-registration consumes no
 governance schedule, because it changes nothing the timelock protects.

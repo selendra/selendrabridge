@@ -409,6 +409,16 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
         echo "allow_unauthenticated = true"
       fi
     fi
+    # H-4 (audit 2026-09-16): the transfer path's second-source policy. Emitted
+    # only when the operator asks for the strict form; the validator's own default
+    # is advisory, for the reason `CorroboratePolicy` documents. Corroboration
+    # itself needs no flag — it is automatic wherever a chain has two or more
+    # `rpcs`, which is why that list is the real fix.
+    if [[ "$(j '.corroborate.require // false')" == "true" ]]; then
+      echo
+      echo "[corroborate]"
+      echo "require = true"
+    fi
     # H-2 (audit 2026-09-16): peer gates this validator cross-checks for
     # bridge-decimals agreement before signing. Unconditional — a validator with
     # no verifiable destination withholds every signature.

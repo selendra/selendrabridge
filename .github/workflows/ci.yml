@@ -33,6 +33,28 @@ jobs:
   rust:
     name: Rust — fmt, clippy, tests
     runs-on: ubuntu-latest
+    # The Postgres-backed tests in `bridge-db`, `indexer` and `sig-store` all skip
+    # themselves when `BRIDGE_TEST_DATABASE_URL` is unset — quietly, and the job
+    # still reports green. That is the audit's own objection to a check that cannot
+    # pass, so CI provides a real database and sets the variable.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: bridge
+          POSTGRES_PASSWORD: bridge
+          POSTGRES_DB: bridge
+        ports: ["5432:5432"]
+        # Without a healthcheck the first test can connect before Postgres is
+        # accepting connections, which fails as a test failure rather than as the
+        # startup race it is.
+        options: >-
+          --health-cmd "pg_isready -U bridge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BRIDGE_TEST_DATABASE_URL: postgres://bridge:bridge@127.0.0.1:5432/bridge
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -57,6 +79,17 @@ jobs:
       - name: Clippy (non-blocking — see note)
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
+
+      # Fails the job if the variable above did not actually reach a live database:
+      # the whole point is that these tests can no longer skip unnoticed.
+      - name: Prove the live-Postgres tests actually ran
+        run: |
+          out="$(cargo test -p bridge-db --test live_pg -- --nocapture 2>&1)"
+          echo "$out"
+          if grep -q "BRIDGE_TEST_DATABASE_URL unset" <<<"$out"; then
+            echo "::error::the live-Postgres tests SKIPPED — the service or the env var is not wired up"
+            exit 1
+          fi
 
       - name: Tests
         run: cargo test --workspace --all-targets

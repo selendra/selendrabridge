@@ -18,6 +18,7 @@
 
 mod config;
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -87,22 +88,28 @@ async fn main() -> anyhow::Result<()> {
         "keeper started"
     );
 
-    // A chain listed as BOTH a claim target and a refund source (a bidirectional
-    // corridor) gets two loops submitting from the same account on the same chain
-    // concurrently. Each has its own fresh-nonce provider, so under simultaneous
-    // load they can fetch the same pending nonce and one tx is rejected
-    // (nonce-too-low) — self-healing on the next tick, but worth flagging. For a
-    // busy bidirectional keeper, run the target and source roles as separate
-    // processes (or separate signer accounts) to avoid the contention.
-    for t in &cfg.targets {
-        if cfg.sources.iter().any(|s| s.chain_id == t.chain_id) {
-            warn!(
-                chain_id = t.chain_id,
-                "chain is both a claim target and a refund source; the two loops share one \
-                 account and may briefly contend on nonces under load (self-healing). Consider \
-                 separate keeper processes for the two roles."
-            );
-        }
+    // One submission lock per chain, shared by that chain's claim loop and its
+    // refund loop. A bidirectional corridor runs both from the same account, and
+    // the race that used to produce is described on [`SendLock`]. This used to be
+    // a warning telling the operator to run two processes; it is now handled, so
+    // there is nothing to warn about.
+    let mut send_locks: BTreeMap<u64, SendLock> = BTreeMap::new();
+    for chain_id in cfg.targets.iter().map(|t| t.chain_id).chain(cfg.sources.iter().map(|s| s.chain_id))
+    {
+        send_locks.entry(chain_id).or_default();
+    }
+    let bidirectional: Vec<u64> = cfg
+        .targets
+        .iter()
+        .filter(|t| cfg.sources.iter().any(|s| s.chain_id == t.chain_id))
+        .map(|t| t.chain_id)
+        .collect();
+    if !bidirectional.is_empty() {
+        info!(
+            chains = ?bidirectional,
+            "bidirectional corridors: the claim and refund loops share one account per chain and \
+             their submissions are serialized per chain"
+        );
     }
 
     // Spawn one independent claim loop per destination chain. A loop only returns
@@ -114,7 +121,8 @@ async fn main() -> anyhow::Result<()> {
         let signer = signer.clone();
         let source = source.clone();
         let policy = cfg.allowlist.clone();
-        tasks.spawn(async move { run_target(target, signer, source, policy).await });
+        let lock = send_locks.get(&target.chain_id).expect("lock per target chain").clone();
+        tasks.spawn(async move { run_target(target, signer, source, policy, lock).await });
     }
 
     // And one refund loop per SOURCE chain. Refunds pay out where the funds were
@@ -122,7 +130,8 @@ async fn main() -> anyhow::Result<()> {
     for src in cfg.sources {
         let signer = signer.clone();
         let store = source.clone();
-        tasks.spawn(async move { run_source_refunds(src, signer, store).await });
+        let lock = send_locks.get(&src.chain_id).expect("lock per source chain").clone();
+        tasks.spawn(async move { run_source_refunds(src, signer, store, lock).await });
     }
 
     let total = tasks.len();
@@ -142,6 +151,24 @@ async fn main() -> anyhow::Result<()> {
 /// Returns the signing provider plus the initial [`GateView`]. Transient RPC
 /// failures retry here rather than killing the loop; only a wrong `chainId` is
 /// fatal, because that is a permanent misconfiguration and submitting to the
+/// Serializes transaction SUBMISSION per chain across this keeper's loops.
+///
+/// A chain listed as both a claim target and a refund source gets two loops
+/// submitting from ONE account on ONE chain concurrently. Each holds its own
+/// provider with `SimpleNonceManager`, which fetches the pending nonce fresh per
+/// tx — correct in isolation, and a race between two of them: both read the same
+/// pending nonce, both broadcast with it, and the second is rejected
+/// `nonce-too-low`. Self-healing on the next tick, so it showed up only as an
+/// occasional wasted tick and a confusing error, which is why it stood as a
+/// warning telling operators to run two processes instead.
+///
+/// One lock per chain removes the race without new accounts to fund or a second
+/// process to supervise. It is held across the nonce fetch and the broadcast ONLY,
+/// never across the receipt wait — the whole point is that the next send observes
+/// this tx as pending and takes `n + 1`, which it cannot do if the lock is still
+/// held while we wait for the block.
+type SendLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
 /// wrong network is not something to keep retrying.
 async fn connect_gate(
     chain: &ChainCfg,
@@ -281,6 +308,7 @@ async fn run_target(
     signer: PrivateKeySigner,
     source: Arc<StoreBackend>,
     policy: AllowlistPolicy,
+    send_lock: SendLock,
 ) -> anyhow::Result<()> {
     let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&target, &signer, "target").await?;
@@ -384,7 +412,7 @@ async fn run_target(
                 if !pending.may_submit(&provider, &rec.submission_id, SigKind::Cancel).await {
                     continue;
                 }
-                match try_cancel(&gate, &rec, &cancel_sigs).await {
+                match try_cancel(&gate, &rec, &cancel_sigs, &send_lock).await {
                     // The DB `refund_status` is advanced by the indexer when it
                     // observes the resulting `Cancelled` event on-chain, not
                     // reported here — the keeper's word is not authoritative for a
@@ -428,7 +456,7 @@ async fn run_target(
             if !pending.may_submit(&provider, &rec.submission_id, SigKind::Transfer).await {
                 continue;
             }
-            match try_claim(&gate, &rec, &claim_sigs, bridge_domain).await {
+            match try_claim(&gate, &rec, &claim_sigs, bridge_domain, &send_lock).await {
                 Ok(ClaimOutcome::Submitted(tx)) => {
                     stranded.clear(&rec.submission_id);
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
@@ -502,6 +530,7 @@ async fn run_source_refunds(
     src: ChainCfg,
     signer: PrivateKeySigner,
     store: Arc<StoreBackend>,
+    send_lock: SendLock,
 ) -> anyhow::Result<()> {
     let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&src, &signer, "source refund").await?;
@@ -550,7 +579,7 @@ async fn run_source_refunds(
                 }
                 continue;
             }
-            match try_refund(&gate, &rec, &refund_sigs).await {
+            match try_refund(&gate, &rec, &refund_sigs, &send_lock).await {
                 // As with cancel, the indexer records `refund_status = refunded`
                 // from the observed on-chain `Refunded` event; the keeper does not
                 // report a state that gates the candidate list.
@@ -824,6 +853,7 @@ async fn try_claim<P: Provider>(
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
     bridge_domain: B256,
+    send_lock: &SendLock,
 ) -> anyhow::Result<ClaimOutcome> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -903,7 +933,7 @@ async fn try_claim<P: Provider>(
         native_sender,
         signatures,
     );
-    confirm(call, "claim", &rec.submission_id, "CLAIMED").await.map(ClaimOutcome::Submitted)
+    confirm(call, "claim", &rec.submission_id, "CLAIMED", send_lock).await.map(ClaimOutcome::Submitted)
 }
 
 /// Send a prepared gate call, await its receipt, and refuse to report a
@@ -923,8 +953,14 @@ async fn confirm<P: Provider>(
     verb: &str,
     submission_id: &str,
     done: &str,
+    send_lock: &SendLock,
 ) -> anyhow::Result<String> {
-    let pending = call.send().await.with_context(|| format!("send {verb}"))?;
+    // See [`SendLock`]: the nonce fetch and the broadcast are one critical section
+    // per chain, and the guard is released before the receipt wait below.
+    let pending = {
+        let _guard = send_lock.lock().await;
+        call.send().await.with_context(|| format!("send {verb}"))?
+    };
     let hash = *pending.tx_hash();
     let receipt = match pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await {
         Ok(r) => r,
@@ -955,6 +991,7 @@ async fn try_cancel<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
+    send_lock: &SendLock,
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
     if gate.executed(submission_id).call().await? {
@@ -981,7 +1018,7 @@ async fn try_cancel<P: Provider>(
         bytes_of(&rec.native_sender)?,
         sorted_signatures(sigs)?,
     );
-    confirm(call, "cancel", &rec.submission_id, "CANCELLED").await.map(Some)
+    confirm(call, "cancel", &rec.submission_id, "CANCELLED", send_lock).await.map(Some)
 }
 
 /// Submit `refund()` on the source. `None` if already refunded, if this gate
@@ -992,6 +1029,7 @@ async fn try_refund<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
+    send_lock: &SendLock,
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -1037,7 +1075,7 @@ async fn try_refund<P: Provider>(
         bytes_of(&rec.native_sender)?,
         sorted_signatures(sigs)?,
     );
-    confirm(call, "refund", &rec.submission_id, "REFUNDED").await.map(Some)
+    confirm(call, "refund", &rec.submission_id, "REFUNDED", send_lock).await.map(Some)
 }
 
 /// The keeper's live view of one gate: the signature `threshold`, the

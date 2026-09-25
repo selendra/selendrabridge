@@ -36,7 +36,7 @@ use bridge_core::backend::StoreBackend;
 use bridge_core::signer::encode_signature;
 use bridge_core::store::{SignerSig, SubmissionRecord};
 use bridge_core::Submission;
-use config::{Config, SourceChain};
+use config::{Config, CorroboratePolicy, SourceChain};
 use state::{NonceDecision, PauseReason, Runtime};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -157,8 +157,12 @@ async fn main() -> anyhow::Result<()> {
         let peers = scale_peers.clone();
         let sol_peers = solana_peers.clone();
         let policy = cfg.allowlist.clone();
+        let corroborate = cfg.corroborate.clone();
         tasks.spawn(async move {
-            scan_source(source, signer, signer_addr, sink, runtime, peers, sol_peers, policy).await
+            scan_source(
+                source, signer, signer_addr, sink, runtime, peers, sol_peers, policy, corroborate,
+            )
+            .await
         });
     }
 
@@ -175,6 +179,14 @@ async fn main() -> anyhow::Result<()> {
     anyhow::bail!("all {total} source scan loops have exited");
 }
 
+/// H-4: how many consecutive windows may end with no peer verdict before the
+/// scanner stops waiting and falls back to the "no second source" policy.
+///
+/// At the shortest sensible poll interval this is minutes of patience, which
+/// covers ordinary peer lag, and it bounds the damage from a peer that can never
+/// answer to a loud warning rather than a stopped validator.
+const INCONCLUSIVE_LIMIT: u32 = 10;
+
 /// Scan one source chain forever: poll for `Sent`, verify, sign, store.
 async fn scan_source(
     source: SourceChain,
@@ -185,11 +197,19 @@ async fn scan_source(
     scale_peers: Vec<(u64, String, Vec<String>)>,
     solana_peers: Vec<(u64, [u8; 32], String)>,
     policy: AllowlistPolicy,
+    corroborate: CorroboratePolicy,
 ) -> anyhow::Result<()> {
     let gate: Address = source.gate.parse().context("bad gate address")?;
     let retry = Duration::from_millis(source.poll_interval_ms.max(1000));
     // Last observed chain head; see the refresh rule in the scan loop.
     let mut cached_latest: Option<u64> = None;
+    // H-4: consecutive windows on which no peer could give a verdict. Bounded,
+    // because an unverified window does not advance the cursor and a peer that can
+    // NEVER answer would therefore stop this validator outright — a security check
+    // that turns into a silent outage is the failure mode this repo has already
+    // been bitten by (the H-2 cross-check withholding on an empty peer list,
+    // 2026-09-24). Past the limit the policy for "no second source" applies.
+    let mut inconclusive_streak: u32 = 0;
     // How fast we may read while behind. Defaults to the steady-state interval:
     // see `catchup_poll_interval_ms` for why aggression has to be opt-in.
     let catchup_ms = source.catchup_poll_interval_ms.unwrap_or(source.poll_interval_ms);
@@ -199,14 +219,41 @@ async fn scan_source(
     // this loop (and, with the isolation in main, never the sibling chains).
     let endpoints = source.endpoints()?;
     let mut failover = loop {
-        match provider::Failover::connect(&endpoints, source.chain_id).await {
-            Ok(f) => break f,
+        match provider::Failover::connect_for_gate(&endpoints, source.chain_id, Some(gate)).await {
+            Ok(mut f) => {
+                // H-4: do not let the whole fleet prefer the same endpoint. The
+                // offset comes from the validator's own address, so it is stable
+                // across restarts (an endpoint order that reshuffled every boot
+                // would make a real disagreement look like flapping) and differs
+                // between validators without any coordination or extra config.
+                f.stagger(signer_addr.as_slice()[19] as usize);
+                break f;
+            }
             Err(e) => {
                 warn!(chain_id = source.chain_id, error = %e, "connecting RPC endpoints failed; retrying");
                 tokio::time::sleep(retry).await;
             }
         }
     };
+    // H-4: one endpoint means the `Sent` events this loop signs rest on a single
+    // source's word. Say so at startup, once, with the fix in the message —
+    // `[corroborate] require = true` turns it from a warning into a refusal.
+    if failover.endpoint_count() < 2 {
+        if corroborate.require {
+            warn!(
+                chain_id = source.chain_id,
+                "[corroborate] require = true and only ONE healthy RPC endpoint: this loop will \
+                 sign NOTHING until a second endpoint is reachable (audit H-4)"
+            );
+        } else {
+            warn!(
+                chain_id = source.chain_id,
+                "only ONE healthy RPC endpoint: every signature rests on it alone, and a single \
+                 endpoint serving a forged Sent mints a valid quorum (audit H-4). Add a second \
+                 `rpcs` entry for this chain; set [corroborate] require = true to withhold instead."
+            );
+        }
+    }
 
     // H-2: connect the peer gates this loop will cross-check against. Same retry
     // posture as the source connection — a peer that is momentarily down must not
@@ -278,10 +325,27 @@ async fn scan_source(
         chain_id = source.chain_id,
         // Redacted to scheme+host by `Failover`: hosted RPC keys live in the path.
         rpc = %failover.active_url(),
-        endpoints = endpoints.len(),
+        // BOTH counts, because they differ and the difference is what matters.
+        // Reporting only the configured length made this line lie: an endpoint
+        // dropped by the startup probe (wrong chain, unreachable, or unable to
+        // serve `eth_call`) still counted, so an operator reading `endpoints = 3`
+        // would believe H-4 corroboration had two peers to choose from when it
+        // had one — or none. Caught on mesh10 the day the check shipped, where a
+        // configured Hoodi endpoint 404s from inside the container.
+        endpoints_configured = endpoints.len(),
+        endpoints_healthy = failover.endpoint_count(),
         resume_from,
         "source scan loop started"
     );
+    if failover.endpoint_count() < endpoints.len() {
+        warn!(
+            chain_id = source.chain_id,
+            configured = endpoints.len(),
+            healthy = failover.endpoint_count(),
+            "some configured RPC endpoints were DROPPED at startup (see the `skipping RPC` lines \
+             above for each reason). H-4 corroboration only has the healthy ones to work with."
+        );
+    }
 
     let sent_sig = Gate::Sent::SIGNATURE_HASH;
 
@@ -333,8 +397,8 @@ async fn scan_source(
             // to `scanned_to` — what was actually read — never to `to_block`.
             let filter = Filter::new().address(gate).event_signature(sent_sig);
 
-            let (mut logs, scanned_to) = match failover
-                .get_logs_confirmed(&filter, from_block, to_block, source.block_confirmation)
+            let (mut logs, scanned_to, verdict) = match failover
+                .get_logs_corroborated(&filter, from_block, to_block, source.block_confirmation)
                 .await
             {
                 Ok(Some(v)) => v,
@@ -360,6 +424,92 @@ async fn scan_source(
                     continue;
                 }
             };
+            // H-4: the window must survive a second endpoint before anything in it
+            // is signed. A validator's whole view of a deposit is the `Sent` log,
+            // so one endpoint that serves a fabricated one mints a signature the
+            // destination gate cannot distinguish from an honest quorum.
+            //
+            // Every non-agreement leaves the cursor PUT. That is the point: this
+            // range is unverified, and skipping it would strand the transfers in
+            // it (and, because nonces must be sequential, stall on the next one
+            // anyway). Re-reading is free and idempotent.
+            match &verdict {
+                provider::Corroboration::Agreed { .. } => {
+                    inconclusive_streak = 0;
+                }
+                provider::Corroboration::Disagreed { served_by, checked_by, detail } => {
+                    inconclusive_streak = 0;
+                    // The endpoint has already been demoted inside the provider,
+                    // so the retry below reads from someone else. This is the one
+                    // log line in the system that means "an RPC endpoint lied".
+                    warn!(
+                        chain_id = source.chain_id,
+                        %served_by,
+                        %checked_by,
+                        %detail,
+                        from_block,
+                        scanned_to,
+                        "RPC ENDPOINTS DISAGREE about this range — signing NOTHING from it and \
+                         demoting the endpoint that served it (audit H-4). If this persists, one \
+                         endpoint is wrong about the chain: investigate before resuming."
+                    );
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+                provider::Corroboration::Inconclusive { reason } => {
+                    inconclusive_streak = inconclusive_streak.saturating_add(1);
+                    if inconclusive_streak < INCONCLUSIVE_LIMIT {
+                        // Almost always a lagging peer, which is ordinary. Not an
+                        // accusation, and not agreement either: wait for it.
+                        warn!(
+                            chain_id = source.chain_id,
+                            %reason,
+                            from_block,
+                            scanned_to,
+                            attempt = inconclusive_streak,
+                            "no second opinion on this range yet; not advancing the cursor"
+                        );
+                        tokio::time::sleep(retry).await;
+                        continue;
+                    }
+                    // Every peer has failed this range this many times running, so
+                    // it is not transient lag — it is a peer that cannot answer at
+                    // all (a `get_logs` range cap below `max_block_range` is the
+                    // usual cause). Treat it as "no second source" and apply that
+                    // policy, loudly, rather than staying stopped for ever on a
+                    // configuration problem nothing else would report.
+                    warn!(
+                        chain_id = source.chain_id,
+                        %reason,
+                        from_block,
+                        scanned_to,
+                        attempts = inconclusive_streak,
+                        "NO PEER CAN CORROBORATE this range after {INCONCLUSIVE_LIMIT} attempts — \
+                         treating it as having no second source. Usual cause: a peer's eth_getLogs \
+                         range cap is below this chain's max_block_range. Fix the peer list (audit H-4)."
+                    );
+                    if corroborate.require {
+                        warn!(
+                            chain_id = source.chain_id,
+                            "WITHHOLDING: [corroborate] require = true (audit H-4)"
+                        );
+                        tokio::time::sleep(retry).await;
+                        continue;
+                    }
+                }
+                provider::Corroboration::Unavailable => {
+                    if corroborate.require {
+                        warn!(
+                            chain_id = source.chain_id,
+                            "WITHHOLDING: [corroborate] require = true and no second RPC endpoint \
+                             for this chain (audit H-4)"
+                        );
+                        tokio::time::sleep(retry).await;
+                        continue;
+                    }
+                }
+            }
+
             // True when there is more ALREADY-CONFIRMED history waiting right now:
             // the window was capped by `max_block_range`, or shortened by a lagging
             // endpoint. See the catch-up note where this is consumed.

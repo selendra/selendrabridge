@@ -53,6 +53,33 @@ pub struct Config {
     /// store says, and accept an empty list as "allow everything".
     #[serde(default)]
     pub allowlist: AllowlistPolicy,
+    /// H-4: what this validator requires of a SECOND RPC endpoint before it signs
+    /// a transfer (audit 2026-09-16).
+    #[serde(default)]
+    pub corroborate: CorroboratePolicy,
+}
+
+/// H-4: the second-source policy for the transfer path.
+///
+/// Corroboration itself is not optional — whenever two or more endpoints survive
+/// the startup chainId probe, every scan window is checked against a second one
+/// and a disagreement discards the window. This policy only decides what happens
+/// when there is NO second endpoint to ask.
+///
+/// The default is advisory, deliberately, and it is the same call the repo already
+/// made for `[allowlist] require`: flipping it to fail-closed would stop every
+/// existing single-endpoint deployment from signing the moment it was upgraded,
+/// which is an outage, not a fix. The real fix is configuring a second `rpcs`
+/// entry — at which point the check is mandatory with no flag at all. `require =
+/// true` is for an operator who would rather withhold than sign unverified, and
+/// it is the right setting once a mesh has two endpoints everywhere.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorroboratePolicy {
+    /// Withhold signatures entirely when a single endpoint leaves nothing to
+    /// compare against. Default `false`: sign, and warn once per scan loop.
+    #[serde(default)]
+    pub require: bool,
 }
 
 /// One Solana gate program the H-2 check can read.
