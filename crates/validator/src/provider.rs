@@ -12,8 +12,10 @@
 //! submissionId from the log and signs it. One endpoint that serves a fabricated
 //! log therefore mints a quorum-valid signature for a deposit that never
 //! happened — and the destination gate cannot tell, because every signature over
-//! it is genuine. The refund path already second-sources (`refund.rs` reads
-//! `sentBy` on chain before attesting); the transfer path did not.
+//! it is genuine. (This comment once said the refund path already
+//! second-sourced. It did not — it read every gate fact from one endpoint — and
+//! since audit round 6 it cross-checks each read across endpoints too; see
+//! `refund::GateReader`.)
 //!
 //! So [`Failover::get_logs_corroborated`] fetches the window from the active
 //! endpoint and then asks a DIFFERENT endpoint for the same explicit range, and
@@ -125,6 +127,21 @@ pub async fn connect_checked(urls: &[String], expected_chain_id: u64) -> anyhow:
         .next()
         .map(|e| e.provider)
         .ok_or_else(|| anyhow::anyhow!("no healthy RPC endpoints for chain {expected_chain_id}"))
+}
+
+/// Every endpoint that answers AND reports `expected_chain_id`, in the order
+/// given, each with its REDACTED url (safe to log). Errors if none survive.
+///
+/// For callers that must cross-check one read across endpoints rather than use
+/// whichever answers first — the refund loop, whose `executed`/`cancelled` reads
+/// decide whether a transfer may be paid back (audit round 6).
+pub async fn connect_all_checked(
+    urls: &[String],
+    expected_chain_id: u64,
+) -> anyhow::Result<Vec<(String, DynProvider)>> {
+    let healthy = probe(urls, expected_chain_id, false, None).await;
+    anyhow::ensure!(!healthy.is_empty(), "no healthy RPC endpoints for chain {expected_chain_id}");
+    Ok(healthy.into_iter().map(|e| (e.url, e.provider)).collect())
 }
 
 /// Build a provider for every url that parses, and keep those whose

@@ -258,6 +258,12 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
   an endpoint is wrong about the chain. With two endpoints nobody can tell which, so
   nothing is signed and nobody is demoted until one is removed; with three or more
   the majority decides. Give each validator a different primary where possible.
+  The **refund** loop applies the same rule to every gate read it attests on
+  (`executed`/`cancelled`, `sentBy`/`refunded`, the aged-block check): each is asked
+  of every endpoint at one block and needs two that agree, as a majority. Until then
+  the candidate is skipped (`refund attestation failed … no 2 endpoints agree`) and
+  retried next tick — a late refund, never a wrong one. Historical `sentBy` reads on
+  the cancel leg now need an archive-capable SECOND endpoint as well.
 - **Seal the Solana gate, and seal it last.** Since H-5 `claim` returns `NotSealed` (`Custom(26)`) until `gate-admin seal` has run, and afterwards a new asset binding needs `gate-admin schedule-governance --register-asset --debridge-id … --mint … --vault … --bridge-decimals …` plus the 48 h delay. `deploy-from-json.sh` runs it (honouring `gate.seal`); a gate left unsealed takes transfers and settles none of them.
 
 ---

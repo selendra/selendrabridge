@@ -116,7 +116,8 @@ async fn main() -> anyhow::Result<()> {
             .collect::<anyhow::Result<_>>()?;
         let signer = signer.clone();
         let sink = sink.clone();
-        tasks.spawn(async move { refund::run(refund_cfg, sources, signer, sink).await });
+        let require = cfg.corroborate.require;
+        tasks.spawn(async move { refund::run(refund_cfg, sources, signer, sink, require).await });
     } else {
         info!("no [refund] block — this validator will not attest cancels or refunds");
     }

@@ -47,11 +47,31 @@ use crate::config::RefundConfig;
 use crate::provider;
 
 /// One chain this validator can independently read gate state from.
+///
+/// ## Every read is corroborated (audit round 6)
+///
+/// This used to hold ONE provider — the first healthy endpoint, the same one on
+/// every validator — and the module docs called the refund path "already
+/// second-sourced". It was not. The destination's `executed`/`cancelled` is the
+/// single fact standing between a refund and a double-spend, and one endpoint
+/// that answered `executed = false, cancelled = true` for a stuck transfer got
+/// every validator to attest its refund while the claim signatures still existed.
+///
+/// Now every read goes to every endpoint, at ONE block number, and an answer is
+/// used only when at least `min_agree` endpoints returned it AND they are a
+/// strict majority of those that answered ([`majority`]). Anything short of that
+/// is an error: the candidate is skipped this tick and retried, loudly. A skipped
+/// refund is late; a wrongly attested one is money gone.
 struct GateReader {
     chain_id: u64,
     gate: Address,
-    provider: DynProvider,
+    /// (redacted url, provider) for every endpoint that passed the chainId probe.
+    endpoints: Vec<(String, DynProvider)>,
     block_confirmation: u64,
+    /// How many endpoints must return the same answer. 2 whenever the chain is
+    /// configured with a second endpoint or `[corroborate] require = true`;
+    /// 1 only for a deliberately single-endpoint chain.
+    min_agree: usize,
 }
 
 impl GateReader {
@@ -60,45 +80,133 @@ impl GateReader {
         gate: &str,
         endpoints: &[String],
         block_confirmation: u64,
+        require: bool,
     ) -> anyhow::Result<Self> {
-        let provider = provider::connect_checked(endpoints, chain_id).await?;
+        let min_agree = if endpoints.len() >= 2 || require { 2 } else { 1 };
+        let healthy = provider::connect_all_checked(endpoints, chain_id).await?;
+        // Same rule as the transfer scanner: a chain configured with a second
+        // endpoint does not start on one, because endpoints are probed only here
+        // and it would then run single-source for the life of the process.
+        anyhow::ensure!(
+            healthy.len() >= min_agree,
+            "{} healthy RPC endpoint(s) of {} configured; the refund path needs {min_agree} \
+             to corroborate every read (audit H-4, round 6)",
+            healthy.len(),
+            endpoints.len()
+        );
+        if min_agree < 2 {
+            warn!(
+                chain_id,
+                "refund loop: ONE RPC endpoint for this chain — every executed/cancelled read \
+                 rests on it alone, and a lying endpoint can get a delivered transfer refunded. \
+                 Add a second `rpcs` entry, or set [corroborate] require = true to refuse."
+            );
+        }
         Ok(GateReader {
             chain_id,
             gate: gate.parse().context("bad gate address")?,
-            provider,
+            endpoints: healthy,
             block_confirmation,
+            min_agree,
         })
     }
 
-    /// The newest block we are willing to trust. Reading `executed` at the chain
-    /// tip would let a reorg make a claimed transfer look unclaimed — and this
-    /// loop would then attest a cancel for a transfer that was actually paid.
+    /// Ask every endpoint the same question and return the [`majority`] answer.
+    async fn agreed<T, F, Fut>(&self, what: &str, read: F) -> anyhow::Result<T>
+    where
+        T: PartialEq + Clone + std::fmt::Debug,
+        F: Fn(DynProvider) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let mut answers: Vec<(&str, T)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for (url, p) in &self.endpoints {
+            match read(p.clone()).await {
+                Ok(v) => answers.push((url.as_str(), v)),
+                Err(e) => failed.push(format!("{url}: {e}")),
+            }
+        }
+        majority(&answers, self.min_agree).map_err(|e| {
+            if e.disagreement {
+                warn!(
+                    chain_id = self.chain_id,
+                    what,
+                    answers = ?answers,
+                    "RPC ENDPOINTS DISAGREE about gate state — attesting NOTHING that depends on \
+                     it (audit H-4). One endpoint is wrong about the chain: investigate."
+                );
+            }
+            anyhow::anyhow!(
+                "{what}: {}{}",
+                e.reason,
+                if failed.is_empty() { String::new() } else { format!(" (failed: {})", failed.join("; ")) }
+            )
+        })
+    }
+
+    /// The newest block we are willing to trust, as ONE number every endpoint is
+    /// then asked about. Reading `executed` at the chain tip would let a reorg
+    /// make a claimed transfer look unclaimed — and this loop would then attest a
+    /// cancel for a transfer that was actually paid.
+    ///
+    /// The LOWEST head among the endpoints that answered, so no single endpoint
+    /// can push the read past what the others have. A head that is too low only
+    /// makes the read older, and older is the safe direction on both legs:
+    /// `cancelled` only ever goes false→true, so an older read can only HIDE a
+    /// burn (delaying a refund); and a cancel attested off a stale `executed =
+    /// false` cannot be used, because `claim` and `cancel` share the gate's one
+    /// `executed` flag and `cancel` reverts once it is set.
     async fn confirmed_block(&self) -> anyhow::Result<u64> {
-        let latest = self.provider.get_block_number().await?;
+        let mut heads: Vec<u64> = Vec::new();
+        for (_, p) in &self.endpoints {
+            if let Ok(h) = p.get_block_number().await {
+                heads.push(h);
+            }
+        }
+        anyhow::ensure!(
+            heads.len() >= self.min_agree,
+            "only {} of {} endpoints reported a head; need {}",
+            heads.len(),
+            self.endpoints.len(),
+            self.min_agree
+        );
+        let latest = heads.into_iter().min().expect("min_agree >= 1");
         Ok(latest.saturating_sub(self.block_confirmation))
     }
 
     /// Destination-side view of a submission at a confirmed block.
     async fn destination_state(&self, id: B256) -> anyhow::Result<DestinationState> {
         let block = self.confirmed_block().await?;
-        let at = BlockNumberOrTag::Number(block).into();
-        let gate = Gate::new(self.gate, &self.provider);
-        Ok(DestinationState {
-            executed: gate.executed(id).block(at).call().await?,
-            cancelled: gate.cancelled(id).block(at).call().await?,
-        })
+        let gate_addr = self.gate;
+        let (executed, cancelled) = self
+            .agreed("destination executed/cancelled", |p| async move {
+                let at = BlockNumberOrTag::Number(block).into();
+                let gate = Gate::new(gate_addr, &p);
+                Ok((
+                    gate.executed(id).block(at).call().await?,
+                    gate.cancelled(id).block(at).call().await?,
+                ))
+            })
+            .await?;
+        Ok(DestinationState { executed, cancelled })
     }
 
     /// Source-side view: who locked the funds (zero once refunded or if this gate
     /// never emitted the id at all), and whether it has already been paid back.
     async fn source_state(&self, id: B256) -> anyhow::Result<SourceState> {
         let block = self.confirmed_block().await?;
-        let at = BlockNumberOrTag::Number(block).into();
-        let gate = Gate::new(self.gate, &self.provider);
-        Ok(SourceState {
-            sent_by: gate.sentBy(id).block(at).call().await?,
-            refunded: gate.refunded(id).block(at).call().await?,
-        })
+        let gate_addr = self.gate;
+        let (sent_by, refunded) = self
+            .agreed("source sentBy/refunded", |p| async move {
+                let at = BlockNumberOrTag::Number(block).into();
+                let gate = Gate::new(gate_addr, &p);
+                Ok((
+                    gate.sentBy(id).block(at).call().await?,
+                    gate.refunded(id).block(at).call().await?,
+                ))
+            })
+            .await?;
+        Ok(SourceState { sent_by, refunded })
     }
 
     /// A block that is provably at least `timeout_secs` old, measured against the
@@ -106,39 +214,33 @@ impl GateReader {
     /// skewed clock must not be able to attest early, and block timestamps are
     /// what the chain actually agrees on).
     ///
-    /// Conservative by construction: any block old enough will do, so we step back
-    /// exponentially until the timestamp condition holds rather than binary-
-    /// searching for the newest such block. Overshooting only makes the effective
-    /// timeout longer, which is the safe direction. Typically one or two calls,
-    /// because block times are stable.
+    /// Each endpoint locates one from the SAME confirmed head, and the OLDEST
+    /// result is used: every honest endpoint's answer is genuinely old enough,
+    /// and anything older is too, so a lying endpoint can only push the block
+    /// further back — which makes `was_sent_by_block` harder to satisfy, never
+    /// easier. Any endpoint answering `None` (no block that old) wins outright.
     ///
     /// `Ok(None)` means the chain has no block that old yet (a fresh dev chain),
     /// in which case nothing may be attested.
     async fn aged_block(&self, timeout_secs: i64) -> anyhow::Result<Option<u64>> {
         let head_num = self.confirmed_block().await?;
-        let head = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Number(head_num))
-            .await?
-            .context("confirmed head block vanished")?;
-        let target = (head.header.timestamp as i64).saturating_sub(timeout_secs);
-
-        // Start from a 12s/block estimate, then double until we are far enough
-        // back. Bounded so a pathological chain cannot spin here.
-        let mut step: u64 = ((timeout_secs.max(1) as u64) / 12).max(1);
-        for _ in 0..24 {
-            let Some(candidate) = head_num.checked_sub(step) else { return Ok(None) };
-            let block = self
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Number(candidate))
-                .await?
-                .context("candidate block vanished")?;
-            if (block.header.timestamp as i64) <= target {
-                return Ok(Some(candidate));
+        let mut found: Vec<Option<u64>> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for (url, p) in &self.endpoints {
+            match aged_block_on(p, head_num, timeout_secs).await {
+                Ok(v) => found.push(v),
+                Err(e) => failed.push(format!("{url}: {e}")),
             }
-            step = step.saturating_mul(2);
         }
-        Ok(None)
+        anyhow::ensure!(
+            found.len() >= self.min_agree,
+            "locating an aged block: only {} of {} endpoints answered; need {} ({})",
+            found.len(),
+            self.endpoints.len(),
+            self.min_agree,
+            failed.join("; ")
+        );
+        Ok(oldest_aged_block(&found))
     }
 
     /// Was `id` already locked on this gate as of `block`?
@@ -147,12 +249,94 @@ impl GateReader {
     /// so a non-zero value at a historical height is the chain's own statement
     /// that the deposit existed by then. Reading it at an aged block is therefore
     /// an *authenticated* age check — no timestamp from the store, no schema
-    /// change, one `eth_call`.
+    /// change, one `eth_call` per endpoint.
     async fn was_sent_by_block(&self, id: B256, block: u64) -> anyhow::Result<bool> {
-        let at = BlockNumberOrTag::Number(block).into();
-        let gate = Gate::new(self.gate, &self.provider);
-        Ok(gate.sentBy(id).block(at).call().await? != Address::ZERO)
+        let gate_addr = self.gate;
+        self.agreed("historical sentBy", |p| async move {
+            let at = BlockNumberOrTag::Number(block).into();
+            let gate = Gate::new(gate_addr, &p);
+            Ok(gate.sentBy(id).block(at).call().await? != Address::ZERO)
+        })
+        .await
     }
+}
+
+/// [`GateReader::aged_block`] against one endpoint, from a given head.
+///
+/// Conservative by construction: any block old enough will do, so we step back
+/// exponentially until the timestamp condition holds rather than binary-
+/// searching for the newest such block. Overshooting only makes the effective
+/// timeout longer, which is the safe direction. Typically one or two calls,
+/// because block times are stable.
+async fn aged_block_on(
+    provider: &DynProvider,
+    head_num: u64,
+    timeout_secs: i64,
+) -> anyhow::Result<Option<u64>> {
+    let head = provider
+        .get_block_by_number(BlockNumberOrTag::Number(head_num))
+        .await?
+        .context("confirmed head block vanished")?;
+    let target = (head.header.timestamp as i64).saturating_sub(timeout_secs);
+
+    // Start from a 12s/block estimate, then double until we are far enough
+    // back. Bounded so a pathological chain cannot spin here.
+    let mut step: u64 = ((timeout_secs.max(1) as u64) / 12).max(1);
+    for _ in 0..24 {
+        let Some(candidate) = head_num.checked_sub(step) else { return Ok(None) };
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(candidate))
+            .await?
+            .context("candidate block vanished")?;
+        if (block.header.timestamp as i64) <= target {
+            return Ok(Some(candidate));
+        }
+        step = step.saturating_mul(2);
+    }
+    Ok(None)
+}
+
+/// The oldest of several endpoints' aged blocks; `None` if any found none. See
+/// [`GateReader::aged_block`] for why the oldest is the safe choice.
+fn oldest_aged_block(found: &[Option<u64>]) -> Option<u64> {
+    found.iter().copied().collect::<Option<Vec<u64>>>()?.into_iter().min()
+}
+
+/// Why [`majority`] refused.
+#[derive(Debug, PartialEq, Eq)]
+struct NoMajority {
+    reason: String,
+    /// Endpoints ANSWERED and differed — as opposed to too few answering.
+    disagreement: bool,
+}
+
+/// The answer at least `min_agree` endpoints returned, provided they are also a
+/// STRICT majority of every endpoint that answered. Pure: this is the security
+/// decision of the refund path.
+///
+/// With two endpoints that means both, identically. With three, two of them —
+/// so one lying endpoint can neither forge a burn nor, by dissenting, stall
+/// every refund on the chain.
+fn majority<T: PartialEq + Clone + std::fmt::Debug>(
+    answers: &[(&str, T)],
+    min_agree: usize,
+) -> Result<T, NoMajority> {
+    if answers.len() < min_agree {
+        return Err(NoMajority {
+            reason: format!("only {} endpoint(s) answered; need {min_agree}", answers.len()),
+            disagreement: false,
+        });
+    }
+    for (_, candidate) in answers {
+        let backers = answers.iter().filter(|(_, v)| v == candidate).count();
+        if backers >= min_agree && backers * 2 > answers.len() {
+            return Ok(candidate.clone());
+        }
+    }
+    Err(NoMajority {
+        reason: format!("no {min_agree} endpoints agree, as a majority, among {answers:?}"),
+        disagreement: true,
+    })
 }
 
 struct DestinationState {
@@ -319,6 +503,9 @@ pub async fn run(
     sources: Vec<(u64, String, Vec<String>)>, // (chain_id, gate, endpoints)
     signer: PrivateKeySigner,
     sink: std::sync::Arc<StoreBackend>,
+    // `[corroborate] require`: also demand two agreeing endpoints on a chain
+    // configured with only one (which then never connects).
+    require_corroboration: bool,
 ) -> anyhow::Result<()> {
     let signer_addr = signer.address();
     let retry = Duration::from_millis(cfg.poll_interval_ms.max(1000));
@@ -330,7 +517,8 @@ pub async fn run(
     // exactly as the transfer scanner does.
     let connect = |chain_id: u64, gate: String, endpoints: Vec<String>| async move {
         loop {
-            match GateReader::connect(chain_id, &gate, &endpoints, cfg.block_confirmation).await {
+            match GateReader::connect(chain_id, &gate, &endpoints, cfg.block_confirmation, require_corroboration)
+                .await {
                 Ok(reader) => break reader,
                 Err(e) => {
                     warn!(chain_id, error = %e, "refund loop: connecting RPC failed; retrying");
@@ -799,5 +987,140 @@ mod tests {
     fn a_delivered_transfer_is_never_attested_without_a_source_reader_either() {
         let delivered = DestinationState { executed: true, cancelled: false };
         assert!(matches!(decide(None, &delivered, true, false, false), Decision::Skip(_)));
+    }
+}
+
+/// Audit round 6, HIGH #2: one destination endpoint used to decide, alone,
+/// whether a transfer was burned — and so whether every validator attested its
+/// refund while the claim signatures still existed.
+#[cfg(test)]
+mod round6_tests {
+    use super::*;
+    use alloy::providers::ProviderBuilder;
+    use alloy_sol_types::SolCall;
+
+    #[test]
+    fn two_endpoints_must_both_agree() {
+        assert_eq!(majority(&[("a", (false, true)), ("b", (false, true))], 2), Ok((false, true)));
+        // THE finding: one endpoint claiming a burn the other does not see.
+        let e = majority(&[("liar", (false, true)), ("honest", (false, false))], 2).unwrap_err();
+        assert!(e.disagreement, "{e:?}");
+        // One endpoint down is not agreement either — and not an accusation.
+        let e = majority(&[("a", (false, true))], 2).unwrap_err();
+        assert!(!e.disagreement, "{e:?}");
+    }
+
+    #[test]
+    fn with_three_endpoints_one_liar_is_outvoted_either_way() {
+        // Forging a burn fails...
+        assert_eq!(
+            majority(&[("liar", true), ("h1", false), ("h2", false)], 2),
+            Ok(false)
+        );
+        // ...and so does stalling every refund by dissenting from a real one.
+        assert_eq!(
+            majority(&[("h1", true), ("liar", false), ("h2", true)], 2),
+            Ok(true)
+        );
+        // Three different answers: nothing.
+        assert!(majority(&[("a", 1), ("b", 2), ("c", 3)], 2).is_err());
+        // Two of four is not a majority.
+        assert!(majority(&[("a", 1), ("b", 1), ("c", 2), ("d", 2)], 2).is_err());
+    }
+
+    #[test]
+    fn a_single_endpoint_chain_is_only_trusted_when_configured_so() {
+        assert_eq!(majority(&[("only", true)], 1), Ok(true));
+        assert!(majority::<bool>(&[], 1).is_err());
+    }
+
+    /// A liar can push the aged block BACK (harder to show the deposit existed
+    /// by then), never forward.
+    #[test]
+    fn the_oldest_aged_block_wins() {
+        assert_eq!(oldest_aged_block(&[Some(900), Some(950)]), Some(900));
+        assert_eq!(oldest_aged_block(&[Some(900), Some(1)]), Some(1));
+        assert_eq!(oldest_aged_block(&[Some(900), None]), None, "no block old enough: nothing ages out");
+    }
+
+    // ---- end to end, against stub JSON-RPC endpoints -----------------------
+
+    /// A gate endpoint at `head` answering `executed`/`cancelled` with the given
+    /// values for any id at any block.
+    async fn stub(head: u64, executed: bool, cancelled: bool) -> String {
+        use axum::{routing::post, Json, Router};
+        let word = |b: bool| format!("0x{:064x}", b as u8);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                let result = match req["method"].as_str() {
+                    Some("eth_blockNumber") => serde_json::json!(format!("{head:#x}")),
+                    Some("eth_chainId") => serde_json::json!("0x1"),
+                    Some("eth_call") => {
+                        let tx = &req["params"][0];
+                        let input = tx["input"].as_str().or(tx["data"].as_str()).unwrap_or_default();
+                        let sel = hex::decode(&input[2..10]).unwrap();
+                        if sel == Gate::executedCall::SELECTOR {
+                            serde_json::json!(word(executed))
+                        } else if sel == Gate::cancelledCall::SELECTOR {
+                            serde_json::json!(word(cancelled))
+                        } else {
+                            panic!("stub RPC: unexpected call {input}")
+                        }
+                    }
+                    m => panic!("stub RPC: unexpected method {m:?}"),
+                };
+                Json(serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/")
+    }
+
+    fn reader(urls: &[String]) -> GateReader {
+        GateReader {
+            chain_id: 1,
+            gate: Address::repeat_byte(0x6A),
+            endpoints: urls
+                .iter()
+                .map(|u| (u.clone(), ProviderBuilder::new().connect_http(u.parse().unwrap()).erased()))
+                .collect(),
+            block_confirmation: 2,
+            min_agree: 2,
+        }
+    }
+
+    /// THE attack. A stuck transfer; a compromised destination endpoint reports it
+    /// burned. Before the fix this read came from that one endpoint, `decide`
+    /// returned `AttestRefund`, and a refund quorum formed on the source while the
+    /// transfer was still claimable. Now the read is refused.
+    #[tokio::test]
+    async fn a_lying_endpoint_cannot_fake_a_burn() {
+        let liar = stub(100, false, true).await;
+        let honest = stub(100, false, false).await;
+        let r = reader(&[liar, honest]);
+        let err = r.destination_state(B256::repeat_byte(7)).await.err().expect("must refuse");
+        assert!(err.to_string().contains("no 2 endpoints agree"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_real_burn_seen_by_both_is_read() {
+        let r = reader(&[stub(100, false, true).await, stub(105, false, true).await]);
+        let d = r.destination_state(B256::repeat_byte(7)).await.unwrap();
+        assert!(!d.executed && d.cancelled);
+        assert_eq!(
+            decide(None, &d, true, false, false),
+            Decision::AttestRefund,
+            "a genuine, corroborated burn must still be refundable"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_endpoints_outvote_one_liar() {
+        let r = reader(&[stub(100, false, true).await, stub(100, false, false).await, stub(100, false, false).await]);
+        let d = r.destination_state(B256::repeat_byte(7)).await.unwrap();
+        assert!(!d.cancelled, "two honest endpoints outvote the forged burn");
     }
 }
