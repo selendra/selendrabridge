@@ -143,6 +143,12 @@ pub enum Unencodable {
     /// is not the record's id. Submitting would fail `NotEnoughSignatures` —
     /// the validators signed a different hash — every single poll.
     IdMismatch,
+    /// The record was minted under a different `bridge_domain` than this gate's
+    /// (audit round 6, LOW — the relayer half of M-6). Rotating the domain is
+    /// MANDATED on every redeploy (round-4 H-3), and the gate rebuilds the id
+    /// with its OWN domain, so a pre-rotation row names an id nobody signed:
+    /// every claim/cancel/refund built from it fails `NotEnoughSignatures`.
+    DomainMismatch { record: [u8; 32], gate: [u8; 32] },
 }
 
 impl std::fmt::Display for Unencodable {
@@ -155,6 +161,14 @@ impl std::fmt::Display for Unencodable {
                 f,
                 "submission_id does not reproduce from the record's fields (auto_params?) — the \
                  gate would reject any instruction built from it"
+            ),
+            Unencodable::DomainMismatch { record, gate } => write!(
+                f,
+                "record bridgeDomain 0x{} is not this gate's 0x{} — minted by a previous deployment \
+                 (the domain was rotated); the gate recomputes a different submissionId, which no \
+                 validator signed, so it can never be claimed, cancelled or refunded here",
+                hex::encode(record),
+                hex::encode(gate)
             ),
         }
     }
@@ -182,10 +196,23 @@ pub struct EncodableRecord {
     pub auto: Option<wire::AutoParamsWire>,
 }
 
-/// Decode and cross-check a record (pure, host-testable).
-pub fn encodable(rec: &SubmissionRecord) -> Result<EncodableRecord, Unencodable> {
+/// Decode and cross-check a record against THIS gate (pure, host-testable).
+///
+/// `gate_domain` is the `bridge_domain` read from the gate's own `Config` — the
+/// value its `claim`/`cancel`/`refund` hash with. Recomputing with the record's
+/// own domain only proved the row self-consistent, not that this gate would
+/// arrive at the same id (audit round 6, LOW: M-6 was fixed in the EVM keeper
+/// but never ported here, so pre-rotation rows were retried every poll).
+pub fn encodable(rec: &SubmissionRecord, gate_domain: &[u8; 32]) -> Result<EncodableRecord, Unencodable> {
     let id = hex32(&rec.submission_id).map_err(|_| Unencodable::Field("submission_id"))?;
     let bridge_domain = hex32(&rec.bridge_domain).map_err(|_| Unencodable::Field("bridge_domain"))?;
+    // Before the recompute: a pre-rotation row is usually self-consistent under
+    // its OWN domain, so the id check below would pass it. The domain is the
+    // actual cause, and naming it is what tells the operator "previous
+    // deployment — route it to the refund path", not "corrupt row".
+    if &bridge_domain != gate_domain {
+        return Err(Unencodable::DomainMismatch { record: bridge_domain, gate: *gate_domain });
+    }
     let debridge_id = hex32(&rec.debridge_id).map_err(|_| Unencodable::Field("debridge_id"))?;
     let receiver = hex_bytes(&rec.receiver).map_err(|_| Unencodable::Field("receiver"))?;
     let native_sender = hex_bytes(&rec.native_sender).map_err(|_| Unencodable::Field("native_sender"))?;
@@ -287,9 +314,9 @@ impl Submitter {
         })
     }
 
-    /// Decode a record, or skip it for good with ONE warning.
-    fn encodable_or_skip(&self, rec: &SubmissionRecord) -> Option<EncodableRecord> {
-        match encodable(rec) {
+    /// Decode a record against this gate, or skip it for good with ONE warning.
+    fn encodable_or_skip(&self, rec: &SubmissionRecord, gate_cfg: &GateConfig) -> Option<EncodableRecord> {
+        match encodable(rec, &gate_cfg.bridge_domain) {
             Ok(e) => Some(e),
             Err(why) => {
                 let mut seen = self.unencodable.lock().unwrap_or_else(|p| p.into_inner());
@@ -362,21 +389,46 @@ impl Submitter {
         // SOURCE side (round 4, M-4): a Solana-origin transfer whose destination
         // was burned comes back here as a `refund`. A failed fetch must not starve
         // the claim queue below, so it is reported and the tick carries on.
-        match self.store.pending_refunds(self.chain_id).await {
-            Ok(queue) => {
-                for rec in queue {
-                    if rec.chain_id_from != self.chain_id || rec.refund_signatures.is_empty() {
-                        continue; // the store is untrusted; re-check its filter
-                    }
-                    if let Err(e) = self.try_refund(&rec).await {
-                        warn!(submission_id = %rec.submission_id, error = %e, "refund failed");
-                    }
-                }
+        let refunds = match self.store.pending_refunds(self.chain_id).await {
+            Ok(queue) => queue,
+            Err(e) => {
+                warn!(error = %e, "fetching the refund queue failed; claims still run");
+                Vec::new()
             }
-            Err(e) => warn!(error = %e, "fetching the refund queue failed; claims still run"),
+        };
+        // Likewise the other way round: a failed claim-queue fetch is returned
+        // at the END, after refunds have had their turn.
+        let claims = self.store.pending_claims(self.chain_id).await;
+        if refunds.is_empty() && claims.as_ref().is_ok_and(|c| c.is_empty()) {
+            return Ok(()); // nothing to do: not even the config read below
         }
 
-        for rec in self.store.pending_claims(self.chain_id).await? {
+        // The gate config, read ONCE per tick and handed to every path: each of
+        // them needs the validator set, and — since audit round 6, LOW (M-6
+        // ported) — the gate's `bridge_domain`, which `encodable_or_skip` checks
+        // BEFORE any per-record RPC so a pre-rotation row is parked in
+        // `unencodable` with one warning instead of being retried forever.
+        // Nothing can be submitted without it, so a failed read fails the tick.
+        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        let gate_cfg = decode_gate_config(
+            &self
+                .rpc
+                .get_account(&config)
+                .await
+                .map_err(|e| anyhow::anyhow!("reading the gate config PDA: {e}"))?
+                .data,
+        )?;
+
+        for rec in refunds {
+            if rec.chain_id_from != self.chain_id || rec.refund_signatures.is_empty() {
+                continue; // the store is untrusted; re-check its filter
+            }
+            if let Err(e) = self.try_refund(&rec, &gate_cfg).await {
+                warn!(submission_id = %rec.submission_id, error = %e, "refund failed");
+            }
+        }
+
+        for rec in claims? {
             if rec.chain_id_to != self.chain_id {
                 continue;
             }
@@ -384,29 +436,29 @@ impl Submitter {
             // it must not queue behind the checks that protect payouts. If a
             // cancel quorum exists the transfer is being unwound, and claiming it
             // would be the wrong outcome.
-            match self.try_cancel_checked(&rec).await {
+            match self.try_cancel_checked(&rec, &gate_cfg).await {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => warn!(submission_id = %rec.submission_id, error = %e, "cancel failed"),
             }
-            if let Err(e) = self.try_claim(&rec).await {
+            if let Err(e) = self.try_claim(&rec, &gate_cfg).await {
                 warn!(submission_id = %rec.submission_id, error = %e, "claim failed");
             }
         }
         Ok(())
     }
 
-    /// Resolve the id + gate config, then attempt a burn. Returns true when one
+    /// Resolve the id against the gate config, then attempt a burn. Returns true when one
     /// was submitted (or the transfer is already spent), so the caller skips the
     /// claim path.
-    async fn try_cancel_checked(&self, rec: &SubmissionRecord) -> anyhow::Result<bool> {
+    async fn try_cancel_checked(&self, rec: &SubmissionRecord, gate_cfg: &GateConfig) -> anyhow::Result<bool> {
         if rec.cancel_signatures.is_empty() {
             return Ok(false);
         }
         // An unencodable record is skipped for claim AND cancel: neither can be
         // expressed to this gate. (Tell the claim path too, so it does not warn
         // a second time.)
-        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(true) };
+        let Some(enc) = self.encodable_or_skip(rec, gate_cfg) else { return Ok(true) };
         let (executed, _) = Pubkey::find_program_address(&[b"executed", &enc.id], &self.program_id);
         if let Some(acct) =
             self.rpc.get_account_with_commitment(&executed, self.rpc.commitment()).await?.value
@@ -415,9 +467,7 @@ impl Submitter {
                 return Ok(true); // already claimed or already burned
             }
         }
-        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
-        let cfg = decode_gate_config(&self.rpc.get_account(&config).await?.data)?;
-        self.try_cancel(rec, &enc, &cfg).await
+        self.try_cancel(rec, &enc, gate_cfg).await
     }
 
     /// Burn a stuck transfer on this (destination) gate once validators have
@@ -481,8 +531,8 @@ impl Submitter {
         Ok(true)
     }
 
-    async fn try_claim(&self, rec: &SubmissionRecord) -> anyhow::Result<()> {
-        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(()) };
+    async fn try_claim(&self, rec: &SubmissionRecord, gate_cfg: &GateConfig) -> anyhow::Result<()> {
+        let Some(enc) = self.encodable_or_skip(rec, gate_cfg) else { return Ok(()) };
         let id = enc.id;
         let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &self.program_id);
 
@@ -507,18 +557,12 @@ impl Submitter {
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault_authority"], &self.program_id);
 
-        // Who may sign, straight from the canonical config PDA — never from the
-        // store, which is exactly the thing an attacker can write to.
-        let config_account = self
-            .rpc
-            .get_account(&config)
-            .await
-            .map_err(|_| anyhow::anyhow!("gate config PDA is not initialized"))?;
-        let gate_cfg = decode_gate_config(&config_account.data)?;
-
+        // Who may sign comes from `gate_cfg`: read by `tick` straight from the
+        // canonical config PDA — never from the store, which is exactly the
+        // thing an attacker can write to.
         let raw_sigs: Vec<Vec<u8>> =
             rec.signatures.iter().filter_map(|s| hex_bytes(&s.signature).ok()).collect();
-        let signatures = ordered_signatures(&id, &raw_sigs, &gate_cfg);
+        let signatures = ordered_signatures(&id, &raw_sigs, gate_cfg);
         // Below quorum there is nothing to submit: the gate would reject it, and
         // sending anyway burns fees on a guaranteed revert every poll.
         //
@@ -614,8 +658,8 @@ impl Submitter {
     /// Mirrors `try_claim`/`try_cancel`: this key only pays fees; the refund
     /// quorum carries the authority, and the program's `process_refund` re-checks
     /// everything (origin record, quorum, asset binding, replay marker) on-chain.
-    async fn try_refund(&self, rec: &SubmissionRecord) -> anyhow::Result<()> {
-        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(()) };
+    async fn try_refund(&self, rec: &SubmissionRecord, gate_cfg: &GateConfig) -> anyhow::Result<()> {
+        let Some(enc) = self.encodable_or_skip(rec, gate_cfg) else { return Ok(()) };
         let id = enc.id;
 
         // Replay guard first: a `["refunded", id]` marker means it is done.
@@ -644,10 +688,9 @@ impl Submitter {
         };
 
         let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
-        let gate_cfg = decode_gate_config(&self.rpc.get_account(&config).await?.data)?;
         let raw: Vec<Vec<u8>> =
             rec.refund_signatures.iter().filter_map(|s| hex_bytes(&s.signature).ok()).collect();
-        let signatures = ordered_signatures(&domain_id(REFUND_PREFIX, &id), &raw, &gate_cfg);
+        let signatures = ordered_signatures(&domain_id(REFUND_PREFIX, &id), &raw, gate_cfg);
         if (signatures.len() as u32) < gate_cfg.threshold {
             return Ok(()); // quorum not yet formed; the gate would reject it
         }
@@ -759,10 +802,17 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
-    fn submitter_for(store: Store, commitment: &str) -> Submitter {
+    pub(super) fn submitter_for(store: Store, commitment: &str) -> Submitter {
+        // A path unique per CALL, not per (pid, commitment): tests run on
+        // parallel threads in one process, and two of them writing then reading
+        // the same `payer-finalized.json` raced — one read a half-written file
+        // (audit round 6, LOW: 26/50 runs failed at 8 threads). No `tempfile`
+        // dev-dependency here, so a process-wide counter does the job.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("solana-relayer-target-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let keypair = dir.join(format!("payer-{commitment}.json"));
+        let keypair = dir.join(format!("payer-{commitment}-{n}.json"));
         solana_sdk::signature::write_keypair_file(&Keypair::new(), &keypair).unwrap();
         let source = SourceChain {
             chain_id: 7_565_164,
@@ -834,6 +884,7 @@ mod tests {
         GateConfig {
             validators: seeds.iter().map(|s| sign(*s, digest).0).collect(),
             threshold,
+            bridge_domain: [0xD0; 32],
         }
     }
 
@@ -1334,7 +1385,7 @@ mod encodable_tests {
 
     #[test]
     fn a_plain_record_reproduces_its_id_with_no_auto() {
-        let e = encodable(&record(500, None)).expect("encodable");
+        let e = encodable(&record(500, None), &DOMAIN).expect("encodable");
         assert!(e.auto.is_none());
         assert_eq!(e.amount, 500);
         assert_eq!(e.debridge_id, DEBRIDGE);
@@ -1345,7 +1396,7 @@ mod encodable_tests {
     /// `auto: None`, hashed to a different id, and failed every poll.
     #[test]
     fn a_record_with_auto_params_reproduces_its_id_with_the_decoded_payload() {
-        let e = encodable(&record(500, Some((1_000_000, 1, vec![0xAA; 20], vec![1, 2, 3]))))
+        let e = encodable(&record(500, Some((1_000_000, 1, vec![0xAA; 20], vec![1, 2, 3]))), &DOMAIN)
             .expect("encodable");
         let auto = e.auto.expect("auto is carried");
         assert_eq!(auto.execution_fee, 1_000_000);
@@ -1360,12 +1411,12 @@ mod encodable_tests {
     fn a_record_whose_id_does_not_reproduce_is_refused() {
         let mut rec = record(500, Some((7, 0, vec![], vec![0xCC; 5])));
         rec.auto_params = "0x".into(); // pretend the payload was not there
-        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::IdMismatch);
+        assert_eq!(encodable(&rec, &DOMAIN).unwrap_err(), Unencodable::IdMismatch);
 
         // Or any tampered hash-bound field.
         let mut rec = record(500, None);
         rec.nonce += 1;
-        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::IdMismatch);
+        assert_eq!(encodable(&rec, &DOMAIN).unwrap_err(), Unencodable::IdMismatch);
     }
 
     /// A payload the program cannot hold is a permanent skip, named as such.
@@ -1376,7 +1427,7 @@ mod encodable_tests {
         let mut blob = hex_bytes(&rec.auto_params).unwrap();
         blob[32 + 15] = 1;
         rec.auto_params = hex0x(&blob);
-        assert!(matches!(encodable(&rec).unwrap_err(), Unencodable::AutoParams(_)));
+        assert!(matches!(encodable(&rec, &DOMAIN).unwrap_err(), Unencodable::AutoParams(_)));
     }
 
     /// Round-4 H-3's shape: an amount the program's `u64` cannot hold.
@@ -1384,13 +1435,63 @@ mod encodable_tests {
     fn an_amount_past_u64_is_a_permanent_skip() {
         let mut rec = record(500, None);
         rec.amount = "18446744073709551616".into(); // 2^64
-        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::Amount);
+        assert_eq!(encodable(&rec, &DOMAIN).unwrap_err(), Unencodable::Amount);
     }
 
     #[test]
     fn malformed_hex_is_named() {
         let mut rec = record(500, None);
         rec.receiver = "0xzz".into();
-        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::Field("receiver"));
+        assert_eq!(encodable(&rec, &DOMAIN).unwrap_err(), Unencodable::Field("receiver"));
+    }
+
+    /// Audit round 6, LOW — M-6 ported to the relayer. A record minted under a
+    /// PREVIOUS deployment's domain is self-consistent (its id reproduces from
+    /// its own fields), which is exactly why the old check let it through and the
+    /// submitter retried it every poll: the gate hashes with its OWN domain and
+    /// finds no signatures over that id. It must now be refused by `encodable`
+    /// and parked, once, in the submitter's `unencodable` set — for claim, cancel
+    /// and refund alike, since all three share `encodable_or_skip`.
+    #[test]
+    fn a_pre_rotation_record_is_parked_not_retried() {
+        const OLD_DOMAIN: [u8; 32] = [0x01; 32]; // the pre-rotation generation
+        let mut rec = record(500, None);
+        let receiver = hex_bytes(&rec.receiver).unwrap();
+        let id = bridge_solana::hash::submission_id(
+            &OLD_DOMAIN, &DEBRIDGE, REC_DECIMALS,
+            &bridge_solana::hash::amount_word(500), 1337, 7565164, 3, &receiver,
+        );
+        rec.bridge_domain = hex0x(&OLD_DOMAIN);
+        rec.submission_id = hex0x(&id);
+
+        // The gate has rotated: its Config carries DOMAIN, not OLD_DOMAIN — and
+        // the decoded GateConfig the submit paths receive now carries it too.
+        let mut cfg_bytes = vec![7u8; 32];               // owner
+        cfg_bytes.extend_from_slice(&DOMAIN);             // bridge_domain (current)
+        cfg_bytes.extend_from_slice(&[0u8; 32]);          // guardian
+        cfg_bytes.extend_from_slice(&1u32.to_le_bytes()); // validators len
+        cfg_bytes.extend_from_slice(&[0xAA; 20]);
+        cfg_bytes.extend_from_slice(&1u32.to_le_bytes()); // threshold
+        cfg_bytes.extend_from_slice(&7_565_164u64.to_le_bytes());
+        cfg_bytes.push(0);                                // paused
+        let gc = decode_gate_config(&cfg_bytes).unwrap();
+        assert_eq!(gc.bridge_domain, DOMAIN, "the gate's domain survives decoding");
+
+        // The gate it was signed for would still accept it...
+        assert!(encodable(&rec, &OLD_DOMAIN).is_ok());
+        // ...the rotated one cannot, and the reason names the cause.
+        let why = encodable(&rec, &gc.bridge_domain).unwrap_err();
+        assert_eq!(why, Unencodable::DomainMismatch { record: OLD_DOMAIN, gate: DOMAIN });
+        assert!(why.to_string().contains("rotated"), "{why}");
+
+        // Parked exactly once; a second pass neither re-warns nor submits.
+        let s = super::tests::submitter_for(Store::new("http://127.0.0.1:1", None).unwrap(), "confirmed");
+        assert!(s.encodable_or_skip(&rec, &gc).is_none());
+        assert!(s.encodable_or_skip(&rec, &gc).is_none());
+        let parked = s.unencodable.lock().unwrap().clone();
+        assert_eq!(parked, HashSet::from([rec.submission_id.clone()]));
+
+        // A current-generation record still goes through.
+        assert!(s.encodable_or_skip(&record(500, None), &gc).is_some());
     }
 }

@@ -280,17 +280,31 @@ async fn scan_source(
 
     // H-2: connect the peer gates this loop will cross-check against. Same retry
     // posture as the source connection — a peer that is momentarily down must not
-    // kill the loop, and `connect_checked` verifies the chain id so a
+    // kill the loop, and `connect_all_checked` verifies the chain id so a
     // wrong-chain endpoint cannot answer for a peer it is not.
+    //
+    // ALL healthy endpoints, not the first (audit round 6, LOW): the scale read
+    // is taken on a `provider::majority`, so one lying peer RPC cannot stop this
+    // validator signing a corridor. And, as for the source, a peer configured
+    // with a second endpoint waits for it — endpoints are probed only here, so
+    // starting on one would read that peer single-source for the process's life.
     let scale_guard = {
         let mut dests = Vec::new();
         for (chain_id, gate_str, urls) in &scale_peers {
             let gate_addr: Address = gate_str
                 .parse()
                 .with_context(|| format!("bad gate address for destination {chain_id}"))?;
-            let provider = loop {
-                match provider::connect_checked(urls, *chain_id).await {
-                    Ok(p) => break p,
+            let min_agree = provider::min_agree(urls.len(), false);
+            let endpoints = loop {
+                match provider::connect_all_checked(urls, *chain_id).await {
+                    Ok(e) if e.len() >= min_agree => break e,
+                    Ok(e) => {
+                        warn!(chain_id, endpoints_configured = urls.len(), endpoints_healthy = e.len(),
+                              "fewer than TWO healthy destination RPC endpoints for a peer configured \
+                               with a second: not reading its bridge decimals single-source \
+                               (audit round 6, LOW); retrying");
+                        tokio::time::sleep(retry).await;
+                    }
                     Err(e) => {
                         warn!(chain_id, error = %e,
                               "connecting destination RPC for the bridge-decimals check failed; retrying");
@@ -298,7 +312,7 @@ async fn scan_source(
                     }
                 }
             };
-            dests.push(scale::Destination { chain_id: *chain_id, gate: gate_addr, provider });
+            dests.push(scale::Destination { chain_id: *chain_id, gate: gate_addr, endpoints, min_agree });
         }
         let solana = solana_peers
             .iter()
@@ -325,8 +339,33 @@ async fn scan_source(
     // possibility of that misconfiguration entirely, and costs one call at
     // startup. Retry rather than exit: a momentarily flaky RPC must not kill the
     // scan loop for this chain (and, per main's isolation, never its siblings).
+    //
+    // From EVERY endpoint in the pool, on a `provider::majority` (audit round 6,
+    // LOW). This used to read `failover.active_provider()` alone, so one lying
+    // endpoint could hand this loop a wrong domain and silently stop it signing.
+    // Liveness only — a wrong domain can only make ids mismatch — but a
+    // disagreement is now a loud retry instead of a quiet dead validator. The
+    // pool already holds >= 2 endpoints whenever >= 2 are configured (above).
+    let domain_endpoints = failover.all_providers();
+    let domain_min_agree = provider::min_agree(endpoints.len(), false);
     let bridge_domain: B256 = loop {
-        match Gate::new(gate, failover.active_provider()).bridgeDomain().call().await {
+        let read = provider::read_agreed(
+            &domain_endpoints,
+            domain_min_agree,
+            "Gate.bridgeDomain()",
+            |p| async move { Ok(Gate::new(gate, p).bridgeDomain().call().await?) },
+            |answers| {
+                warn!(
+                    chain_id = source.chain_id,
+                    gate = %gate,
+                    answers = ?answers,
+                    "RPC ENDPOINTS DISAGREE about Gate.bridgeDomain() — not scanning until they \
+                     agree (audit H-4, round 6). One endpoint is wrong about the chain: investigate."
+                );
+            },
+        )
+        .await;
+        match read {
             Ok(d) => break d,
             Err(e) => {
                 warn!(

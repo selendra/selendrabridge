@@ -113,28 +113,14 @@ fn log_key(l: &Log) -> LogKey {
     )
 }
 
-/// Connect to the first endpoint that answers AND reports `expected_chain_id`.
-///
-/// Used by the refund loop, which needs a plain provider for `eth_call` reads of
-/// gate state rather than the log-scanning surface [`Failover`] exposes. The
-/// chainId guard matters more here than anywhere: attesting a refund on the
-/// strength of a *different* chain's `executed` flag would be exactly the
-/// mistake that lets a delivered transfer also be refunded.
-pub async fn connect_checked(urls: &[String], expected_chain_id: u64) -> anyhow::Result<DynProvider> {
-    probe(urls, expected_chain_id, true, None)
-        .await
-        .into_iter()
-        .next()
-        .map(|e| e.provider)
-        .ok_or_else(|| anyhow::anyhow!("no healthy RPC endpoints for chain {expected_chain_id}"))
-}
-
 /// Every endpoint that answers AND reports `expected_chain_id`, in the order
 /// given, each with its REDACTED url (safe to log). Errors if none survive.
 ///
 /// For callers that must cross-check one read across endpoints rather than use
 /// whichever answers first — the refund loop, whose `executed`/`cancelled` reads
-/// decide whether a transfer may be paid back (audit round 6).
+/// decide whether a transfer may be paid back (audit round 6), and the H-2
+/// scale-peer reads (audit round 6, LOW; they used a first-healthy-only
+/// `connect_checked`, now removed).
 pub async fn connect_all_checked(
     urls: &[String],
     expected_chain_id: u64,
@@ -142,6 +128,107 @@ pub async fn connect_all_checked(
     let healthy = probe(urls, expected_chain_id, false, None).await;
     anyhow::ensure!(!healthy.is_empty(), "no healthy RPC endpoints for chain {expected_chain_id}");
     Ok(healthy.into_iter().map(|e| (e.url, e.provider)).collect())
+}
+
+/// How many endpoints must return the same answer for a cross-checked read: 2
+/// whenever the chain is configured with a second endpoint (or `[corroborate]
+/// require = true` is passed as `require`), 1 only for a deliberately
+/// single-endpoint chain. One rule for the refund reads, the startup
+/// `Gate.bridgeDomain()` read and the H-2 scale-peer reads (audit round 6, LOW).
+pub fn min_agree(configured: usize, require: bool) -> usize {
+    if configured >= 2 || require {
+        2
+    } else {
+        1
+    }
+}
+
+/// Why [`majority`] refused.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NoMajority {
+    pub reason: String,
+    /// Endpoints ANSWERED and differed — as opposed to too few answering.
+    pub disagreement: bool,
+}
+
+/// The answer at least `min_agree` endpoints returned, provided they are also a
+/// STRICT majority of every endpoint that answered. Pure: this is the security
+/// decision of every cross-checked point read (refund, bridgeDomain, scale).
+///
+/// With two endpoints that means both, identically. With three, two of them —
+/// so one lying endpoint can neither forge an answer nor, by dissenting, stall
+/// the read.
+///
+/// Moved here from `refund.rs` (audit round 6, LOW) so the startup reads that
+/// used to be single-source apply the SAME rule rather than a second copy of it.
+pub fn majority<T: PartialEq + Clone + std::fmt::Debug>(
+    answers: &[(&str, T)],
+    min_agree: usize,
+) -> Result<T, NoMajority> {
+    if answers.len() < min_agree {
+        return Err(NoMajority {
+            reason: format!("only {} endpoint(s) answered; need {min_agree}", answers.len()),
+            disagreement: false,
+        });
+    }
+    for (_, candidate) in answers {
+        let backers = answers.iter().filter(|(_, v)| v == candidate).count();
+        if backers >= min_agree && backers * 2 > answers.len() {
+            return Ok(candidate.clone());
+        }
+    }
+    Err(NoMajority {
+        reason: format!("no {min_agree} endpoints agree, as a majority, among {answers:?}"),
+        disagreement: true,
+    })
+}
+
+/// Ask every endpoint the same question, sequentially. Returns the answers (by
+/// redacted url) and the failures, for [`majority`] and the caller's log line.
+pub async fn ask_all<T, F, Fut>(endpoints: &[(String, DynProvider)], read: F) -> (Vec<(String, T)>, Vec<String>)
+where
+    F: Fn(DynProvider) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut answers = Vec::new();
+    let mut failed = Vec::new();
+    for (url, p) in endpoints {
+        match read(p.clone()).await {
+            Ok(v) => answers.push((url.clone(), v)),
+            Err(e) => failed.push(format!("{url}: {e}")),
+        }
+    }
+    (answers, failed)
+}
+
+/// [`ask_all`] then [`majority`]: `Ok` only on an agreed answer. On refusal the
+/// error names what was read and every endpoint that failed; a DISAGREEMENT (as
+/// opposed to too few answers) is also reported through `on_disagree` with the
+/// answers, so each caller can log it loudly in its own terms.
+pub async fn read_agreed<T, F, Fut>(
+    endpoints: &[(String, DynProvider)],
+    min_agree: usize,
+    what: &str,
+    read: F,
+    on_disagree: impl FnOnce(&[(&str, T)]),
+) -> anyhow::Result<T>
+where
+    T: PartialEq + Clone + std::fmt::Debug,
+    F: Fn(DynProvider) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let (answers, failed) = ask_all(endpoints, read).await;
+    let answers: Vec<(&str, T)> = answers.iter().map(|(u, v)| (u.as_str(), v.clone())).collect();
+    majority(&answers, min_agree).map_err(|e| {
+        if e.disagreement {
+            on_disagree(&answers);
+        }
+        anyhow::anyhow!(
+            "{what}: {}{}",
+            e.reason,
+            if failed.is_empty() { String::new() } else { format!(" (failed: {})", failed.join("; ")) }
+        )
+    })
 }
 
 /// Build a provider for every url that parses, and keep those whose
@@ -335,12 +422,12 @@ impl Failover {
         ))
     }
 
-    /// A clone of the currently-active provider, for one-off contract reads that
-    /// do not warrant a dedicated failover wrapper (e.g. the startup read of
-    /// `Gate.bridgeDomain()`). Callers own the retry: this hands back whichever
-    /// endpoint is active right now and does not rotate on failure.
-    pub fn active_provider(&self) -> DynProvider {
-        self.endpoints[self.active].provider.clone()
+    /// Every endpoint in the pool, (redacted url, provider), for one-off point
+    /// reads that must be cross-checked with [`read_agreed`] rather than taken
+    /// from whichever endpoint is active — e.g. the startup read of
+    /// `Gate.bridgeDomain()` (audit round 6, LOW: it used to be single-source).
+    pub fn all_providers(&self) -> Vec<(String, DynProvider)> {
+        self.endpoints.iter().map(|e| (e.url.clone(), e.provider.clone())).collect()
     }
 
     pub async fn get_block_number(&mut self) -> anyhow::Result<u64> {
@@ -948,5 +1035,74 @@ mod stagger_tests {
             preferred(2, val2),
             "both even: they align, and no offset scheme avoids it at n=2"
         );
+    }
+}
+
+/// Audit round 6, LOW: the startup `Gate.bridgeDomain()` read and the H-2
+/// scale-peer reads used ONE endpoint. They now share the refund path's
+/// majority rule through [`read_agreed`].
+#[cfg(test)]
+mod agreed_read_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn endpoints(n: usize) -> Vec<(String, DynProvider)> {
+        (0..n)
+            .map(|i| {
+                let p = DynProvider::new(ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap()));
+                (format!("ep{i}"), p)
+            })
+            .collect()
+    }
+
+    /// Answer the i-th call with `script[i]` (`None` = transport failure).
+    async fn run(script: &[Option<u8>], min_agree: usize) -> (anyhow::Result<u8>, bool) {
+        let calls = AtomicUsize::new(0);
+        let mut disagreed = false;
+        let r = read_agreed(
+            &endpoints(script.len()),
+            min_agree,
+            "test read",
+            |_| {
+                let v = script[calls.fetch_add(1, Ordering::SeqCst)];
+                async move { v.ok_or_else(|| anyhow::anyhow!("refused")) }
+            },
+            |_| disagreed = true,
+        )
+        .await;
+        (r, disagreed)
+    }
+
+    #[test]
+    fn a_second_configured_endpoint_means_two_must_agree() {
+        assert_eq!(min_agree(1, false), 1);
+        assert_eq!(min_agree(2, false), 2);
+        assert_eq!(min_agree(3, false), 2);
+        assert_eq!(min_agree(1, true), 2);
+    }
+
+    #[tokio::test]
+    async fn one_lying_endpoint_of_two_is_a_loud_refusal_not_an_answer() {
+        let (r, disagreed) = run(&[Some(6), Some(18)], 2).await;
+        assert!(r.is_err() && disagreed, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn one_endpoint_down_of_two_is_a_quiet_refusal() {
+        let (r, disagreed) = run(&[Some(6), None], 2).await;
+        let e = r.unwrap_err().to_string();
+        assert!(!disagreed && e.contains("ep1: refused"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn with_three_endpoints_one_liar_is_outvoted() {
+        assert_eq!(run(&[Some(18), Some(6), Some(6)], 2).await.0.unwrap(), 6);
+        assert_eq!(run(&[Some(6), Some(6)], 2).await.0.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_single_endpoint_chain_reads_single_source_only_by_configuration() {
+        assert_eq!(run(&[Some(6)], 1).await.0.unwrap(), 6);
+        assert!(run(&[Some(6)], 2).await.0.is_err());
     }
 }

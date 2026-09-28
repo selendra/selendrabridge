@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use bridge_core::abi::Gate;
@@ -44,7 +45,34 @@ use tracing::{debug, info, warn};
 /// BEFORE considering a resubmit — a duplicate goes out only once the original
 /// is gone from the mempool or has mined and reverted. Each `try_*` still
 /// re-checks on-chain state first, so a retry after a tx actually landed is a no-op.
+///
+/// It is also the fee-bump interval: a remembered tx still in the pool one full
+/// window after its last broadcast is replaced at the same nonce with higher
+/// fees (see [`maybe_replace`]).
+#[cfg(not(test))]
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Shortened so the anvil-backed stuck-tx regression runs in seconds.
+#[cfg(test)]
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Fee bump per replacement, as a fraction: +1/8 = +12.5%. geth refuses a
+/// same-nonce replacement that does not raise BOTH `maxFeePerGas` and
+/// `maxPriorityFeePerGas` by at least 10% ("replacement transaction
+/// underpriced"); 12.5% clears that with margin for integer rounding. When the
+/// network's current estimate is higher still, the estimate is used instead.
+const FEE_BUMP_DIVISOR: u128 = 8;
+
+/// At most this many replacements per stuck tx (audit round 6, LOW). Together
+/// with [`MAX_FEE_MULTIPLE`] this bounds what a fee spike can cost the keeper
+/// account: 1.125^5 is ~1.8x from bumps alone, and a spiking estimate can take
+/// it further only up to the multiple.
+const MAX_FEE_BUMPS: u32 = 5;
+
+/// Hard ceiling on a replacement's fee, as a multiple of the fee the ORIGINAL
+/// broadcast carried (which was itself the network estimate at the time). A
+/// replacement that cannot clear the 10% minimum without crossing it is not
+/// sent; the tx is left to wait (and the operator is told).
+const MAX_FEE_MULTIPLE: u128 = 4;
 
 /// How often [`GateView`] re-reads `threshold`, `validatorCount` and validator
 /// membership from the gate.
@@ -168,6 +196,18 @@ async fn main() -> anyhow::Result<()> {
 /// this tx as pending and takes `n + 1`, which it cannot do if the lock is still
 /// held while we wait for the block.
 type SendLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
+/// Everything [`confirm`] needs to put a tx on one chain: that chain's
+/// [`SendLock`], and the keeper address the nonce is read for.
+///
+/// The address is needed because `confirm` now populates nonce, gas and fees
+/// ITSELF instead of leaving them to the provider's fillers: a stuck tx can only
+/// be replaced if the keeper knows exactly which nonce and fees it went out
+/// with (audit round 6, LOW — see [`maybe_replace`]).
+struct Submitter {
+    lock: SendLock,
+    from: Address,
+}
 
 /// wrong network is not something to keep retrying.
 async fn connect_gate(
@@ -313,6 +353,7 @@ async fn run_target(
     let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&target, &signer, "target").await?;
     let gate = Gate::new(gate_addr, &provider);
+    let submitter = Submitter { lock: send_lock, from: signer.address() };
 
     // Submissions already reported UNCLAIMABLE on this chain. Bounded in practice
     // by the number of simultaneously-stranded transfers, and entries are dropped
@@ -412,7 +453,7 @@ async fn run_target(
                 if !pending.may_submit(&provider, &rec.submission_id, SigKind::Cancel).await {
                     continue;
                 }
-                match try_cancel(&gate, &rec, &cancel_sigs, &send_lock).await {
+                match try_cancel(&gate, &rec, &cancel_sigs, &submitter).await {
                     // The DB `refund_status` is advanced by the indexer when it
                     // observes the resulting `Cancelled` event on-chain, not
                     // reported here — the keeper's word is not authoritative for a
@@ -456,7 +497,7 @@ async fn run_target(
             if !pending.may_submit(&provider, &rec.submission_id, SigKind::Transfer).await {
                 continue;
             }
-            match try_claim(&gate, &rec, &claim_sigs, bridge_domain, &send_lock).await {
+            match try_claim(&gate, &rec, &claim_sigs, bridge_domain, &submitter).await {
                 Ok(ClaimOutcome::Submitted(tx)) => {
                     stranded.clear(&rec.submission_id);
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
@@ -535,6 +576,7 @@ async fn run_source_refunds(
     let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&src, &signer, "source refund").await?;
     let gate = Gate::new(gate_addr, &provider);
+    let submitter = Submitter { lock: send_lock, from: signer.address() };
     let mut pending = PendingTxs::default();
     // Reported-once memo, as in the claim loop.
     let mut stranded = StrandedLog::default();
@@ -579,7 +621,13 @@ async fn run_source_refunds(
                 }
                 continue;
             }
-            match try_refund(&gate, &rec, &refund_sigs, &send_lock).await {
+            // The refund loop recorded timed-out refunds in `pending` but never
+            // consulted it, so a slow refund was re-sent at the next nonce every
+            // tick, and was never fee-bumped either (audit round 6, LOW).
+            if !pending.may_submit(&provider, &rec.submission_id, SigKind::Refund).await {
+                continue;
+            }
+            match try_refund(&gate, &rec, &refund_sigs, &submitter).await {
                 // As with cancel, the indexer records `refund_status = refunded`
                 // from the observed on-chain `Refunded` event; the keeper does not
                 // report a state that gates the candidate list.
@@ -667,6 +715,12 @@ impl StrandedLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiptTimeout {
     hash: B256,
+    /// The fully populated request that was signed (nonce, gas, fees included)
+    /// — what a fee-bump replacement is built from.
+    tx: TransactionRequest,
+    /// When it was broadcast, so the first bump waits one window from the
+    /// broadcast rather than from when the loop noticed the timeout.
+    sent_at: Instant,
 }
 
 impl std::fmt::Display for ReceiptTimeout {
@@ -718,6 +772,110 @@ fn resolve_pending(probe: TxProbe) -> PendingAction {
     }
 }
 
+/// One verdict for a nonce from the probes of every hash broadcast at it (the
+/// original and each fee-bump replacement).
+///
+/// At most one of them can ever mine — they share a nonce — so a receipt for
+/// ANY of them settles it, and the rest will read `Gone`. Short of that, one
+/// still in the pool means the nonce is still in flight; an unanswerable probe
+/// is treated as in flight (fail closed, as in [`resolve_pending`]); only when
+/// EVERY hash is gone may the tick submit afresh.
+fn combine_probes(probes: impl IntoIterator<Item = TxProbe>) -> TxProbe {
+    fn rank(p: TxProbe) -> u8 {
+        match p {
+            TxProbe::Mined { .. } => 3,
+            TxProbe::InMempool => 2,
+            TxProbe::Unknown => 1,
+            TxProbe::Gone => 0,
+        }
+    }
+    probes.into_iter().fold(TxProbe::Gone, |acc, p| if rank(p) > rank(acc) { p } else { acc })
+}
+
+/// The smallest fee a replacement may carry over `current`, raised to the
+/// network's current `estimate` when that is higher, and clamped to `ceiling`.
+/// `None` when even the minimum bump would cross the ceiling.
+///
+/// The minimum is `current + current/8 + 1` (>12.5%), which always clears the
+/// 10% geth demands of a replacement — the `+ 1` keeps that true for fees small
+/// enough that `current/8` rounds to nothing.
+fn bumped_fee(current: u128, estimate: Option<u128>, ceiling: u128) -> Option<u128> {
+    let min = current.saturating_add(current / FEE_BUMP_DIVISOR).saturating_add(1);
+    if min > ceiling {
+        return None;
+    }
+    Some(estimate.map_or(min, |e| e.max(min)).min(ceiling))
+}
+
+/// The same request with only its fees raised — same nonce, to, value, input
+/// and gas limit — or `None` if the ceiling forbids any further bump.
+///
+/// EIP-1559 txs raise `maxFeePerGas` AND `maxPriorityFeePerGas` (geth checks
+/// both); a legacy tx raises `gasPrice`. The priority fee is kept `<=` the max
+/// fee, which cannot pull it back under its own 10% floor because the old
+/// priority fee was itself `<=` the old max fee.
+fn reprice(
+    tx: &TransactionRequest,
+    estimate: Option<alloy::eips::eip1559::Eip1559Estimation>,
+    gas_price_estimate: Option<u128>,
+    ceiling: u128,
+) -> Option<TransactionRequest> {
+    let mut next = tx.clone();
+    if let (Some(max_fee), Some(tip)) = (tx.max_fee_per_gas, tx.max_priority_fee_per_gas) {
+        let new_max = bumped_fee(max_fee, estimate.map(|e| e.max_fee_per_gas), ceiling)?;
+        let new_tip = bumped_fee(tip, estimate.map(|e| e.max_priority_fee_per_gas), ceiling)?;
+        next.max_fee_per_gas = Some(new_max);
+        next.max_priority_fee_per_gas = Some(new_tip.min(new_max));
+    } else {
+        // No gasPrice either: not populated by `populate`, nothing known to bump.
+        next.gas_price = Some(bumped_fee(tx.gas_price?, gas_price_estimate, ceiling)?);
+    }
+    Some(next)
+}
+
+/// The fee a request pays per gas at most: `maxFeePerGas`, or a legacy
+/// `gasPrice`.
+fn fee_cap(tx: &TransactionRequest) -> u128 {
+    tx.max_fee_per_gas.or(tx.gas_price).unwrap_or(0)
+}
+
+/// One nonce's worth of in-flight submission: the request as last broadcast,
+/// and every hash that has gone out at that nonce.
+///
+/// Audit round 6, LOW: this used to be a bare hash, and a remembered tx that
+/// stayed in the pool was waited on FOREVER (`InMempool => Wait`, with nothing
+/// else ever happening). An underpriced tx at nonce n therefore never mined,
+/// and — every claim, cancel and refund on that chain sharing one account —
+/// every later tx queued behind it at n+1, n+2, ..., each costing a full
+/// [`RECEIPT_TIMEOUT`] of the loop and none ever landing. One fee spike wedged
+/// the chain's keeper until someone cleared the nonce by hand.
+///
+/// Now the tx is REPLACED at the same nonce with higher fees (see
+/// [`maybe_replace`]). Replacing rather than resubmitting is what keeps it
+/// safe: a same-nonce replacement cannot also mine alongside the original, so
+/// there is never a second execution to pay for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlight {
+    /// Fully populated (from, nonce, gas, fees): exactly what was last signed.
+    tx: TransactionRequest,
+    /// Oldest first; the last is the current replacement. ALL are polled —
+    /// whichever mines wins, and the rest become `Gone`.
+    hashes: Vec<B256>,
+    /// Replacements sent (or attempted) so far; capped at [`MAX_FEE_BUMPS`].
+    bumps: u32,
+    /// Last broadcast. A replacement waits one [`RECEIPT_TIMEOUT`] from here.
+    last_sent: Instant,
+    /// [`MAX_FEE_MULTIPLE`] times the ORIGINAL broadcast's fee cap.
+    ceiling: u128,
+}
+
+impl InFlight {
+    fn new(tx: TransactionRequest, hash: B256, sent_at: Instant) -> Self {
+        let ceiling = fee_cap(&tx).saturating_mul(MAX_FEE_MULTIPLE);
+        Self { tx, hashes: vec![hash], bumps: 0, last_sent: sent_at, ceiling }
+    }
+}
+
 /// Hashes of submitted txs whose receipt did not arrive within
 /// [`RECEIPT_TIMEOUT`], keyed by `(submission_id, kind)` — one claim, one
 /// cancel and one refund can each be in flight for the same id, but never two
@@ -727,19 +885,21 @@ fn resolve_pending(probe: TxProbe) -> PendingAction {
 /// this memo is what stops the fresh nonce from being used to queue a
 /// duplicate behind a tx that is merely slow.
 #[derive(Default)]
-struct PendingTxs(HashMap<(String, &'static str), B256>);
+struct PendingTxs(HashMap<(String, &'static str), InFlight>);
 
 impl PendingTxs {
     fn key(submission_id: &str, kind: SigKind) -> (String, &'static str) {
         (submission_id.to_owned(), kind.as_str())
     }
 
-    fn track(&mut self, submission_id: &str, kind: SigKind, hash: B256) {
-        self.0.insert(Self::key(submission_id, kind), hash);
+    fn track(&mut self, submission_id: &str, kind: SigKind, tx: InFlight) {
+        self.0.insert(Self::key(submission_id, kind), tx);
     }
 
+    /// The most recent hash broadcast for this `(id, kind)`.
+    #[cfg(test)]
     fn hash(&self, submission_id: &str, kind: SigKind) -> Option<B256> {
-        self.0.get(&Self::key(submission_id, kind)).copied()
+        self.0.get(&Self::key(submission_id, kind)).and_then(|f| f.hashes.last().copied())
     }
 
     fn clear(&mut self, submission_id: &str, kind: SigKind) {
@@ -766,8 +926,14 @@ impl PendingTxs {
         submission_id: &str,
         kind: SigKind,
     ) -> bool {
-        let Some(hash) = self.hash(submission_id, kind) else { return true };
-        let probe = probe_tx(provider, hash).await;
+        let key = Self::key(submission_id, kind);
+        let Some(hashes) = self.0.get(&key).map(|f| f.hashes.clone()) else { return true };
+        let hash = *hashes.last().expect("an InFlight always holds at least one hash");
+        let mut probes = Vec::with_capacity(hashes.len());
+        for h in &hashes {
+            probes.push(probe_tx(provider, *h).await);
+        }
+        let probe = combine_probes(probes);
         match self.apply(submission_id, kind, probe) {
             PendingAction::Landed => {
                 info!(submission_id, tx = %hash, kind = kind.as_str(), "earlier tx landed after its receipt timed out");
@@ -779,6 +945,13 @@ impl PendingTxs {
             }
             PendingAction::Wait => {
                 debug!(submission_id, tx = %hash, kind = kind.as_str(), ?probe, "earlier tx still in flight; not resubmitting");
+                // Only a tx the node positively holds is re-priced. `Unknown`
+                // is an RPC failure, not evidence the fee is too low.
+                if probe == TxProbe::InMempool {
+                    if let Some(f) = self.0.get_mut(&key) {
+                        maybe_replace(provider, submission_id, kind, f).await;
+                    }
+                }
                 false
             }
         }
@@ -788,7 +961,7 @@ impl PendingTxs {
     /// means nothing was left in flight.
     fn note_failure(&mut self, submission_id: &str, kind: SigKind, err: &anyhow::Error) {
         if let Some(t) = err.downcast_ref::<ReceiptTimeout>() {
-            self.track(submission_id, kind, t.hash);
+            self.track(submission_id, kind, InFlight::new(t.tx.clone(), t.hash, t.sent_at));
         }
     }
 
@@ -800,6 +973,93 @@ impl PendingTxs {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// Replace a stuck tx at its own nonce with higher fees, if it is due.
+///
+/// Called only for a tx the node still holds in its pool. Sends nothing unless
+/// ALL of these hold, and records a skipped reason where one matters:
+///   * a full [`RECEIPT_TIMEOUT`] has passed since the last broadcast — each
+///     price gets a fair window, and a 1 s poll does not become a bump per tick;
+///   * fewer than [`MAX_FEE_BUMPS`] replacements have gone out, and the bump
+///     fits under the [`MAX_FEE_MULTIPLE`] ceiling — so a fee spike cannot
+///     drain the keeper account;
+///   * the tx's nonce is the account's NEXT to mine (`latest` count == nonce).
+///     A tx at n+1 is usually stuck only because n is; re-pricing it would pay
+///     more for nothing. Once n mines, n+1 becomes the head and is judged on
+///     its own fee after its next window.
+///
+/// The replacement is the identical call (to, value, input, gas limit) at the
+/// same nonce, so at most one of the two can ever execute. Its hash is added to
+/// the entry and polled alongside the original's.
+async fn maybe_replace<P: Provider>(provider: &P, submission_id: &str, kind: SigKind, f: &mut InFlight) {
+    if f.last_sent.elapsed() < RECEIPT_TIMEOUT {
+        return;
+    }
+    let (Some(from), Some(nonce)) = (f.tx.from, f.tx.nonce) else { return };
+    let current = *f.hashes.last().expect("an InFlight always holds at least one hash");
+    if f.bumps >= MAX_FEE_BUMPS {
+        // Re-armed each window, so this is one line per RECEIPT_TIMEOUT, not per tick.
+        f.last_sent = Instant::now();
+        warn!(
+            submission_id, kind = kind.as_str(), nonce, tx = %current, bumps = f.bumps,
+            max_fee_per_gas = fee_cap(&f.tx),
+            "tx STILL stuck after the maximum number of fee bumps; not raising further — \
+             the keeper's later txs on this chain queue behind it until it mines or is cleared"
+        );
+        return;
+    }
+    match provider.get_transaction_count(from).latest().await {
+        Ok(next) if next == nonce => {}
+        // Behind an earlier nonce (not this tx's fee's fault), or the nonce has
+        // just been consumed and the next probe will find the receipt.
+        Ok(_) => return,
+        Err(e) => {
+            warn!(submission_id, tx = %current, error = %e, "nonce read failed; not re-pricing this tick");
+            return;
+        }
+    }
+    let estimate = if f.tx.max_fee_per_gas.is_some() {
+        provider.estimate_eip1559_fees().await.ok()
+    } else {
+        None
+    };
+    let gas_price = if f.tx.gas_price.is_some() { provider.get_gas_price().await.ok() } else { None };
+    // Counted before sending: a rejected replacement still uses up an attempt,
+    // so a node that keeps refusing cannot turn this into a loop.
+    f.bumps += 1;
+    f.last_sent = Instant::now();
+    let Some(replacement) = reprice(&f.tx, estimate, gas_price, f.ceiling) else {
+        f.bumps = MAX_FEE_BUMPS;
+        warn!(
+            submission_id, kind = kind.as_str(), nonce, tx = %current,
+            max_fee_per_gas = fee_cap(&f.tx), ceiling = f.ceiling,
+            "stuck tx cannot be re-priced under the fee ceiling ({MAX_FEE_MULTIPLE}x its original fee); \
+             leaving it to wait"
+        );
+        return;
+    };
+    match provider.send_transaction(replacement.clone()).await {
+        Ok(sent) => {
+            let hash = *sent.tx_hash();
+            warn!(
+                submission_id, kind = kind.as_str(), nonce, replaced = %current, tx = %hash,
+                bump = f.bumps,
+                old_max_fee_per_gas = fee_cap(&f.tx), new_max_fee_per_gas = fee_cap(&replacement),
+                "tx stuck in the mempool past its receipt window; REPLACED at the same nonce with higher fees"
+            );
+            f.hashes.push(hash);
+            f.tx = replacement;
+        }
+        // e.g. "replacement transaction underpriced" against a node with a
+        // stricter rule, or "nonce too low" because the original just mined
+        // (the next probe sees its receipt). The pool is unchanged; the next
+        // window bumps again from the fees still in it.
+        Err(e) => warn!(
+            submission_id, kind = kind.as_str(), nonce, tx = %current, bump = f.bumps, error = %e,
+            "fee-bump replacement was rejected; retrying after the next receipt window"
+        ),
     }
 }
 
@@ -853,7 +1113,7 @@ async fn try_claim<P: Provider>(
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
     bridge_domain: B256,
-    send_lock: &SendLock,
+    submitter: &Submitter,
 ) -> anyhow::Result<ClaimOutcome> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -933,7 +1193,7 @@ async fn try_claim<P: Provider>(
         native_sender,
         signatures,
     );
-    confirm(call, "claim", &rec.submission_id, "CLAIMED", send_lock).await.map(ClaimOutcome::Submitted)
+    confirm(call, "claim", &rec.submission_id, "CLAIMED", submitter).await.map(ClaimOutcome::Submitted)
 }
 
 /// Send a prepared gate call, await its receipt, and refuse to report a
@@ -948,18 +1208,24 @@ async fn try_claim<P: Provider>(
 /// re-checks on-chain state first, so a retry after a tx really landed is a no-op.
 ///
 /// `verb` names the call in the error; `done` is the log line on success.
-async fn confirm<P: Provider>(
+async fn confirm<P: Provider + Clone>(
     call: alloy::contract::CallBuilder<P, impl alloy::contract::CallDecoder>,
     verb: &str,
     submission_id: &str,
     done: &str,
-    send_lock: &SendLock,
+    submitter: &Submitter,
 ) -> anyhow::Result<String> {
+    let provider = call.provider.clone();
     // See [`SendLock`]: the nonce fetch and the broadcast are one critical section
     // per chain, and the guard is released before the receipt wait below.
-    let pending = {
-        let _guard = send_lock.lock().await;
-        call.send().await.with_context(|| format!("send {verb}"))?
+    let (pending, tx, sent_at) = {
+        let _guard = submitter.lock.lock().await;
+        let tx = populate(&provider, call.into_transaction_request(), submitter.from)
+            .await
+            .with_context(|| format!("send {verb}"))?;
+        let pending =
+            provider.send_transaction(tx.clone()).await.with_context(|| format!("send {verb}"))?;
+        (pending, tx, Instant::now())
     };
     let hash = *pending.tx_hash();
     let receipt = match pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await {
@@ -969,7 +1235,7 @@ async fn confirm<P: Provider>(
         // `PendingTxs`) instead of queueing a duplicate next tick.
         Err(alloy::providers::PendingTransactionError::TxWatcher(
             alloy::providers::WatchTxError::Timeout,
-        )) => return Err(ReceiptTimeout { hash }.into()),
+        )) => return Err(ReceiptTimeout { hash, tx, sent_at }.into()),
         Err(e) => return Err(anyhow::Error::from(e).context("await receipt")),
     };
     if !receipt.status() {
@@ -983,6 +1249,39 @@ async fn confirm<P: Provider>(
     Ok(format!("{:#x}", receipt.transaction_hash))
 }
 
+/// Fill in exactly what the provider's fillers would — the pending nonce (the
+/// `SimpleNonceManager` rule, deliberately: see `connect_gate`), the gas
+/// estimate, and EIP-1559 fees falling back to a legacy gas price where the
+/// chain has no base fee — but HERE, so the caller holds the populated request.
+///
+/// The fillers still run on send and find nothing left to do but the chain id
+/// and the signature. Letting them fill everything, as `call.send()` used to,
+/// left the keeper not knowing which nonce and fees its own tx carried, which is
+/// what made a stuck tx impossible to replace (audit round 6, LOW).
+async fn populate<P: Provider>(
+    provider: &P,
+    mut tx: TransactionRequest,
+    from: Address,
+) -> anyhow::Result<TransactionRequest> {
+    tx.from = Some(from);
+    tx.nonce = Some(provider.get_transaction_count(from).pending().await?);
+    // estimateGas surfaces a revert (e.g. `UnknownAsset`) exactly as the gas
+    // filler did, so failure reporting is unchanged.
+    tx.gas = Some(provider.estimate_gas(tx.clone()).await?);
+    match provider.estimate_eip1559_fees().await {
+        Ok(fees) => {
+            tx.max_fee_per_gas = Some(fees.max_fee_per_gas);
+            tx.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas);
+        }
+        // The gas filler's own fallback, for a chain without EIP-1559.
+        Err(alloy::transports::RpcError::UnsupportedFeature(_)) => {
+            tx.gas_price = Some(provider.get_gas_price().await?);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(tx)
+}
+
 /// Submit `cancel()` on the destination. `None` if it is already executed
 /// (claimed or cancelled) — either way there is nothing to burn.
 ///
@@ -991,7 +1290,7 @@ async fn try_cancel<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
-    send_lock: &SendLock,
+    submitter: &Submitter,
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
     if gate.executed(submission_id).call().await? {
@@ -1018,7 +1317,7 @@ async fn try_cancel<P: Provider>(
         bytes_of(&rec.native_sender)?,
         sorted_signatures(sigs)?,
     );
-    confirm(call, "cancel", &rec.submission_id, "CANCELLED", send_lock).await.map(Some)
+    confirm(call, "cancel", &rec.submission_id, "CANCELLED", submitter).await.map(Some)
 }
 
 /// Submit `refund()` on the source. `None` if already refunded, if this gate
@@ -1029,7 +1328,7 @@ async fn try_refund<P: Provider>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
-    send_lock: &SendLock,
+    submitter: &Submitter,
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
@@ -1075,7 +1374,7 @@ async fn try_refund<P: Provider>(
         bytes_of(&rec.native_sender)?,
         sorted_signatures(sigs)?,
     );
-    confirm(call, "refund", &rec.submission_id, "REFUNDED", send_lock).await.map(Some)
+    confirm(call, "refund", &rec.submission_id, "REFUNDED", submitter).await.map(Some)
 }
 
 /// The keeper's live view of one gate: the signature `threshold`, the
@@ -1640,6 +1939,14 @@ mod tests {
     // Pending-tx tracking: a receipt timeout must not become a duplicate tx.
     // ---------------------------------------------------------------------
 
+    fn inflight(hash: B256) -> InFlight {
+        InFlight::new(TransactionRequest::default(), hash, Instant::now())
+    }
+
+    fn timeout(hash: B256) -> ReceiptTimeout {
+        ReceiptTimeout { hash, tx: TransactionRequest::default(), sent_at: Instant::now() }
+    }
+
     #[test]
     fn a_tx_still_in_the_mempool_blocks_a_resubmit() {
         assert_eq!(resolve_pending(TxProbe::InMempool), PendingAction::Wait);
@@ -1667,12 +1974,12 @@ mod tests {
         p.note_failure("0xid", SigKind::Transfer, &anyhow::anyhow!("send claim: nonce too low"));
         assert_eq!(p.hash("0xid", SigKind::Transfer), None);
 
-        let err: anyhow::Error = ReceiptTimeout { hash }.into();
+        let err: anyhow::Error = timeout(hash).into();
         p.note_failure("0xid", SigKind::Transfer, &err);
         assert_eq!(p.hash("0xid", SigKind::Transfer), Some(hash));
         // ...and survives a `.context()` wrapper, as `try_*` may add one.
         let mut q = PendingTxs::default();
-        let wrapped = anyhow::Error::from(ReceiptTimeout { hash }).context("claim");
+        let wrapped = anyhow::Error::from(timeout(hash)).context("claim");
         q.note_failure("0xid", SigKind::Transfer, &wrapped);
         assert_eq!(q.hash("0xid", SigKind::Transfer), Some(hash));
     }
@@ -1690,7 +1997,7 @@ mod tests {
             (TxProbe::Mined { reverted: false }, PendingAction::Landed, false),
         ] {
             let mut p = PendingTxs::default();
-            p.track("0xid", SigKind::Cancel, hash);
+            p.track("0xid", SigKind::Cancel, inflight(hash));
             assert_eq!(p.apply("0xid", SigKind::Cancel, probe), action, "{probe:?}");
             assert_eq!(p.hash("0xid", SigKind::Cancel).is_some(), still_tracked, "{probe:?}");
         }
@@ -1700,19 +2007,72 @@ mod tests {
     #[test]
     fn pending_is_keyed_by_kind_as_well_as_id() {
         let mut p = PendingTxs::default();
-        p.track("0xid", SigKind::Transfer, B256::repeat_byte(1));
+        p.track("0xid", SigKind::Transfer, inflight(B256::repeat_byte(1)));
         assert_eq!(p.hash("0xid", SigKind::Cancel), None);
-        p.track("0xid", SigKind::Cancel, B256::repeat_byte(2));
+        p.track("0xid", SigKind::Cancel, inflight(B256::repeat_byte(2)));
         assert_eq!(p.len(), 2);
         p.clear("0xid", SigKind::Transfer);
         assert_eq!(p.hash("0xid", SigKind::Cancel), Some(B256::repeat_byte(2)));
     }
 
+    /// Original + replacements share a nonce: a receipt for any one settles it,
+    /// one still pooled keeps it in flight, and only all-gone allows a resubmit.
+    #[test]
+    fn probes_across_replacements_combine_to_one_verdict() {
+        use TxProbe::*;
+        assert_eq!(combine_probes([Gone, Mined { reverted: false }]), Mined { reverted: false });
+        assert_eq!(combine_probes([Mined { reverted: true }, Gone]), Mined { reverted: true });
+        assert_eq!(combine_probes([Gone, InMempool]), InMempool);
+        assert_eq!(combine_probes([Unknown, InMempool]), InMempool);
+        assert_eq!(combine_probes([Gone, Unknown]), Unknown, "fail closed");
+        assert_eq!(combine_probes([Gone, Gone]), Gone);
+    }
+
+    /// Every bump clears geth's 10% replacement minimum on BOTH 1559 fees,
+    /// follows a higher network estimate, and never crosses the ceiling.
+    #[test]
+    fn a_replacement_is_priced_above_the_minimum_and_under_the_ceiling() {
+        let tx = TransactionRequest {
+            max_fee_per_gas: Some(1_000),
+            max_priority_fee_per_gas: Some(100),
+            ..Default::default()
+        };
+        let r = reprice(&tx, None, None, 4_000).unwrap();
+        assert_eq!(r.max_fee_per_gas, Some(1_126));
+        assert_eq!(r.max_priority_fee_per_gas, Some(113));
+        assert!(r.max_fee_per_gas.unwrap() * 10 >= 1_000 * 11);
+        assert!(r.max_priority_fee_per_gas.unwrap() * 10 >= 100 * 11);
+
+        // A higher current estimate wins; clamped to the ceiling.
+        let est = alloy::eips::eip1559::Eip1559Estimation { max_fee_per_gas: 9_999, max_priority_fee_per_gas: 500 };
+        let r = reprice(&tx, Some(est), None, 4_000).unwrap();
+        assert_eq!((r.max_fee_per_gas, r.max_priority_fee_per_gas), (Some(4_000), Some(500)));
+
+        // Nothing but the fees changes.
+        assert_eq!(TransactionRequest { max_fee_per_gas: tx.max_fee_per_gas, max_priority_fee_per_gas: tx.max_priority_fee_per_gas, ..r }, tx);
+
+        // No room for even the minimum bump under the ceiling: no replacement.
+        assert_eq!(reprice(&tx, None, None, 1_100), None);
+        // A tiny fee still strictly increases.
+        assert_eq!(bumped_fee(1, None, u128::MAX), Some(2));
+        // Legacy gasPrice is bumped the same way.
+        let legacy = TransactionRequest { gas_price: Some(800), ..Default::default() };
+        assert_eq!(reprice(&legacy, None, None, 3_200).unwrap().gas_price, Some(901));
+    }
+
+    /// The ceiling is fixed from the ORIGINAL fee, so a run of bumps cannot
+    /// ratchet it upward.
+    #[test]
+    fn the_fee_ceiling_is_a_multiple_of_the_original_fee() {
+        let tx = TransactionRequest { max_fee_per_gas: Some(250), max_priority_fee_per_gas: Some(1), ..Default::default() };
+        assert_eq!(InFlight::new(tx, B256::ZERO, Instant::now()).ceiling, 250 * MAX_FEE_MULTIPLE);
+    }
+
     #[test]
     fn pending_entries_for_ids_that_left_the_queue_are_dropped() {
         let mut p = PendingTxs::default();
-        p.track("0xgone", SigKind::Transfer, B256::repeat_byte(1));
-        p.track("0xhere", SigKind::Refund, B256::repeat_byte(2));
+        p.track("0xgone", SigKind::Transfer, inflight(B256::repeat_byte(1)));
+        p.track("0xhere", SigKind::Refund, inflight(B256::repeat_byte(2)));
         p.retain_seen(&["0xhere".to_string()].into_iter().collect());
         assert_eq!(p.len(), 1);
         assert_eq!(p.hash("0xhere", SigKind::Refund), Some(B256::repeat_byte(2)));
@@ -1913,5 +2273,119 @@ mod domain_tests {
     fn a_current_transfer_is_unaffected() {
         let domain = B256::repeat_byte(0xD0);
         assert!(agrees_with_gate(&record_under(domain), domain).is_ok());
+    }
+
+    /// Audit round 6, LOW — the regression for "the keeper never bumps fees".
+    ///
+    /// `anvil --no-mining` stands in for a fee spike: the keeper's tx is
+    /// broadcast and then never included, exactly as an underpriced one would
+    /// sit. (Anvil evicts a fee-cap-below-basefee tx when it mines, unlike geth,
+    /// so the spike is modelled by not mining at all.)
+    ///
+    /// Before the fix every later tick probed `InMempool -> Wait` and did nothing
+    /// else, forever; nonce 0 stayed the original tx at its original fee and
+    /// every later send queued behind it. Now the next tick after the receipt
+    /// window REPLACES nonce 0 with higher fees, and once a block is mined the
+    /// replacement lands and later sends proceed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_tx_is_replaced_at_its_nonce_with_higher_fees() {
+        use alloy::consensus::Transaction as _;
+        use std::process::Stdio;
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _anvil = Kill(
+            std::process::Command::new("/usr/bin/anvil")
+                .args(["--port", &port.to_string(), "--no-mining"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn anvil"),
+        );
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".parse().unwrap();
+        let me = signer.address();
+        // The keeper's provider stack (see `connect_gate`).
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .with_simple_nonce_management()
+            .connect_http(format!("http://127.0.0.1:{port}").parse().unwrap());
+        let started = Instant::now();
+        while provider.get_chain_id().await.is_err() {
+            assert!(started.elapsed() < Duration::from_secs(20), "anvil did not come up");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let submitter = Submitter { lock: Arc::new(tokio::sync::Mutex::new(())), from: me };
+        let to = Address::repeat_byte(0x42);
+        let send = |id: &'static str| {
+            let call = alloy::contract::CallBuilder::new_raw(provider.clone(), Bytes::new()).to(to);
+            let submitter = &submitter;
+            async move { confirm(call, "claim", id, "CLAIMED", submitter).await }
+        };
+        let pool_nonce_0 = || async {
+            let pool: serde_json::Value = provider.raw_request("txpool_content".into(), ()).await.unwrap();
+            let mine = pool["pending"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&format!("{me:#x}")))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            (mine.as_object().map_or(0, |m| m.len()), mine["0"]["hash"].as_str().map(str::to_owned))
+        };
+
+        // 1. The claim is broadcast, never included, and its receipt times out.
+        let err = send("0xsub1").await.expect_err("tx1 must time out");
+        let timed_out = err.downcast_ref::<ReceiptTimeout>().expect("typed timeout").clone();
+        let h1 = timed_out.hash;
+        let tx1 = provider.get_transaction_by_hash(h1).await.unwrap().unwrap();
+        assert_eq!(tx1.nonce(), 0);
+        assert_eq!(timed_out.tx.nonce, Some(0), "confirm knows the nonce it used");
+        let mut pending = PendingTxs::default();
+        pending.note_failure("0xsub1", SigKind::Transfer, &err);
+
+        // 2. Next tick: still pooled, a full window old, head of the queue ->
+        //    replaced at nonce 0 with a higher fee. No new submission allowed.
+        assert!(!pending.may_submit(&provider, "0xsub1", SigKind::Transfer).await);
+        let h2 = pending.hash("0xsub1", SigKind::Transfer).unwrap();
+        assert_ne!(h2, h1, "a replacement was broadcast");
+        let tx2 = provider.get_transaction_by_hash(h2).await.unwrap().expect("replacement is pooled");
+        assert_eq!(tx2.nonce(), 0, "same nonce");
+        assert_eq!((tx2.to(), tx2.input(), tx2.value()), (tx1.to(), tx1.input(), tx1.value()), "same call");
+        assert!(tx2.max_fee_per_gas() * 10 >= tx1.max_fee_per_gas() * 11, "maxFee +10% at least");
+        assert!(
+            tx2.max_priority_fee_per_gas().unwrap() * 10 >= tx1.max_priority_fee_per_gas().unwrap() * 11,
+            "tip +10% at least"
+        );
+        let (count, at_0) = pool_nonce_0().await;
+        assert_eq!((count, at_0), (1, Some(format!("{h2:#x}"))), "nonce 0 in the pool IS the replacement");
+        assert_eq!(probe_tx(&provider, h1).await, TxProbe::Gone, "the original was displaced");
+
+        // 3. Not a bump per tick: the replacement gets its own window.
+        assert!(!pending.may_submit(&provider, "0xsub1", SigKind::Transfer).await);
+        assert_eq!(pending.hash("0xsub1", SigKind::Transfer), Some(h2));
+
+        // 4. A block is mined: the replacement lands, found via ITS hash, and
+        //    the memo lets the tick through (to its no-op `executed` re-check).
+        let _: serde_json::Value = provider.raw_request("evm_mine".into(), ()).await.unwrap();
+        let receipt = provider.get_transaction_receipt(h2).await.unwrap().expect("replacement mined");
+        assert!(receipt.status());
+        assert!(provider.get_transaction_receipt(h1).await.unwrap().is_none(), "only one of them executed");
+        assert!(pending.may_submit(&provider, "0xsub1", SigKind::Transfer).await);
+        assert_eq!(pending.len(), 0);
+
+        // 5. Later sends are no longer queued behind a dead nonce.
+        let _: serde_json::Value = provider.raw_request("evm_setAutomine".into(), (true,)).await.unwrap();
+        let t = Instant::now();
+        let h3 = send("0xsub2").await.expect("later send confirms");
+        assert!(t.elapsed() < RECEIPT_TIMEOUT);
+        let tx3 = provider.get_transaction_by_hash(h3.parse().unwrap()).await.unwrap().unwrap();
+        assert_eq!(tx3.nonce(), 1);
+        assert_eq!(provider.get_transaction_count(me).latest().await.unwrap(), 2);
     }
 }

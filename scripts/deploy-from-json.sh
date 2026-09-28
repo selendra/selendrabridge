@@ -132,7 +132,45 @@ fi
 [[ "$BRIDGE_DOMAIN" =~ ^0x0{64}$ ]] && die "gate.bridge_domain must not be zero (Gate rejects it)"
 
 # --- deployer auth (private key / env var / encrypted keystore) -------------
+#
+# A raw key is NEVER put on a command line (audit round 6, LOW). This used to
+# pass `--private-key "$key"` to every cast/forge call, and argv is world-
+# readable through /proc/<pid>/cmdline (and `ps`) for as long as each call runs
+# — dozens of calls over a multi-chain deploy. Foundry (checked on 1.8.1) has
+# NO environment binding for --private-key: `cast send`, `forge create`,
+# `forge script` and `cast wallet address` all take it only as an argument. So
+# a raw key is converted, once, into an EPHEMERAL encrypted keystore and every
+# call signs through `--keystore` + `--password-file`, the same as the
+# configured-keystore path:
+#   * the key reaches `cast wallet import --interactive` on its stdin through a
+#     pty (`script`; the prompt reads /dev/tty, not a pipe) — never on argv;
+#   * the random throwaway password reaches the import through
+#     CAST_UNSAFE_PASSWORD (environ is owner-only, unlike cmdline) and every
+#     later call through a 0600 file;
+#   * both live in a 0700 `mktemp -d` removed by the EXIT trap.
+# The keystore path below is unchanged: it never had a key on argv.
 AUTH=()
+EPHEMERAL_KS_DIR=""
+cleanup_ephemeral_keystore() { [[ -n "$EPHEMERAL_KS_DIR" ]] && rm -rf "$EPHEMERAL_KS_DIR"; return 0; }
+trap cleanup_ephemeral_keystore EXIT
+stage_ephemeral_keystore() {  # raw-key -> sets AUTH and DEPLOYER_ADDR
+  local k="$1" pw cmd
+  need script "staging a raw deployer key into an ephemeral keystore (keeps it off argv)"
+  EPHEMERAL_KS_DIR="$(mktemp -d)"; chmod 700 "$EPHEMERAL_KS_DIR"
+  pw="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s' "$pw" >"$EPHEMERAL_KS_DIR/password"; chmod 600 "$EPHEMERAL_KS_DIR/password"
+  cmd="cast wallet import deployer --keystore-dir '$EPHEMERAL_KS_DIR' --interactive"
+  # The pty echoes what it is fed, so ALL output is discarded; success is
+  # judged by the keystore file existing and decrypting below.
+  if script -V 2>/dev/null | grep -q util-linux; then
+    printf '%s\n' "$k" | CAST_UNSAFE_PASSWORD="$pw" script -qec "$cmd" /dev/null >/dev/null 2>&1 || true
+  else  # BSD/macOS script(1)
+    printf '%s\n' "$k" | CAST_UNSAFE_PASSWORD="$pw" script -q /dev/null sh -c "$cmd" >/dev/null 2>&1 || true
+  fi
+  [[ -f "$EPHEMERAL_KS_DIR/deployer" ]] || die "could not stage the deployer key into an ephemeral keystore (is it a valid 32-byte hex key?)"
+  AUTH=(--keystore "$EPHEMERAL_KS_DIR/deployer" --password-file "$EPHEMERAL_KS_DIR/password")
+  DEPLOYER_ADDR="$(cast wallet address "${AUTH[@]}")" || die "ephemeral deployer keystore does not decrypt"
+}
 DEPLOYER_KEY="$(jr '.deployer.private_key')"
 DEPLOYER_KEY_ENV="$(jr '.deployer.private_key_env')"
 KEYSTORE="$(jr '.deployer.keystore')"
@@ -145,12 +183,10 @@ if [[ -n "$KEYSTORE" ]]; then
 elif [[ -n "$DEPLOYER_KEY_ENV" ]]; then
   key="${!DEPLOYER_KEY_ENV:-}"
   [[ -n "$key" ]] || die "deployer.private_key_env=$DEPLOYER_KEY_ENV is set in the config but that env var is empty"
-  AUTH=(--private-key "$key")
-  DEPLOYER_ADDR="$(cast wallet address --private-key "$key")"
+  stage_ephemeral_keystore "$key"; unset key
 elif [[ -n "$DEPLOYER_KEY" ]]; then
   [[ "$PROFILE" == "local" ]] && : || warn "profile=production with an INLINE deployer key — prefer deployer.keystore"
-  AUTH=(--private-key "$DEPLOYER_KEY")
-  DEPLOYER_ADDR="$(cast wallet address --private-key "$DEPLOYER_KEY")"
+  stage_ephemeral_keystore "$DEPLOYER_KEY"; unset DEPLOYER_KEY
 else
   die "no deployer key: set deployer.keystore (preferred), deployer.private_key_env, or deployer.private_key"
 fi

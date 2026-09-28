@@ -485,6 +485,61 @@ contract UpgradeTest is Test {
         assertEq(gate.owner(), address(this), "owner preserved");
     }
 
+    /// Audit round 6, LOW: the schedule pins CODE, not just an address. An empty
+    /// CREATE2 address gives holders nothing to review for 48 h and could be
+    /// filled with anything in the block before the upgrade.
+    function test_Upgrade_RefusesToScheduleAnAddressWithNoCode() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address future = vm.computeCreate2Address(
+            bytes32(uint256(7)), keccak256(type(GateV2).creationCode), address(this)
+        );
+        assertEq(future.code.length, 0);
+        vm.expectRevert(abi.encodeWithSelector(Gate.ImplementationHasNoCode.selector, future));
+        gate.scheduleUpgrade(future);
+    }
+
+    /// The pinned hash is checked at install time: code swapped in after the
+    /// schedule (a metamorphic re-deploy, emulated with `vm.etch`) is refused,
+    /// and re-scheduling — which restarts the delay and re-pins — is the only way
+    /// forward. (The etched code is not installed afterwards: its UUPS `__self`
+    /// immutable names another address, so `proxiableUUID` would refuse it.)
+    function test_Upgrade_RefusesCodeThatChangedAfterScheduling() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        bytes32 pinned = gate.upgradeCodehash(v2);
+        assertEq(pinned, v2.codehash, "codehash pinned at schedule time");
+
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+        vm.etch(v2, address(new Gate()).code); // different bytecode, same address
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.ImplementationCodeChanged.selector, v2, pinned, v2.codehash)
+        );
+        gate.upgradeToAndCall(v2, "");
+
+        gate.scheduleUpgrade(v2);
+        assertEq(gate.upgradeCodehash(v2), v2.codehash, "re-scheduling re-pins");
+        assertEq(gate.upgradeReadyAt(v2), block.timestamp + gate.UPGRADE_DELAY(), "and restarts the delay");
+    }
+
+    /// A successful install burns the pin together with the schedule.
+    function test_Upgrade_InstallBurnsThePinnedCodehash() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+        gate.upgradeToAndCall(v2, "");
+        assertEq(gate.upgradeCodehash(v2), 0, "the pin is burned with the schedule");
+    }
+
+    function test_Upgrade_CancelClearsThePinnedCodehash() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        gate.cancelScheduledUpgrade(v2);
+        assertEq(gate.upgradeCodehash(v2), 0);
+    }
+
     /// The implementation must be permanently uninitializable, or anyone can own
     /// it and drive its own `upgradeToAndCall`.
     function test_Implementation_CannotBeInitialized() public {

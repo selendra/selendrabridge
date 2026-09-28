@@ -10,8 +10,12 @@
 //!   * **finality** — read only at `finalized`, so a fork cannot discard a `Sent`
 //!     after the destination has paid out (enforced in [`crate::config`]);
 //!   * **never sign what you cannot reproduce** — a mismatch between the emitted
-//!     and recomputed id means a lying RPC or a divergent program, and is a hard
-//!     stop rather than a skip;
+//!     and recomputed id means a lying RPC or a divergent program. It is never
+//!     signed; since audit round 6 (LOW) it is QUARANTINED — logged at ERROR,
+//!     persisted beside the cursor, and scanned past — rather than a hard stop
+//!     that wedged the scanner on that transaction forever (see
+//!     [`Scanner::process_line`]). The one exception is an event from a NEWER
+//!     program version, which still halts: that is systemic, not per-event;
 //!   * **the allowlist gates signing, not just claiming** — see below.
 //!
 //! ## Why the allowlist has to be enforced HERE
@@ -44,14 +48,15 @@ use bridge_solana::account::{self, AssetAccount};
 use bridge_solana::gate::Sent;
 use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
 use bridge_solana::relayer::{
-    gate_program_data_lines, parse_sent_event_line, verify_sent_record, SentEvent,
+    gate_program_data_lines, parse_sent_event_line, verify_sent_record, SentEvent, PROGRAM_DATA_PREFIX,
+    SENT_EVENT_VERSION,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::SourceChain;
 use crate::evm::GateReader;
@@ -111,6 +116,45 @@ fn next_page_action(
         return PageAction::TooDeep;
     }
     PageAction::KeepWalking
+}
+
+/// Why a decoded event can never be signed by this scanner, or `Ok` if the
+/// event-intrinsic checks pass (pure; the RPC-backed origin proof comes later).
+///
+/// Both checks are PERMANENT properties of the event: re-reading the same
+/// transaction yields the same answer. That is what makes them quarantine
+/// material rather than retry material (audit round 6, LOW).
+fn signable(sent: &Sent, bridge_domain: &[u8; 32], chain_id: u64) -> Result<(), String> {
+    // Never sign an id we cannot reproduce ourselves.
+    let computed = recompute(sent, bridge_domain);
+    if computed != sent.submission_id {
+        return Err(format!(
+            "submissionId MISMATCH: emitted {} computed {} — refusing to sign",
+            hex::encode(sent.submission_id),
+            hex::encode(computed)
+        ));
+    }
+    // The gate binds its own chain id into the hash; if it disagrees with our
+    // config we are pointed at the wrong program or the wrong cluster. (A
+    // config-wide mismatch is refused at startup — `load_bridge_domain` checks
+    // the gate's own `chain_id` — so reaching this is a per-event anomaly.)
+    if sent.chain_id_from != chain_id {
+        return Err(format!(
+            "event chain_id_from {} != configured {} — refusing to sign",
+            sent.chain_id_from, chain_id
+        ));
+    }
+    Ok(())
+}
+
+/// The version byte of a tagged `Program data:` payload, read WITHOUT decoding
+/// the rest — so it is available even when a future layout no longer
+/// deserializes as today's `SentEvent`. `version` is the struct's first field.
+fn payload_version(line: &str) -> Option<u8> {
+    use base64::Engine as _;
+    let rest = line.trim().strip_prefix(PROGRAM_DATA_PREFIX)?;
+    let payload = rest.split_whitespace().nth(1)?;
+    base64::engine::general_purpose::STANDARD.decode(payload).ok()?.first().copied()
 }
 
 /// Recompute a submissionId from a decoded event, exactly as the program did.
@@ -244,9 +288,22 @@ impl Scanner {
             "config PDA {config_pda} is owned by {}, not the gate program",
             account.owner
         );
-        let domain = decode_config_view(&mut &account.data[..])
-            .with_context(|| format!("decoding gate config PDA {config_pda}"))?
-            .bridge_domain;
+        let view = decode_config_view(&mut &account.data[..])
+            .with_context(|| format!("decoding gate config PDA {config_pda}"))?;
+        // Audit round 6, LOW: a wrong `[source].chain_id` used to surface as a
+        // per-event `chain_id_from` refusal that wedged the scanner. Events are
+        // now quarantined and scanned PAST instead — so a config-wide mismatch
+        // must be refused here, up front, or every transfer would be skipped
+        // (loudly, but irrecoverably once the cursor moved). The gate stamps
+        // `chain_id_from` from this very field.
+        anyhow::ensure!(
+            view.chain_id == self.cfg.chain_id,
+            "gate config PDA {config_pda} carries chain_id {} but [source].chain_id is {} — \
+             wrong program, wrong cluster, or wrong config; refusing to scan",
+            view.chain_id,
+            self.cfg.chain_id
+        );
+        let domain = view.bridge_domain;
         anyhow::ensure!(
             domain != [0u8; 32],
             "gate reports a zero bridge_domain — it predates the deployment-domain fix and \
@@ -434,20 +491,8 @@ impl Scanner {
             // signs. Keep only the lines the gate itself emitted.
             let gate = self.program_id.to_string();
             for line in gate_program_data_lines(&logs, &gate) {
-                match parse_sent_event_line(line) {
-                    None => continue, // not our event
-                    // A tagged-but-malformed payload is a fault, not noise: surface
-                    // it and leave the cursor put rather than silently skipping a
-                    // transfer (the H3 posture).
-                    Some(Err(e)) => {
-                        anyhow::bail!("malformed BRIDGE_SENT in tx {}: {e}", entry.signature)
-                    }
-                    Some(Ok(event)) => {
-                        let sent = event.to_sent()?;
-                        if self.handle(&event, &sent, &entry.signature).await? {
-                            handled += 1;
-                        }
-                    }
+                if self.process_line(line, &entry.signature).await? {
+                    handled += 1;
                 }
             }
 
@@ -458,26 +503,96 @@ impl Scanner {
         Ok(handled)
     }
 
+    /// Handle one gate-attributed log line from transaction `tx`. `Ok(true)`
+    /// means an event was signed and stored; `Ok(false)` means there was nothing
+    /// to sign (not our event, withheld, or quarantined); `Err` is transient and
+    /// leaves the cursor put so the whole transaction is re-read next tick.
+    ///
+    /// Audit round 6, LOW — undecodable events used to wedge the scanner. A bad
+    /// version, a submissionId that does not reproduce, or a foreign
+    /// `chain_id_from` each `bail!`ed with the cursor pinned, so every later
+    /// tick re-read the same transaction and failed the same way: ONE bad event
+    /// stopped this validator attesting for every Solana transfer after it.
+    ///
+    /// Now they are QUARANTINED: never signed (those refusals are the point, and
+    /// `handle` still re-checks as a backstop), logged at ERROR with the tx and
+    /// reason, persisted in the cursor file, and scanned past. The security
+    /// cost is bounded to the event itself: it was never going to be signed, so
+    /// skipping it withholds exactly one attestation — and a transfer that
+    /// cannot reach quorum is what the cancel/refund path exists for. Nothing
+    /// here weakens the `["sent", id]` origin proof; quarantine happens only on
+    /// the path that REFUSES to sign.
+    ///
+    /// Why persisted, not just logged: the cursor alone would claim these
+    /// transactions were handled. The list beside it is the durable record an
+    /// operator (or the refund tooling) can audit after the log has rotated.
+    ///
+    /// The exception is an event from a NEWER program version. That is not a
+    /// bad event but an upgraded gate ahead of this relayer — every subsequent
+    /// event would be skipped too, irrecoverably once the cursor moved. It
+    /// still halts, loudly, and resumes cleanly once the relayer is upgraded.
+    /// (An OLDER version — e.g. replaying pre-upgrade history — is quarantined.)
+    async fn process_line(&mut self, line: &str, tx: &str) -> anyhow::Result<bool> {
+        let ahead = |v: u8| {
+            anyhow::anyhow!(
+                "BRIDGE_SENT in tx {tx} is event version {v}, newer than this relayer's \
+                 {SENT_EVENT_VERSION} — the gate program was upgraded; upgrade the relayer. \
+                 Halting rather than scanning past events it cannot read"
+            )
+        };
+        let event = match parse_sent_event_line(line) {
+            None => return Ok(false), // not our event
+            Some(Ok(event)) => event,
+            Some(Err(e)) => {
+                if let Some(v) = payload_version(line).filter(|v| *v > SENT_EVENT_VERSION) {
+                    return Err(ahead(v));
+                }
+                self.quarantine(tx, &format!("malformed BRIDGE_SENT: {e}"))?;
+                return Ok(false);
+            }
+        };
+        if event.version > SENT_EVENT_VERSION {
+            return Err(ahead(event.version));
+        }
+        let sent = match event.to_sent() {
+            Ok(sent) => sent,
+            Err(e) => {
+                self.quarantine(tx, &format!("undecodable BRIDGE_SENT: {e}"))?;
+                return Ok(false);
+            }
+        };
+        if let Err(reason) = signable(&sent, &self.bridge_domain, self.cfg.chain_id) {
+            self.quarantine(tx, &reason)?;
+            return Ok(false);
+        }
+        self.handle(&event, &sent, tx).await
+    }
+
+    /// Record a never-signable event and move on (see [`Self::process_line`]).
+    /// Logged once per `(tx, reason)`; a transient failure later in the same
+    /// transaction re-reads it without a duplicate entry or line.
+    fn quarantine(&mut self, tx: &str, reason: &str) -> anyhow::Result<()> {
+        if self.cursor.quarantine(tx, reason) {
+            error!(
+                tx,
+                reason,
+                state_file = %self.cfg.state_file,
+                "QUARANTINED gate event — NOT signed, scanning past it. This transfer will not \
+                 reach quorum from this validator; route it to cancel/refund"
+            );
+            self.cursor.save(&self.cfg.state_file)?;
+        }
+        Ok(())
+    }
+
     /// Verify and sign one event. `Ok(false)` means the event was rejected as
     /// unauthentic and skipped; `Ok(true)` means it was signed and stored.
     async fn handle(&self, event: &SentEvent, sent: &Sent, tx: &str) -> anyhow::Result<bool> {
-        // Never sign an id we cannot reproduce ourselves.
-        let computed = recompute(sent, &self.bridge_domain);
-        if computed != sent.submission_id {
-            anyhow::bail!(
-                "submissionId MISMATCH in tx {tx}: emitted {} computed {} — refusing to sign",
-                hex::encode(sent.submission_id),
-                hex::encode(computed)
-            );
-        }
-        // The gate binds its own chain id into the hash; if it disagrees with our
-        // config we are pointed at the wrong program or the wrong cluster.
-        if sent.chain_id_from != self.cfg.chain_id {
-            anyhow::bail!(
-                "event chain_id_from {} != configured {} — refusing to sign",
-                sent.chain_id_from,
-                self.cfg.chain_id
-            );
+        // Backstop: `process_line` quarantines these before we get here, but the
+        // function that signs keeps its own refusal to sign an id it cannot
+        // reproduce, or one from a foreign chain.
+        if let Err(reason) = signable(sent, &self.bridge_domain, self.cfg.chain_id) {
+            anyhow::bail!("tx {tx}: {reason}");
         }
 
         // THE origin proof. Recomputing the id proves only that whoever wrote the
@@ -977,5 +1092,154 @@ mod tests {
         .unwrap();
         let hash = bridge_solana::hash::keccak(&recovered.serialize()[1..]);
         assert_eq!(format!("0x{}", hex::encode(&hash[12..])), evm_address(&secret));
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    //! Audit round 6, LOW: an unsignable gate event used to `bail!` with the
+    //! cursor pinned, wedging the scanner on that transaction forever. It must
+    //! now be refused (never signed), recorded, and scanned past — while an
+    //! event from a NEWER program version still halts, and a transient fault on
+    //! a good event still leaves the cursor put.
+    use super::*;
+    use bridge_solana::relayer::{sent_event_to_program_data_line, SentEvent, SENT_EVENT_VERSION};
+
+    const DOMAIN: [u8; 32] = [0xD0; 32];
+
+    fn scanner(name: &str) -> Scanner {
+        let dir = std::env::temp_dir().join(format!("sr-quarantine-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = SourceChain {
+            chain_id: 7_565_164,
+            rpc: "http://127.0.0.1:1".into(), // unreachable: proves no RPC is reached
+            program_id: "11111111111111111111111111111111".into(),
+            commitment: "confirmed".into(),
+            allow_unfinalized: true,
+            poll_interval_ms: 2000,
+            state_file: dir.join("cursor.json").to_string_lossy().into_owned(),
+            max_batch: 100,
+            start_at_tip: false,
+        };
+        let mut s = Scanner::new(cfg, [0x42; 32], Store::new("http://127.0.0.1:1", None).unwrap(), BTreeMap::new())
+            .unwrap();
+        s.bridge_domain = DOMAIN;
+        s
+    }
+
+    fn good() -> Sent {
+        let mut s = Sent {
+            bridge_decimals: 9,
+            submission_id: [0; 32],
+            debridge_id: [0x22; 32],
+            amount: 42_000,
+            chain_id_from: 7_565_164,
+            chain_id_to: 1337,
+            receiver: vec![0xEE; 20],
+            nonce: 7,
+            native_sender: vec![0x33; 32],
+            auto: None,
+        };
+        s.submission_id = recompute(&s, &DOMAIN);
+        s
+    }
+
+    /// The event is refused, recorded (in memory AND in the state file), and the
+    /// line reports "nothing signed" instead of an error — so `tick` advances.
+    async fn assert_quarantined(sc: &mut Scanner, line: &str, reason_has: &str) {
+        let signed = sc.process_line(line, "TX1").await.expect("quarantined, not a hard error");
+        assert!(!signed, "an unsignable event must never be signed");
+        assert_eq!(sc.cursor.quarantined.len(), 1);
+        assert_eq!(sc.cursor.quarantined[0].tx, "TX1");
+        assert!(sc.cursor.quarantined[0].reason.contains(reason_has), "{:?}", sc.cursor.quarantined);
+        let on_disk = crate::state::Cursor::load_or_init(&sc.cfg.state_file).unwrap();
+        assert_eq!(on_disk.quarantined, sc.cursor.quarantined, "persisted beside the cursor");
+
+        // A re-read of the same transaction (e.g. after a transient failure
+        // later in it) neither duplicates the entry nor errors.
+        assert!(!sc.process_line(line, "TX1").await.unwrap());
+        assert_eq!(sc.cursor.quarantined.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_id_mismatch_is_quarantined_not_wedging() {
+        let mut sc = scanner("id");
+        let mut s = good();
+        s.submission_id[0] ^= 1;
+        let line = sent_event_to_program_data_line(&SentEvent::from_sent(&s, [0x55; 32]));
+        assert_quarantined(&mut sc, &line, "MISMATCH").await;
+    }
+
+    #[tokio::test]
+    async fn a_foreign_chain_id_from_is_quarantined_not_wedging() {
+        let mut sc = scanner("chain");
+        let mut s = good();
+        s.chain_id_from = 999;
+        s.submission_id = recompute(&s, &DOMAIN); // self-consistent, wrong chain
+        let line = sent_event_to_program_data_line(&SentEvent::from_sent(&s, [0x55; 32]));
+        assert_quarantined(&mut sc, &line, "chain_id_from").await;
+    }
+
+    #[tokio::test]
+    async fn an_older_event_version_is_quarantined_not_wedging() {
+        let mut sc = scanner("old");
+        let mut ev = SentEvent::from_sent(&good(), [0x55; 32]);
+        ev.version = SENT_EVENT_VERSION - 1; // e.g. replaying pre-upgrade history
+        assert_quarantined(&mut sc, &sent_event_to_program_data_line(&ev), "version").await;
+    }
+
+    #[tokio::test]
+    async fn a_garbage_payload_is_quarantined_not_wedging() {
+        use base64::Engine as _;
+        let mut sc = scanner("garbage");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // Our tag, a payload claiming the CURRENT version, then truncated.
+        let line = format!(
+            "{PROGRAM_DATA_PREFIX} {} {}",
+            b64.encode(bridge_solana::relayer::SENT_EVENT_TAG),
+            b64.encode([SENT_EVENT_VERSION, 1, 2, 3])
+        );
+        assert_quarantined(&mut sc, &line, "malformed").await;
+    }
+
+    /// A NEWER version is an upgraded program, not a bad event: scanning past it
+    /// would skip every transfer until the relayer is upgraded. It halts —
+    /// whether or not the new layout still decodes as today's struct.
+    #[tokio::test]
+    async fn a_newer_event_version_still_halts() {
+        use base64::Engine as _;
+        let mut sc = scanner("newer");
+        let mut ev = SentEvent::from_sent(&good(), [0x55; 32]);
+        ev.version = SENT_EVENT_VERSION + 1;
+        let err = sc.process_line(&sent_event_to_program_data_line(&ev), "TX1").await.unwrap_err();
+        assert!(err.to_string().contains("upgrade the relayer"), "{err}");
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let line = format!(
+            "{PROGRAM_DATA_PREFIX} {} {}",
+            b64.encode(bridge_solana::relayer::SENT_EVENT_TAG),
+            b64.encode([SENT_EVENT_VERSION + 1, 9, 9])
+        );
+        assert!(sc.process_line(&line, "TX2").await.is_err(), "undecodable newer layout halts too");
+        assert!(sc.cursor.quarantined.is_empty(), "a halt is not a quarantine");
+    }
+
+    /// A GOOD event proceeds to the RPC-backed origin proof; an RPC fault there
+    /// is transient and must still propagate (cursor pinned, retried), never be
+    /// mistaken for quarantine material.
+    #[tokio::test]
+    async fn a_good_event_with_an_rpc_fault_is_retried_not_quarantined() {
+        let mut sc = scanner("good");
+        let line = sent_event_to_program_data_line(&SentEvent::from_sent(&good(), [0x55; 32]));
+        assert!(sc.process_line(&line, "TX1").await.is_err(), "unreachable RPC is an error");
+        assert!(sc.cursor.quarantined.is_empty());
+    }
+
+    #[test]
+    fn signable_names_each_refusal() {
+        assert!(signable(&good(), &DOMAIN, 7_565_164).is_ok());
+        assert!(signable(&good(), &[0xD1; 32], 7_565_164).unwrap_err().contains("MISMATCH"));
+        assert!(signable(&good(), &DOMAIN, 1).unwrap_err().contains("chain_id_from"));
     }
 }

@@ -3964,6 +3964,7 @@ name = "solana-relayer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "borsh 1.8.0",
  "bridge-solana",
  "hex",

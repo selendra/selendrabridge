@@ -183,6 +183,8 @@ Each optionally scoped to one chain. The token comes from `[api] token` or the `
 
 **With neither set, `/pause`, `/resume` and `/rescan` are not mounted at all** — the process serves read-only `/status` and logs why. `pause` takes a validator out of quorum and survives a restart, so an open halt button is a one-request denial of service against the signer set; a missing secret mount used to be indistinguishable from a correct deployment except in the log. For local dev, `allow_unauthenticated = true` in the `[api]` block restores the old behaviour explicitly.
 
+A **wrong** bearer is throttled per peer address (burst of 30, then 2/s; 429 instead of 401 once spent). The **correct** bearer is never throttled — behind docker-proxy every host caller shares one address, and a local process spraying bad tokens used to lock the operator's own `/pause` out. That makes the token's entropy the only bound on guessing, so use a random 256-bit value (`openssl rand -hex 32`); the validator warns at startup about a token shorter than 32 bytes.
+
 The scanner pauses itself on a nonce gap, a nonce replay, or a `submissionId` mismatch — each of which means an RPC is lying or events were missed.
 A pause is a real safety stop and needs a human to look before `/resume`.
 
@@ -252,7 +254,10 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
   after 10 attempts, which let a lying endpoint switch the check off), so that error
   means the chain is not being signed at all until the `rpcs` list is fixed. A chain
   configured with two or more `rpcs` also refuses to START scanning on fewer than two
-  healthy ones. `[corroborate] require = true` (bridge config `.corroborate.require`)
+  healthy ones. The startup `Gate.bridgeDomain()` read and every `[[destinations]]` bridge-decimals
+  read are taken the same way — from every healthy endpoint, used only when two agree as
+  a majority — and a destination configured with two `rpcs` likewise waits for both;
+  a disagreement is logged as `RPC ENDPOINTS DISAGREE` and retried, never signed through. `[corroborate] require = true` (bridge config `.corroborate.require`)
   now only matters for a chain configured with a single endpoint: it withholds instead
   of signing on that one source. Watch for `RPC ENDPOINTS DISAGREE` — that line means
   an endpoint is wrong about the chain. With two endpoints nobody can tell which, so

@@ -92,12 +92,19 @@ pub fn decode_config_view<'a>(data: &mut &'a [u8]) -> anyhow::Result<ConfigView>
         .map_err(|e| anyhow::anyhow!("config account does not match the expected layout: {e}"))
 }
 
-/// The subset of the on-chain `Config` the submit paths need: who may sign, and
-/// how many signatures constitute a quorum.
+/// The subset of the on-chain `Config` the submit paths need: who may sign, how
+/// many signatures constitute a quorum, and which `bridge_domain` the gate
+/// rebuilds every submissionId with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateConfig {
     pub validators: Vec<[u8; 20]>,
     pub threshold: u32,
+    /// The gate's OWN domain (audit round 6, LOW — M-6 ported to the relayer).
+    /// `claim`/`cancel`/`refund` all recompute the id with THIS value, never the
+    /// one a store row carries, so the submit paths must compare against it.
+    /// It used to be dropped here, which is how a post-rotation gate ended up
+    /// being handed pre-rotation rows every poll, forever.
+    pub bridge_domain: [u8; 32],
 }
 
 /// Decode the gate's `Config` account into the quorum parameters.
@@ -115,7 +122,7 @@ pub fn decode_gate_config(data: &[u8]) -> anyhow::Result<GateConfig> {
              from this decoder; refusing to run with a filter that drops every signature"
         );
     }
-    Ok(GateConfig { validators: view.validators, threshold: view.threshold })
+    Ok(GateConfig { validators: view.validators, threshold: view.threshold, bridge_domain: view.bridge_domain })
 }
 
 /// The SPL token program id, hardcoded to avoid pulling `spl-token` in.

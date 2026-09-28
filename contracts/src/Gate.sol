@@ -289,14 +289,29 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         window, which is the conservative reading.
     uint256 public setupDeadline;
 
+    /// @notice The `extcodehash` each scheduled implementation had when it was
+    ///         put through {scheduleUpgrade}; {_authorizeUpgrade} installs it
+    ///         only if the code is still exactly that.
+    ///
+    /// @dev    Audit round 6, LOW. {upgradeReadyAt} is keyed by ADDRESS, and an
+    ///         address is not code. Without this the owner could schedule an
+    ///         empty CREATE2 address — or a metamorphic contract on a pre-Cancun
+    ///         chain, where SELFDESTRUCT still clears code — let holders review
+    ///         "nothing" (or something benign) for 48 h, then fill or re-create
+    ///         it with different bytecode in the block before the upgrade. The
+    ///         timelock would have delayed an address and reviewed nothing.
+    ///         Pinning the hash makes what sat out the delay the only thing that
+    ///         can be installed. Appended from `__gap` like every field above.
+    mapping(address implementation => bytes32 codehash) public upgradeCodehash;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
     ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
     ///      `supportedChain` took one each: 49 -> 47. `bridgeDecimalsOf` took
-    ///      one: 47 -> 46. `setupDeadline` took one: 46 -> 45. The gap still ends
-    ///      at slot 63.)
-    uint256[45] private __gap;
+    ///      one: 47 -> 46. `setupDeadline` took one: 46 -> 45. `upgradeCodehash`
+    ///      took one: 45 -> 44. The gap still ends at slot 63.)
+    uint256[44] private __gap;
 
     /// @param amount the WIRE amount, in the asset's bridge decimals (see
     ///        {BridgeDecimals}) — what the submissionId commits to, not the local
@@ -438,6 +453,12 @@ contract Gate is Initializable, UUPSUpgradeable {
     error UpgradeNotScheduled(address implementation);
     /// @dev the scheduled implementation is still inside its {UPGRADE_DELAY}
     error UpgradeNotReady(address implementation, uint256 readyAt);
+    /// @dev {scheduleUpgrade} was given an address with no code (audit round 6,
+    ///      LOW): there is nothing there for anyone to review during the delay.
+    error ImplementationHasNoCode(address implementation);
+    /// @dev the implementation's code changed after it was scheduled (audit
+    ///      round 6, LOW; see {upgradeCodehash}). Re-schedule to review the new code.
+    error ImplementationCodeChanged(address implementation, bytes32 scheduled, bytes32 current);
     /// @dev a validator addition / threshold decrease was attempted without first
     ///      going through {scheduleGovernance}
     error GovernanceNotScheduled(bytes32 actionId);
@@ -466,6 +487,11 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         transfer in flight across the upgrade can never be settled again;
     ///         the gate must be paused and drained first.
     error MigrationRequiresPause();
+
+    /// @notice {initializeV2} was called on a gate created by {initialize} at this
+    ///         version, not on a pre-decimals gate upgraded in place. See
+    ///         {initializeV2} (audit round 6, LOW).
+    error NotALegacyGate();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -560,10 +586,25 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         is a new deployment generation, not an upgrade — the same rule
     ///         {bridgeDomain} already states, for the same reason.
     ///
-    ///         `reinitializer(2)` so it runs exactly once, and never on a gate
-    ///         deployed by {initialize} at this version (that one is already at
-    ///         version 1 with the state seeded correctly — for a fresh gate this
-    ///         function is a no-op it should never need).
+    ///         `reinitializer(2)` so it runs exactly once.
+    ///
+    ///         AUDIT ROUND 6, LOW — `reinitializer(2)` ALONE DID NOT KEEP FRESH
+    ///         GATES OUT. {initialize} leaves a gate at version 1, which is exactly
+    ///         what a pre-decimals gate is at, so the owner of a sealed, live,
+    ///         freshly deployed gate could call this directly and register any
+    ///         unregistered token at identity scale INSTANTLY — skipping the 48 h
+    ///         {setBridgeDecimals} delay that exists precisely because the scale
+    ///         moves money once the gate is sealed. (It also listed chains in
+    ///         {supportedChain} with no delay.) The earlier comment's "a no-op it
+    ///         should never need" was an assumption, not a check.
+    ///
+    ///         The discriminator is {setupDeadline}: {initialize} always sets it
+    ///         non-zero, and on a pre-decimals gate the slot was `__gap`, so it
+    ///         reads zero there and only there. That also covers gates ALREADY
+    ///         deployed at version 1 by this generation's {initialize}, which a
+    ///         change to {initialize}'s version could not reach. Not covered: a
+    ///         gate deployed between the decimals revision and M-1 (decimals, no
+    ///         `setupDeadline`) — mesh9's generation, retired.
     ///
     ///         H-2 UPDATE — WHAT THIS CAN NO LONGER DO. The wire scale is now part
     ///         of the submissionId preimage, so an id minted by the pre-decimals
@@ -587,6 +628,10 @@ contract Gate is Initializable, UUPSUpgradeable {
         // `upgradeToAndCall` delegatecalls this with the caller preserved, so the
         // owner check is the same one every other privileged entrypoint runs.
         if (msg.sender != owner) revert NotOwner();
+        // Only a gate that predates {initialize}'s `setupDeadline` is a
+        // migration target; anything else would use this to skip the
+        // {setBridgeDecimals} timelock (audit round 6, LOW; see above).
+        if (setupDeadline != 0) revert NotALegacyGate();
         // Migrating a gate that is still accepting transfers strands whatever is
         // in flight across the id-format change (see above). Halt first.
         if (!paused) revert MigrationRequiresPause();
@@ -622,10 +667,16 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         keeping the earliest deadline. Otherwise an owner could schedule
     ///         an address once, wait out the window, and hold an indefinitely
     ///         re-usable instant-upgrade right against it.
+    ///
+    ///         The code is pinned as well as the address (audit round 6, LOW; see
+    ///         {upgradeCodehash}): an address with no code is refused outright,
+    ///         and re-scheduling re-pins the hash along with the new deadline.
     function scheduleUpgrade(address implementation) external onlyOwner {
         if (implementation == address(0)) revert ZeroAddress();
+        if (implementation.code.length == 0) revert ImplementationHasNoCode(implementation);
         uint256 readyAt = block.timestamp + UPGRADE_DELAY;
         upgradeReadyAt[implementation] = readyAt;
+        upgradeCodehash[implementation] = implementation.codehash;
         emit UpgradeScheduled(implementation, readyAt);
     }
 
@@ -636,12 +687,15 @@ contract Gate is Initializable, UUPSUpgradeable {
     function cancelScheduledUpgrade(address implementation) external {
         if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
         delete upgradeReadyAt[implementation];
+        delete upgradeCodehash[implementation];
         emit UpgradeCancelled(implementation);
     }
 
-    /// @dev The UUPS hook. Enforces owner + scheduled + matured, then BURNS the
-    ///      schedule so one approval installs exactly one implementation; without
-    ///      the delete, a rolled-back upgrade could be re-installed instantly.
+    /// @dev The UUPS hook. Enforces owner + scheduled + matured + unchanged code,
+    ///      then BURNS the schedule so one approval installs exactly one
+    ///      implementation; without the delete, a rolled-back upgrade could be
+    ///      re-installed instantly. A schedule made before {upgradeCodehash}
+    ///      existed pins zero and so never matches: re-schedule it (fail-closed).
     ///
     ///      Deliberately does NOT have a pause/emergency bypass. An upgrade that
     ///      is urgent enough to skip the delay is indistinguishable on-chain from
@@ -655,7 +709,15 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (block.timestamp > readyAt + SCHEDULE_GRACE) {
             revert ScheduleExpired(bytes32(uint256(uint160(newImplementation))), readyAt);
         }
+        // What is installed must be what sat out the delay, byte for byte —
+        // not whatever was CREATE2'd or re-created at that address since
+        // (audit round 6, LOW; see {upgradeCodehash}).
+        bytes32 pinned = upgradeCodehash[newImplementation];
+        if (newImplementation.codehash != pinned) {
+            revert ImplementationCodeChanged(newImplementation, pinned, newImplementation.codehash);
+        }
         delete upgradeReadyAt[newImplementation];
+        delete upgradeCodehash[newImplementation];
     }
 
     // ---------------------------------------------------------------------

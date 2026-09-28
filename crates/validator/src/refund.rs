@@ -59,7 +59,7 @@ use crate::provider;
 ///
 /// Now every read goes to every endpoint, at ONE block number, and an answer is
 /// used only when at least `min_agree` endpoints returned it AND they are a
-/// strict majority of those that answered ([`majority`]). Anything short of that
+/// strict majority of those that answered ([`provider::majority`]). Anything short of that
 /// is an error: the candidate is skipped this tick and retried, loudly. A skipped
 /// refund is late; a wrongly attested one is money gone.
 struct GateReader {
@@ -82,7 +82,7 @@ impl GateReader {
         block_confirmation: u64,
         require: bool,
     ) -> anyhow::Result<Self> {
-        let min_agree = if endpoints.len() >= 2 || require { 2 } else { 1 };
+        let min_agree = provider::min_agree(endpoints.len(), require);
         let healthy = provider::connect_all_checked(endpoints, chain_id).await?;
         // Same rule as the transfer scanner: a chain configured with a second
         // endpoint does not start on one, because endpoints are probed only here
@@ -111,37 +111,23 @@ impl GateReader {
         })
     }
 
-    /// Ask every endpoint the same question and return the [`majority`] answer.
+    /// Ask every endpoint the same question and return the [`provider::majority`] answer.
     async fn agreed<T, F, Fut>(&self, what: &str, read: F) -> anyhow::Result<T>
     where
         T: PartialEq + Clone + std::fmt::Debug,
         F: Fn(DynProvider) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        let mut answers: Vec<(&str, T)> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        for (url, p) in &self.endpoints {
-            match read(p.clone()).await {
-                Ok(v) => answers.push((url.as_str(), v)),
-                Err(e) => failed.push(format!("{url}: {e}")),
-            }
-        }
-        majority(&answers, self.min_agree).map_err(|e| {
-            if e.disagreement {
-                warn!(
-                    chain_id = self.chain_id,
-                    what,
-                    answers = ?answers,
-                    "RPC ENDPOINTS DISAGREE about gate state — attesting NOTHING that depends on \
-                     it (audit H-4). One endpoint is wrong about the chain: investigate."
-                );
-            }
-            anyhow::anyhow!(
-                "{what}: {}{}",
-                e.reason,
-                if failed.is_empty() { String::new() } else { format!(" (failed: {})", failed.join("; ")) }
-            )
+        provider::read_agreed(&self.endpoints, self.min_agree, what, read, |answers| {
+            warn!(
+                chain_id = self.chain_id,
+                what,
+                answers = ?answers,
+                "RPC ENDPOINTS DISAGREE about gate state — attesting NOTHING that depends on \
+                 it (audit H-4). One endpoint is wrong about the chain: investigate."
+            );
         })
+        .await
     }
 
     /// The newest block we are willing to trust, as ONE number every endpoint is
@@ -300,43 +286,6 @@ async fn aged_block_on(
 /// [`GateReader::aged_block`] for why the oldest is the safe choice.
 fn oldest_aged_block(found: &[Option<u64>]) -> Option<u64> {
     found.iter().copied().collect::<Option<Vec<u64>>>()?.into_iter().min()
-}
-
-/// Why [`majority`] refused.
-#[derive(Debug, PartialEq, Eq)]
-struct NoMajority {
-    reason: String,
-    /// Endpoints ANSWERED and differed — as opposed to too few answering.
-    disagreement: bool,
-}
-
-/// The answer at least `min_agree` endpoints returned, provided they are also a
-/// STRICT majority of every endpoint that answered. Pure: this is the security
-/// decision of the refund path.
-///
-/// With two endpoints that means both, identically. With three, two of them —
-/// so one lying endpoint can neither forge a burn nor, by dissenting, stall
-/// every refund on the chain.
-fn majority<T: PartialEq + Clone + std::fmt::Debug>(
-    answers: &[(&str, T)],
-    min_agree: usize,
-) -> Result<T, NoMajority> {
-    if answers.len() < min_agree {
-        return Err(NoMajority {
-            reason: format!("only {} endpoint(s) answered; need {min_agree}", answers.len()),
-            disagreement: false,
-        });
-    }
-    for (_, candidate) in answers {
-        let backers = answers.iter().filter(|(_, v)| v == candidate).count();
-        if backers >= min_agree && backers * 2 > answers.len() {
-            return Ok(candidate.clone());
-        }
-    }
-    Err(NoMajority {
-        reason: format!("no {min_agree} endpoints agree, as a majority, among {answers:?}"),
-        disagreement: true,
-    })
 }
 
 struct DestinationState {
@@ -996,6 +945,7 @@ mod tests {
 #[cfg(test)]
 mod round6_tests {
     use super::*;
+    use crate::provider::majority;
     use alloy::providers::ProviderBuilder;
     use alloy_sol_types::SolCall;
 

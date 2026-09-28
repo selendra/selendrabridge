@@ -815,6 +815,80 @@ fn asset_write_allowed(
     Err(GateError::AssetAlreadyRegistered.into())
 }
 
+/// Is `existing_len` the size of an account written by the pre-decimals program
+/// (a 96-byte body, in the 97 bytes that program allocated)?
+fn is_legacy_asset_len(existing_len: usize) -> bool {
+    existing_len == LEGACY_ASSET_CONFIG_LEN || existing_len == LEGACY_ASSET_CONFIG_LEN + 1
+}
+
+/// Pure legacy-migration rule (host-testable; audit round 6, LOW): is this
+/// registration the "identical re-run" of an asset recorded by the PRE-DECIMALS
+/// program, which must backfill the H-5(b) vault binding and upgrade the record?
+///
+/// THE BUG IT FIXES. The re-run is the documented one-command migration for a
+/// pre-H-5 gate (see [`bind_vault`]), but a legacy record decodes with both
+/// decimals `0` while the re-run reads the mint's real decimals into
+/// `local_decimals`, so [`asset_write_allowed`] saw a DIFFERENT record and
+/// refused with `AssetAlreadyRegistered` — for every legacy asset whose mint
+/// has any decimals at all. The migration existed on paper only, and those
+/// vaults kept no scale commitment, which is the H-5(b) amplification left open.
+///
+/// WHY ONLY IDENTITY SCALE (`bridge_decimals == local_decimals`). A legacy
+/// record's semantics are `bridge_unit(0, 0) == 1`: every transfer it ever
+/// handled carried LOCAL amounts, and the `["sent", id]` records it wrote hold
+/// local amounts too. Upgrading it at any other scale would silently rescale
+/// every amount the gate has already attested — the same reason
+/// `Gate.initializeV2` migrates the EVM gate at identity scale and no other.
+/// Identity keeps the unit at 1, so nothing a validator signed changes meaning.
+/// Any other scale, a different mint, or a different vault is NOT this rule and
+/// falls through to [`asset_write_allowed`]'s refusal: H-1 write-once still holds.
+///
+/// WHY NO SCHEDULE. It repoints nothing (same id, mint, vault, unit 1) and only
+/// ADDS commitments — the vault binding, and a scale in the record that `claim`
+/// now enforces. There is nothing for the 48 h to protect, and the backfill must
+/// not wait 48 h per asset, because that wait IS the H-5(b) window.
+///
+/// Gated on the ACCOUNT LENGTH, not on decoded zeros: a current-layout record of
+/// a 0-decimal mint also reads `0/0`, and must never be rewritable through here.
+fn legacy_asset_upgrade_allowed(
+    existing_len: usize,
+    existing: &AssetConfig,
+    incoming: &AssetConfig,
+) -> bool {
+    is_legacy_asset_len(existing_len)
+        && existing.mint != Pubkey::default()
+        && existing.debridge_id == incoming.debridge_id
+        && existing.mint == incoming.mint
+        && existing.vault == incoming.vault
+        && existing.bridge_decimals == 0
+        && existing.local_decimals == 0
+        && incoming.bridge_decimals == incoming.local_decimals
+}
+
+/// Grow a program-owned account in place to `space` bytes, topping its balance
+/// up to rent exemption from `payer` (audit round 6, LOW). Used only to lift a
+/// pre-decimals asset record out of the 97 bytes the old program allocated —
+/// the first `realloc` in this program; [`ASSET_CONFIG_SLACK`] exists so the
+/// NEXT field needs none.
+fn grow_program_account<'a>(
+    payer: &AccountInfo<'a>,
+    target: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    space: usize,
+) -> ProgramResult {
+    let rent = Rent::get()?.minimum_balance(space);
+    let have = target.lamports();
+    if have < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, rent - have),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
+    // Zero-initialised, so no stale bytes from an earlier shrink can surface in
+    // the slack.
+    target.realloc(space, true)
+}
+
 /// What a vault is committed to, stored in `["vault", vault]` (H-5(b)).
 ///
 /// `bridge_decimals` is the field that does the work. `mint` is recorded so the
@@ -883,7 +957,10 @@ fn vault_binding_allowed(
 /// It is written on the idempotent re-run path too, which is how a vault bound by
 /// a pre-H-5 build of this program gets its record backfilled — re-running
 /// `register_asset` with the values already stored. Without that the check would
-/// be inert on every gate that is already live, which is all of them.
+/// be inert on every gate that is already live, which is all of them. For a
+/// record from before the decimals fields, "the values already stored" means the
+/// same mint and vault at IDENTITY scale — see [`legacy_asset_upgrade_allowed`]
+/// (audit round 6, LOW: that re-run used to be refused outright).
 fn bind_vault<'a>(
     program_id: &Pubkey,
     payer: &AccountInfo<'a>,
@@ -1326,9 +1403,10 @@ pub enum GateError {
     /// scale, which is what makes the ids diverge in the first place.
     #[error("wire scale does not match this gate's registration for the asset")]
     BridgeScaleMismatch,
-    /// H-5: `claim` on a gate whose asset registry is not final yet. `Custom(26)`.
-    /// Mirrors `Gate.NotSealed`.
-    #[error("gate is not sealed — Seal it before it may release anything")]
+    /// H-5: `claim` — and, since audit round 6 (LOW), `send` — on a gate whose
+    /// asset registry is not final yet. `Custom(26)`. Mirrors `Gate.NotSealed`
+    /// (which the EVM gate raises from `claim` only).
+    #[error("gate is not sealed — Seal it before it may move any funds")]
     NotSealed,
     /// H-5: `Seal` on a gate that is already sealed. `Custom(27)`. Mirrors
     /// `Gate.AlreadySealed`.
@@ -2090,6 +2168,22 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
     if cfg.paused {
         return Err(GateError::Paused.into());
     }
+    // H-5 (audit round 6, LOW): funds only ever ENTER a gate whose asset registry
+    // is final, too. `claim` refused an unsealed gate but `send` did not, so a
+    // user could lock real tokens in a vault while one-transaction registration
+    // was still open — liquidity sitting behind exactly the instant, unscheduled
+    // owner action H-5 is about (a second debridge_id on that vault at the same
+    // mint and scale is a 1:1 drain of it), and `process_seal`'s promise that
+    // nothing reaches an unsealed gate was false. Refusing here makes that
+    // promise true and makes "seal before provisioning liquidity" hold for user
+    // deposits, not only for the operator's own top-up.
+    //
+    // Stricter than the EVM gate: `Gate.send` does not consult `isSealed` (only
+    // `Gate.claim` does). A transfer toward an unsealed EVM gate is still
+    // harmless there — it cannot be claimed until that gate seals.
+    if !cfg.sealed {
+        return Err(GateError::NotSealed.into());
+    }
     // H-3: only a governance-registered destination. Checked before any account
     // work so a spam send costs the attacker a failed tx and nothing else.
     if !cfg.corridor_registered(args.chain_id_to) {
@@ -2512,7 +2606,15 @@ fn process_register_asset(
     // the timelock protects — so it must not consume a schedule. It is also the
     // path that BACKFILLS the vault binding for an asset registered by a pre-H-5
     // build, which is why it is a no-op and no longer an early return.
+    //
+    // "Byte for byte" cannot hold for a record older than the decimals fields:
+    // it decodes as `0/0`, the mint says otherwise, and the re-run used to be
+    // refused as a repoint (audit round 6, LOW). That case is
+    // [`legacy_asset_upgrade_allowed`]: same id, mint and vault, identity scale.
     let mut rerun = false;
+    // Audit round 6, LOW: a pre-decimals record re-registered at identity scale.
+    // Skips the schedule like a re-run, but unlike one it WRITES the record.
+    let mut legacy_upgrade = false;
     if !asset_ai.data_is_empty() {
         if asset_ai.owner != program_id {
             return Err(ProgramError::IllegalOwner);
@@ -2530,13 +2632,19 @@ fn process_register_asset(
         // is sealed); changing a live one must not exist. Route a different asset
         // through a fresh debridge_id instead.
         let existing = decode_asset_config(&asset_ai.data.borrow())?;
-        rerun = !asset_write_allowed(&existing, &record)?;
+        // Checked BEFORE the write-once rule, which would otherwise refuse it:
+        // the legacy record's `0/0` never equals the mint's real decimals.
+        if legacy_asset_upgrade_allowed(asset_ai.data_len(), &existing, &record) {
+            legacy_upgrade = true;
+        } else {
+            rerun = !asset_write_allowed(&existing, &record)?;
+        }
     }
 
     // H-5(a): instant while the gate is being wired, timelocked once it is
     // sealed or the setup window has run out. The action id commits to the mint,
     // the vault AND the scale, so the 48 h is spent on exactly this binding.
-    if !rerun {
+    if !rerun && !legacy_upgrade {
         let now = solana_program::clock::Clock::get()?.unix_timestamp;
         if !in_setup_phase(cfg.sealed, cfg.setup_deadline, now) {
             let action_id =
@@ -2578,8 +2686,16 @@ fn process_register_asset(
             bump,
             space,
         )?;
+    } else if asset_ai.data_len() < space {
+        // A pre-decimals account is 96/97 bytes and the current record is 98:
+        // without growing it, the write below could not fit (audit round 6, LOW).
+        grow_program_account(owner, asset_ai, system_program, space)?;
     }
     record.serialize(&mut &mut asset_ai.data.borrow_mut()[..])?;
+    if legacy_upgrade {
+        msg!("legacy asset record upgraded at identity scale; vault binding backfilled");
+        return Ok(());
+    }
     msg!("asset registered for debridge_id");
     Ok(())
 }
@@ -2593,8 +2709,15 @@ fn process_register_asset(
 ///
 /// Call it as the last wiring step and BEFORE provisioning vault liquidity — an
 /// unsealed gate that holds funds is the drain this finding is about. The order
-/// is safe because `claim` is refused until this lands, so nothing can be
-/// delivered into an unsealed gate in the meantime either.
+/// is safe because BOTH fund-moving user instructions refuse an unsealed gate:
+/// `claim` releases nothing out of it, and `send` locks nothing into it. That
+/// second half was missing until audit round 6 (LOW): this comment claimed
+/// "nothing can be delivered into an unsealed gate" while `send` never checked,
+/// so user deposits could land in a vault still open to instant registration.
+///
+/// What remains outside the program's reach is a plain SPL transfer straight
+/// into the vault token account — the operator's own top-up is exactly that, and
+/// only the runbook order above governs it.
 fn process_seal(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
@@ -3528,6 +3651,37 @@ mod c1_tests {
         assert_ne!(add_validator_action_id(&[0u8; 20]), lower_threshold_action_id(0));
         // Deterministic, so off-chain tooling can derive the same id.
         assert_eq!(a, add_validator_action_id(&[0xAA; 20]));
+    }
+
+    /// Audit round 6, LOW: the legacy re-run is recognised by the ACCOUNT LENGTH
+    /// and only at identity scale, on the same id, mint and vault. Every other
+    /// shape falls through to the H-1 write-once refusal.
+    #[test]
+    fn only_a_legacy_record_at_identity_scale_may_be_upgraded() {
+        let (mint, vault) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let legacy = AssetConfig { debridge_id: [7; 32], mint, vault, bridge_decimals: 0, local_decimals: 0 };
+        let want = AssetConfig { bridge_decimals: 6, local_decimals: 6, ..legacy.clone() };
+        for len in [LEGACY_ASSET_CONFIG_LEN, LEGACY_ASSET_CONFIG_LEN + 1] {
+            assert!(legacy_asset_upgrade_allowed(len, &legacy, &want), "len {len}");
+            // A non-identity scale would rescale every amount already attested.
+            let scaled = AssetConfig { bridge_decimals: 3, ..want.clone() };
+            assert!(!legacy_asset_upgrade_allowed(len, &legacy, &scaled));
+            // Different vault / mint / id: a repoint, not a migration.
+            let other_vault = AssetConfig { vault: Pubkey::new_unique(), ..want.clone() };
+            assert!(!legacy_asset_upgrade_allowed(len, &legacy, &other_vault));
+            let other_mint = AssetConfig { mint: Pubkey::new_unique(), ..want.clone() };
+            assert!(!legacy_asset_upgrade_allowed(len, &legacy, &other_mint));
+            let other_id = AssetConfig { debridge_id: [8; 32], ..want.clone() };
+            assert!(!legacy_asset_upgrade_allowed(len, &legacy, &other_id));
+            // An allocated-but-unwritten legacy account is not a binding to upgrade.
+            let blank = AssetConfig::default();
+            assert!(!legacy_asset_upgrade_allowed(len, &blank, &want));
+        }
+        // A CURRENT-layout record never takes this path, even one that decodes to
+        // `0/0` (a 0-decimal mint): its rewrite stays H-1's decision.
+        for len in [ASSET_CONFIG_LEN, ASSET_CONFIG_LEN + ASSET_CONFIG_SLACK] {
+            assert!(!legacy_asset_upgrade_allowed(len, &legacy, &want), "len {len}");
+        }
     }
 
     /// Audit 2026-09-16, M-3. An `["asset", id]` record written by the

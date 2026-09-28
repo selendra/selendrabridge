@@ -93,8 +93,17 @@
 //! `claim` is refused until `seal` lands, so the wiring order is: init →
 //! register-corridor → register-asset → **seal** → fund the vaults.
 //!
-//! A vault backs exactly ONE asset: a second `debridgeId` naming a vault already
-//! recorded in `["vault", vault]` is refused (`Custom(28)`).
+//! A vault backs ONE MINT AT ONE SCALE, not one `debridgeId` (audit round 6,
+//! LOW — this line used to say "exactly ONE asset", which is the rule H-5 (b)
+//! deliberately did NOT adopt). A `debridgeId` is `keccak(sourceChainId,
+//! sourceToken)`, so one SPL mint bridged from three EVM chains is three ids
+//! against one vault, and all three must register. What `["vault", vault]`
+//! pins is its `VaultBinding { mint, bridge_decimals }`: a further id on the
+//! same vault is accepted only if it agrees on both, and refused with
+//! `VaultAssetMismatch` (`Custom(28)`) otherwise — so a vault always pays out in
+//! the units it was funded in. A second id at the SAME mint and scale is left to
+//! the timelock above. See docs/bug/audit-2026-09-16.md, "Fixes applied
+//! 2026-09-24 — H-5", section (b).
 //!
 //! The program UPGRADE authority cannot be timelocked by the program itself:
 //! put it behind a Squads / SPL-Governance timelock before any production use.

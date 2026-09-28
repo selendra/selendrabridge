@@ -21,21 +21,34 @@
 //! transfer a phishing or replay attempt should target, need the bearer token.
 //! With `allow_unauthenticated = true` (dev) everything is served in full.
 //!
-//! Every PRESENTED bearer, right or wrong, on any route draws from a small token
-//! bucket owned by the PEER'S IP ADDRESS; when that bucket is empty the API
-//! answers 429 without comparing. That bounds online guessing of the token at a
-//! few attempts per second per address. Requests with no `Authorization` header
-//! do not touch any bucket, so a healthcheck can never lock an operator out.
+//! Every WRONG bearer on any route draws from a small token bucket owned by the
+//! PEER'S IP ADDRESS; once that bucket is empty further wrong bearers get 429
+//! instead of 401. A CORRECT bearer never draws and is never throttled.
+//! Requests with no `Authorization` header do not touch any bucket, so a
+//! healthcheck can never lock an operator out.
 //!
 //! Per address, not global (audit 2026-09-16, LOW). A single shared bucket —
 //! which is what keying on the empty string amounted to — let anyone who could
 //! reach the port keep it drained with a wrong bearer every half second, and the
 //! operator's own correct token then got 429 on `/pause` for as long as the
-//! flood lasted: the halt button was deniable exactly when it was needed. The
-//! draw still happens BEFORE the compare, so a throttled address learns nothing
-//! from any guess. The residual — callers sharing one address (a NAT, or a
-//! proxy in front of the API) share one bucket — is why the API should be bound
-//! to a private interface, as the shipped configs do.
+//! flood lasted: the halt button was deniable exactly when it was needed.
+//!
+//! Failures only (audit round 6, LOW). Per-address keying left a residual that
+//! is the COMMON deployment, not an edge case: behind docker-proxy every host
+//! caller reaches the container from the bridge gateway (172.x.0.1), so any
+//! local process spraying bad bearers drained the one bucket the operator's
+//! curl also drew from, and `/pause` answered 429 again. The draw used to happen
+//! BEFORE the compare so a throttled address learned nothing from a guess; that
+//! is exactly what made the correct token deniable. Now the compare (still
+//! constant-time, [`ct_eq`]) runs first and only a mismatch spends budget.
+//!
+//! What that gives up, stated plainly: a throttled peer's guesses are still
+//! evaluated (a right one gets 200), so the bucket no longer bounds online
+//! guessing — the token's entropy does. A 256-bit random token (what
+//! `openssl rand -hex 32` gives) is not guessable at any request rate, so
+//! throttling the correct token protected nothing and cost the halt button. The
+//! bucket stays as a cheap per-peer brake and a loud 429 signal on a flood, and
+//! [`router`] warns at startup about a token too short to carry that weight.
 //!
 //! Each source's state is shared with its scan loop via `Arc<Mutex<Runtime>>`.
 
@@ -66,6 +79,10 @@ use crate::state::Runtime;
 const AUTH_ATTEMPT_BURST: u32 = 30;
 const AUTH_ATTEMPTS_PER_SECOND: f64 = 2.0;
 
+/// Below this many bytes the operator token gets a startup warning: since a
+/// correct bearer bypasses the failure throttle, entropy is the guessing bound.
+const MIN_TOKEN_LEN: usize = 32;
+
 #[derive(Clone)]
 pub struct ApiState {
     /// One runtime per watched source chain, keyed by chain_id.
@@ -85,7 +102,7 @@ pub struct ApiState {
 struct Guard {
     token: Option<String>,
     allow_unauthenticated: bool,
-    /// One bucket per peer IP for presented bearers (see the module note).
+    /// One bucket per peer IP, drawn only by WRONG bearers (see the module note).
     attempts: RateLimit,
 }
 
@@ -112,17 +129,21 @@ impl Guard {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         let Some(presented) = presented else { return Credential::None };
-        // Draw BEFORE comparing, so an exhausted bucket refuses to evaluate the
-        // guess at all — a correct token from a flooding address gets 429 too,
-        // which is the price of the response not being an oracle. The bucket is
-        // the PEER's, so a flood from elsewhere cannot spend the operator's.
-        if !self.attempts.check(&peer_key(req)) {
-            return Credential::Throttled;
-        }
+        // Compare FIRST (audit round 6, LOW). Drawing before the compare made a
+        // correct token from a drained address 429 — and behind docker-proxy
+        // every host caller is ONE address, so any local process could deny the
+        // operator's `/pause`. A correct bearer is never throttled: the token's
+        // entropy, not the bucket, is what stops guessing (see the module note).
+        // `ct_eq` keeps the compare constant-time either way.
         if ct_eq(presented.as_bytes(), expected.as_bytes()) {
-            Credential::Full
-        } else {
+            return Credential::Full;
+        }
+        // Only a FAILED attempt spends the peer's budget. An empty bucket turns
+        // the 401 into a 429 so a flood is visible and backs off.
+        if self.attempts.check(&peer_key(req)) {
             Credential::Wrong
+        } else {
+            Credential::Throttled
         }
     }
 }
@@ -147,7 +168,7 @@ enum Credential {
     None,
     /// A bearer was presented and does not match.
     Wrong,
-    /// Too many bearers presented recently; not evaluated.
+    /// A wrong bearer from a peer that has spent its failure budget.
     Throttled,
 }
 
@@ -205,7 +226,19 @@ pub fn router(state: ApiState) -> Router {
         .route("/rescan/:chain_id", post(rescan_one));
 
     match guard.token.clone() {
-        Some(_) => {
+        Some(t) => {
+            // A correct bearer is never throttled (audit round 6, LOW), so the
+            // token's length is the whole guessing bound. 32 bytes is 128 bits of
+            // hex; say so loudly rather than refuse, so a dev stack's "s3cret"
+            // still starts.
+            if t.len() < MIN_TOKEN_LEN {
+                warn!(
+                    len = t.len(),
+                    "operator API token is shorter than {MIN_TOKEN_LEN} bytes; wrong-token \
+                     throttling does not bound guessing of a CORRECT token, so use a random \
+                     256-bit value (e.g. `openssl rand -hex 32`)"
+                );
+            }
             info!(
                 "operator API auth enabled: bearer token required for pause/resume/rescan \
                  and for the full /status (validator address + nonces)"
@@ -532,10 +565,10 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Online guessing is bounded: after the burst of presented bearers the API
-    /// stops evaluating them (429) — for the right token too, briefly, so the
-    /// response is not an oracle. Requests with NO bearer are unaffected, so a
-    /// healthcheck can never lock the operator out.
+    /// Wrong bearers are throttled per peer: after the burst the API answers 429
+    /// instead of 401. Requests with NO bearer are unaffected, so a healthcheck
+    /// can never lock the operator out; and the RIGHT bearer is never throttled
+    /// (audit round 6, LOW — see `a_shared_proxy_address_cannot_lock_the_operator_out`).
     #[tokio::test]
     async fn bearer_attempts_are_rate_limited() {
         let p = temp_state_path("auth-limit");
@@ -547,9 +580,7 @@ mod tests {
             saw_429 |= code == StatusCode::TOO_MANY_REQUESTS;
         }
         assert!(saw_429, "a flood of wrong tokens must eventually be throttled");
-        // While throttled, the right token is not evaluated either...
-        assert_eq!(post_with(app.clone(), "/pause", Some("s3cret")).await, StatusCode::TOO_MANY_REQUESTS);
-        // ...but the credential-less healthcheck read is untouched.
+        // The credential-less healthcheck read is untouched.
         let (code, _) = get_status(app.clone(), "/status", None).await;
         assert_eq!(code, StatusCode::OK);
         let _ = std::fs::remove_file(&p);
@@ -581,14 +612,42 @@ mod tests {
         for _ in 0..(AUTH_ATTEMPT_BURST + 5) {
             post_from(app.clone(), "/pause", "guess", ATTACKER).await;
         }
-        // Premise: the attacker really did exhaust a bucket — even the right token
-        // from its address is not evaluated.
+        // Premise: the attacker really did exhaust its bucket.
         assert_eq!(
-            post_from(app.clone(), "/pause", "s3cret", ATTACKER).await,
+            post_from(app.clone(), "/pause", "guess", ATTACKER).await,
             StatusCode::TOO_MANY_REQUESTS
         );
         // The operator, from another address, can still halt the validator.
         assert_eq!(post_from(app.clone(), "/pause", "s3cret", OPERATOR).await, StatusCode::OK);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// THE regression (audit round 6, LOW). Behind docker-proxy every host
+    /// caller reaches the API from the bridge gateway, so per-address buckets
+    /// were one bucket again: a local process spraying bad bearers drained it and
+    /// the operator's CORRECT token on `/pause` got 429, because the draw came
+    /// before the compare. Only failures draw now; the right token always passes.
+    #[tokio::test]
+    async fn a_shared_proxy_address_cannot_lock_the_operator_out() {
+        let p = temp_state_path("auth-proxy");
+        let app = app_with(&p, Some("s3cret"), false);
+        const DOCKER_GW: [u8; 4] = [172, 18, 0, 1];
+
+        for _ in 0..(AUTH_ATTEMPT_BURST + 5) {
+            post_from(app.clone(), "/pause", "guess", DOCKER_GW).await;
+        }
+        // Premise: the shared address really is throttled for wrong bearers...
+        assert_eq!(
+            post_from(app.clone(), "/pause", "guess", DOCKER_GW).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // ...yet the operator, from that same address, can halt the validator,
+        assert_eq!(post_from(app.clone(), "/pause", "s3cret", DOCKER_GW).await, StatusCode::OK);
+        // and a success does not refill the attacker's budget.
+        assert_eq!(
+            post_from(app.clone(), "/pause", "guess", DOCKER_GW).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
         let _ = std::fs::remove_file(&p);
     }
 

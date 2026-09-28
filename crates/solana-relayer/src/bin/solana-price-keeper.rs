@@ -154,6 +154,40 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// What the `[TOKEN_SEED, mint]` PDA says about one configured token.
+#[derive(Debug)]
+enum RecordRead {
+    Listed(Box<TokenRec>),
+    /// No account at the PDA: the mint is configured here but never listed.
+    NotListed,
+    /// An account the swap program does not own. Anyone can create one: sending
+    /// lamports to the PDA of a configured-but-unlisted mint leaves a
+    /// system-owned, zero-data account there.
+    Foreign(Pubkey),
+    /// Owned by the program but not a `TokenRec`.
+    Undecodable,
+}
+
+/// Classify a token-record read (pure, host-testable).
+///
+/// Audit round 6, LOW: the owner was never checked, and a record that did not
+/// decode was `?`-propagated out of `tick` — so a system-owned empty account at
+/// ONE unlisted mint's PDA (a lamport transfer is all it takes) aborted the tick
+/// for EVERY token, and every pool price went stale a day later. Each outcome is
+/// now per-token; the caller warns and moves on.
+fn read_record(program: &Pubkey, acct: Option<&solana_sdk::account::Account>) -> RecordRead {
+    let Some(a) = acct else { return RecordRead::NotListed };
+    // Only the swap program can have written a real record here. Checked BEFORE
+    // decoding: a foreign account's bytes mean nothing, even if they decode.
+    if a.owner != *program {
+        return RecordRead::Foreign(a.owner);
+    }
+    match math::decode::<TokenRec>(&a.data) {
+        Some(rec) => RecordRead::Listed(Box::new(rec)),
+        None => RecordRead::Undecodable,
+    }
+}
+
 fn tick(
     rpc: &RpcClient,
     oracle: &Keypair,
@@ -191,10 +225,33 @@ fn tick(
             debug!(symbol = %t.symbol, "hub is pinned at 1.0 and never stale; skipping");
             continue;
         }
-        let rec: TokenRec = match rpc.get_account(&t.record) {
-            Ok(a) => math::decode(&a.data).ok_or_else(|| anyhow::anyhow!("{} record does not decode", t.symbol))?,
-            Err(_) => {
+        // `get_account_with_commitment`, not `get_account`: it answers a missing
+        // account with `None` instead of an error, so "not listed" and "the RPC
+        // failed" stop being the same message (the old code called both "not
+        // listed"). Either way it is THIS token's problem, not the tick's.
+        let acct = match rpc.get_account_with_commitment(&t.record, rpc.commitment()) {
+            Ok(resp) => resp.value,
+            Err(e) => {
+                warn!(symbol = %t.symbol, mint = %t.mint, error = %e, "RPC error reading the token record; skipping this token this tick");
+                continue;
+            }
+        };
+        let rec: TokenRec = match read_record(&program, acct.as_ref()) {
+            RecordRead::Listed(rec) => *rec,
+            RecordRead::NotListed => {
                 warn!(symbol = %t.symbol, mint = %t.mint, "token is not listed on this pool; skipping");
+                continue;
+            }
+            RecordRead::Foreign(owner) => {
+                warn!(
+                    symbol = %t.symbol, mint = %t.mint, record = %t.record, %owner,
+                    "token record PDA is owned by another program, not the pool — not listed \
+                     (anyone can fund an empty account there); skipping"
+                );
+                continue;
+            }
+            RecordRead::Undecodable => {
+                warn!(symbol = %t.symbol, mint = %t.mint, record = %t.record, "token record does not decode; skipping");
                 continue;
             }
         };
@@ -278,5 +335,46 @@ mod tests {
     fn set_price_instruction_matches_the_program_enum() {
         let bytes = SwapInstruction::SetPrice { price: 3180 * math::PRICE_ONE }.to_bytes();
         assert_eq!(bytes.len(), 1 + 16, "tag + u128");
+    }
+
+    /// Audit round 6, LOW: a system-owned, zero-data account at the TOKEN_SEED
+    /// PDA — created by anyone sending lamports there — used to decode-fail with
+    /// `?` and abort the tick for every token. It is now classified as foreign
+    /// (never decoded), and each other outcome is per-token too.
+    #[test]
+    fn a_squatted_or_bad_token_record_is_per_token_not_fatal() {
+        let program = Pubkey::new_unique();
+        let acct = |owner: Pubkey, data: Vec<u8>| solana_sdk::account::Account {
+            lamports: 1_000_000,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let squatted = acct(solana_sdk::system_program::id(), vec![]);
+        assert!(
+            matches!(read_record(&program, Some(&squatted)), RecordRead::Foreign(o) if o == solana_sdk::system_program::id())
+        );
+        // Ownership is checked BEFORE decoding: foreign bytes are never trusted.
+        let rec = TokenRec {
+            mint: [1; 32],
+            vault: [2; 32],
+            decimals: 9,
+            price: math::PRICE_ONE,
+            reserve: 0,
+            last_price_update: 0,
+            listed: true,
+            price_set_at: 0,
+        };
+        let foreign_but_decodable = acct(Pubkey::new_unique(), borsh::to_vec(&rec).unwrap());
+        assert!(matches!(read_record(&program, Some(&foreign_but_decodable)), RecordRead::Foreign(_)));
+
+        assert!(matches!(read_record(&program, None), RecordRead::NotListed));
+        assert!(matches!(read_record(&program, Some(&acct(program, vec![1, 2]))), RecordRead::Undecodable));
+        assert!(matches!(
+            read_record(&program, Some(&acct(program, borsh::to_vec(&rec).unwrap()))),
+            RecordRead::Listed(_)
+        ));
     }
 }

@@ -40,6 +40,9 @@ solana-sdk = "=1.18.26"
 solana-program = "=1.18.26"
 libsecp256k1 = "0.6"
 borsh = { version = "1", features = ["derive"] }
+# Same version bridge-solana uses (already in the lockfile): the scanner peeks at
+# a `Program data:` payload's version byte when the rest will not decode.
+base64 = "0.22"
 # native-tls, NOT rustls: the rustls stack pulls a zeroize that cannot coexist
 # with solana-client 1.18 (verified by isolating each dependency).
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }

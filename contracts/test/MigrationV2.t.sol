@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
 import {GateProxy} from "../src/GateProxy.sol";
+import {GateDeployer} from "../src/GateDeployer.sol";
 import {TestToken} from "../src/TestToken.sol";
 import {BridgeHash} from "../src/BridgeHash.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
@@ -405,5 +406,37 @@ contract MigrationV2Test is Test {
         bytes32 action = upgraded.setLocalTokenActionId(did, address(token));
         vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
         upgraded.setLocalToken(did, address(token));
+    }
+
+    /// Audit round 6, LOW: {initialize} leaves a gate at version 1 — the same as a
+    /// pre-decimals gate — so `reinitializer(2)` alone let the owner of a FRESH,
+    /// sealed gate call {initializeV2} directly and register a token at identity
+    /// scale instantly, skipping the 48 h {setBridgeDecimals} delay. Refused now:
+    /// only a gate whose `setupDeadline` reads as virgin gap is a migration target.
+    function test_InitializeV2_RefusedOnAFreshGate() public {
+        Gate fresh = GateDeployer.deploy(_vals(), 1, keccak256("mesh.fresh.generation"));
+        fresh.seal();
+        TestToken other = new TestToken("Other", "OTH");
+        address[] memory toks = new address[](1);
+        toks[0] = address(other);
+
+        // The legitimate path takes the public delay...
+        bytes32 action = fresh.setBridgeDecimalsActionId(address(other), 18);
+        vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
+        fresh.setBridgeDecimals(address(other), 18);
+
+        // ...and the migration entrypoint is no longer a way around it, paused
+        // (its own precondition) or not.
+        fresh.pause();
+        vm.expectRevert(Gate.NotALegacyGate.selector);
+        fresh.initializeV2(toks, _chains());
+        (bool set,,) = fresh.bridgeDecimalsOf(address(other));
+        assertFalse(set, "nothing registered without the timelock");
+        assertFalse(fresh.supportedChain(CHAIN_DST), "no chain listed without the timelock");
+    }
+
+    function _vals() internal view returns (address[] memory vals) {
+        vals = new address[](1);
+        vals[0] = v1;
     }
 }

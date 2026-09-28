@@ -67,11 +67,23 @@ use tracing::warn;
 
 use bridge_core::abi::Gate;
 
+use crate::provider;
+
 /// An EVM destination gate this validator can read well enough to vote on.
 pub struct Destination {
     pub chain_id: u64,
     pub gate: Address,
-    pub provider: DynProvider,
+    /// Every healthy endpoint for the peer chain, (redacted url, provider).
+    ///
+    /// Audit round 6, LOW: this used to be ONE provider — `connect_checked`
+    /// kept the first healthy endpoint — so a single lying destination RPC could
+    /// report a wrong scale and stop this validator signing the corridor. Only
+    /// liveness (claim enforces the scale on-chain since the scale went into the
+    /// submissionId), but every other gate read is corroborated now, so this is
+    /// too: the scale is taken only when [`provider::majority`] agrees.
+    pub endpoints: Vec<(String, DynProvider)>,
+    /// [`provider::min_agree`] for the peer's CONFIGURED endpoint count.
+    pub min_agree: usize,
 }
 
 /// A Solana gate program this validator can read, for EVM->Solana transfers.
@@ -202,49 +214,46 @@ impl ScaleGuard {
         })
     }
 
+    /// The destination scale, read from every endpoint of the peer and taken
+    /// only on a [`provider::majority`] (audit round 6, LOW). A refusal is an
+    /// `Err` — too few answers, or endpoints that answered and DIFFER — so the
+    /// batch is retried with the cursor rolled back, the same posture as a
+    /// transport fault: a lying endpoint delays signing, it never turns into a
+    /// permanent withhold (`Unknown`) or, worse, a cached wrong scale.
     async fn evm_destination_scale(
         &self,
         dest: &Destination,
         debridge_id: B256,
     ) -> anyhow::Result<Option<u8>> {
-        let gate = Gate::new(dest.gate, &dest.provider);
-        let primary: Option<String> = match gate.bridgeDecimalsFor(debridge_id).call().await {
-            Ok(out) if out.set => return Ok(Some(out.bridgeDecimals)),
-            Ok(_) => {
-                // No corridor there yet. The transfer is already unclaimable until
-                // one exists, so withholding costs nothing and the operator sees why.
+        provider::read_agreed(
+            &dest.endpoints,
+            dest.min_agree,
+            "destination bridge decimals",
+            |p| evm_scale_on(dest, p, debridge_id),
+            |answers| {
                 warn!(
                     chain_id = dest.chain_id,
                     %debridge_id,
-                    "destination gate has no corridor registered for this debridgeId"
+                    answers = ?answers,
+                    "DESTINATION RPC ENDPOINTS DISAGREE about an asset's bridge decimals — not \
+                     signing this source until they agree (audit H-4/H-2). One endpoint is wrong \
+                     about the chain: investigate."
                 );
-                return Ok(None);
-            }
-            // A gate older than `bridgeDecimalsFor` reverts on it; answer from the
-            // two reads it is made of. A transport fault lands here too and is
-            // then reported by those reads, so it is still retried, not withheld.
-            Err(e) => Some(e.to_string()),
-        };
-        // Name BOTH reads when the fallback also fails in transit: otherwise a
-        // 429 on `bridgeDecimalsFor` is logged as if only `tokenOf` had failed.
-        let first = || primary.as_deref().map(|p| format!(" (bridgeDecimalsFor first: {p})")).unwrap_or_default();
+            },
+        )
+        .await
+    }
+}
 
-        let local = match gate.tokenOf(debridge_id).call().await {
-            Ok(t) => t,
-            Err(e) if is_definitive(&e) => {
-                warn!(chain_id = dest.chain_id, gate = %dest.gate, error = %e,
-                      "destination gate does not answer tokenOf");
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "reading destination tokenOf on chain {}: {e}{}",
-                    dest.chain_id,
-                    first()
-                ))
-            }
-        };
-        if local == Address::ZERO {
+/// One endpoint's answer for [`ScaleGuard::evm_destination_scale`]: `Ok(None)`
+/// when the chain definitively has no scale for the id, `Err` on transit faults.
+async fn evm_scale_on(dest: &Destination, provider: DynProvider, debridge_id: B256) -> anyhow::Result<Option<u8>> {
+    let gate = Gate::new(dest.gate, &provider);
+    let primary: Option<String> = match gate.bridgeDecimalsFor(debridge_id).call().await {
+        Ok(out) if out.set => return Ok(Some(out.bridgeDecimals)),
+        Ok(_) => {
+            // No corridor there yet. The transfer is already unclaimable until
+            // one exists, so withholding costs nothing and the operator sees why.
             warn!(
                 chain_id = dest.chain_id,
                 %debridge_id,
@@ -252,29 +261,62 @@ impl ScaleGuard {
             );
             return Ok(None);
         }
-        match gate.bridgeDecimalsOf(local).call().await {
-            Ok(out) if out.set => Ok(Some(out.bridgeDecimals)),
-            Ok(_) => {
-                warn!(
-                    chain_id = dest.chain_id,
-                    token = %local,
-                    "destination token has no bridge decimals registered"
-                );
-                Ok(None)
-            }
-            Err(e) if is_definitive(&e) => {
-                warn!(chain_id = dest.chain_id, token = %local, error = %e,
-                      "destination gate does not answer bridgeDecimalsOf");
-                Ok(None)
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "reading destination bridgeDecimalsOf on chain {}: {e}{}",
+        // A gate older than `bridgeDecimalsFor` reverts on it; answer from the
+        // two reads it is made of. A transport fault lands here too and is
+        // then reported by those reads, so it is still retried, not withheld.
+        Err(e) => Some(e.to_string()),
+    };
+    // Name BOTH reads when the fallback also fails in transit: otherwise a
+    // 429 on `bridgeDecimalsFor` is logged as if only `tokenOf` had failed.
+    let first = || primary.as_deref().map(|p| format!(" (bridgeDecimalsFor first: {p})")).unwrap_or_default();
+
+    let local = match gate.tokenOf(debridge_id).call().await {
+        Ok(t) => t,
+        Err(e) if is_definitive(&e) => {
+            warn!(chain_id = dest.chain_id, gate = %dest.gate, error = %e,
+                  "destination gate does not answer tokenOf");
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "reading destination tokenOf on chain {}: {e}{}",
                 dest.chain_id,
                 first()
-            )),
+            ))
         }
+    };
+    if local == Address::ZERO {
+        warn!(
+            chain_id = dest.chain_id,
+            %debridge_id,
+            "destination gate has no corridor registered for this debridgeId"
+        );
+        return Ok(None);
     }
+    match gate.bridgeDecimalsOf(local).call().await {
+        Ok(out) if out.set => Ok(Some(out.bridgeDecimals)),
+        Ok(_) => {
+            warn!(
+                chain_id = dest.chain_id,
+                token = %local,
+                "destination token has no bridge decimals registered"
+            );
+            Ok(None)
+        }
+        Err(e) if is_definitive(&e) => {
+            warn!(chain_id = dest.chain_id, token = %local, error = %e,
+                  "destination gate does not answer bridgeDecimalsOf");
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "reading destination bridgeDecimalsOf on chain {}: {e}{}",
+            dest.chain_id,
+            first()
+        )),
+    }
+}
 
+impl ScaleGuard {
     async fn solana_destination_scale(
         &self,
         dest: &SolanaDestination,
@@ -450,7 +492,12 @@ mod tests {
     #[tokio::test]
     async fn a_transport_failure_is_retryable_not_a_withhold() {
         let g = ScaleGuard::new(
-            vec![Destination { chain_id: 1338, gate: Address::repeat_byte(4), provider: dead_provider() }],
+            vec![Destination {
+                chain_id: 1338,
+                gate: Address::repeat_byte(4),
+                endpoints: vec![("dead".into(), dead_provider())],
+                min_agree: 1,
+            }],
             vec![],
         );
         let r = g
