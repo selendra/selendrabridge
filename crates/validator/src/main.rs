@@ -39,7 +39,7 @@ use bridge_core::Submission;
 use config::{Config, CorroboratePolicy, SourceChain};
 use state::{NonceDecision, PauseReason, Runtime};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -180,11 +180,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// H-4: how many consecutive windows may end with no peer verdict before the
-/// scanner stops waiting and falls back to the "no second source" policy.
+/// warning escalates to an error (and repeats at every further multiple).
 ///
-/// At the shortest sensible poll interval this is minutes of patience, which
-/// covers ordinary peer lag, and it bounds the damage from a peer that can never
-/// answer to a loud warning rather than a stopped validator.
+/// It used to be the point at which the scanner gave up waiting and signed on
+/// the serving endpoint's word alone. That turned the check off for anyone who
+/// could make windows inconclusive — and the serving endpoint could, just by
+/// reporting a head no honest peer had reached (audit round 6). An inconclusive
+/// window is now never signed; this only decides how loudly to say so.
 const INCONCLUSIVE_LIMIT: u32 = 10;
 
 /// Scan one source chain forever: poll for `Sent`, verify, sign, store.
@@ -210,6 +212,12 @@ async fn scan_source(
     // been bitten by (the H-2 cross-check withholding on an empty peer list,
     // 2026-09-24). Past the limit the policy for "no second source" applies.
     let mut inconclusive_streak: u32 = 0;
+    // H-4: the largest window to ask for next. Halved on every inconclusive
+    // window and restored on agreement, so a peer whose `eth_getLogs` range cap
+    // is below `max_block_range` (1rpc.io caps at 50) still gets a range it CAN
+    // answer. That is what used to justify signing single-source after
+    // `INCONCLUSIVE_LIMIT`; shrinking the window fixes it without the hole.
+    let mut window_cap: u64 = source.max_block_range.max(1);
     // How fast we may read while behind. Defaults to the steady-state interval:
     // see `catchup_poll_interval_ms` for why aggression has to be opt-in.
     let catchup_ms = source.catchup_poll_interval_ms.unwrap_or(source.poll_interval_ms);
@@ -220,6 +228,20 @@ async fn scan_source(
     let endpoints = source.endpoints()?;
     let mut failover = loop {
         match provider::Failover::connect_for_gate(&endpoints, source.chain_id, Some(gate)).await {
+            // H-4 (round 6): an operator who configured a second endpoint asked
+            // for corroboration. If it is merely unreachable right now, starting
+            // anyway would sign on ONE source for the life of the process
+            // (endpoints are probed once, here), so wait for it instead.
+            Ok(f) if endpoints.len() >= 2 && f.endpoint_count() < 2 => {
+                warn!(
+                    chain_id = source.chain_id,
+                    endpoints_configured = endpoints.len(),
+                    endpoints_healthy = f.endpoint_count(),
+                    "fewer than TWO healthy RPC endpoints for a chain configured with a second: \
+                     not scanning on a single source (audit H-4); retrying"
+                );
+                tokio::time::sleep(retry).await;
+            }
             Ok(mut f) => {
                 // H-4: do not let the whole fleet prefer the same endpoint. The
                 // offset comes from the validator's own address, so it is stable
@@ -385,7 +407,7 @@ async fn scan_source(
         let confirmed = latest.saturating_sub(source.block_confirmation);
 
         if confirmed >= from_block {
-            let to_block = confirmed.min(from_block + source.max_block_range - 1);
+            let to_block = confirmed.min(from_block + window_cap - 1);
 
             // Address/topic selection only — the block range is applied by
             // `get_logs_confirmed`, against the head of the endpoint that serves
@@ -436,12 +458,14 @@ async fn scan_source(
             match &verdict {
                 provider::Corroboration::Agreed { .. } => {
                     inconclusive_streak = 0;
+                    window_cap = window_cap.saturating_mul(2).min(source.max_block_range.max(1));
                 }
                 provider::Corroboration::Disagreed { served_by, checked_by, detail } => {
                     inconclusive_streak = 0;
-                    // The endpoint has already been demoted inside the provider,
-                    // so the retry below reads from someone else. This is the one
-                    // log line in the system that means "an RPC endpoint lied".
+                    // If a majority outvoted the serving endpoint it has been
+                    // demoted inside the provider; a 1-vs-1 split demotes nobody,
+                    // because it cannot say which side lied. This is the one log
+                    // line in the system that means "an RPC endpoint lied".
                     warn!(
                         chain_id = source.chain_id,
                         %served_by,
@@ -449,53 +473,45 @@ async fn scan_source(
                         %detail,
                         from_block,
                         scanned_to,
-                        "RPC ENDPOINTS DISAGREE about this range — signing NOTHING from it and \
-                         demoting the endpoint that served it (audit H-4). If this persists, one \
-                         endpoint is wrong about the chain: investigate before resuming."
+                        "RPC ENDPOINTS DISAGREE about this range — signing NOTHING from it \
+                         (audit H-4). If this persists, one endpoint is wrong about the chain: \
+                         investigate, and remove it from `rpcs`."
                     );
                     tokio::time::sleep(retry).await;
                     continue;
                 }
                 provider::Corroboration::Inconclusive { reason } => {
+                    // NEVER signed, however long it lasts (audit round 6). Almost
+                    // always a lagging peer, which is ordinary; a peer whose range
+                    // cap is below the window is handled by shrinking it. Past the
+                    // limit it is not transient and the operator must look — but
+                    // the answer is a better peer list, not an unverified window.
                     inconclusive_streak = inconclusive_streak.saturating_add(1);
-                    if inconclusive_streak < INCONCLUSIVE_LIMIT {
-                        // Almost always a lagging peer, which is ordinary. Not an
-                        // accusation, and not agreement either: wait for it.
+                    window_cap = (window_cap / 2).max(1);
+                    if inconclusive_streak.is_multiple_of(INCONCLUSIVE_LIMIT) {
+                        error!(
+                            chain_id = source.chain_id,
+                            %reason,
+                            from_block,
+                            scanned_to,
+                            attempts = inconclusive_streak,
+                            "NO PEER HAS CORROBORATED this range after {inconclusive_streak} attempts — \
+                             signing is WITHHELD on this chain until one does. Fix the chain's \
+                             `rpcs` list (audit H-4)."
+                        );
+                    } else {
                         warn!(
                             chain_id = source.chain_id,
                             %reason,
                             from_block,
                             scanned_to,
                             attempt = inconclusive_streak,
+                            window_cap,
                             "no second opinion on this range yet; not advancing the cursor"
                         );
-                        tokio::time::sleep(retry).await;
-                        continue;
                     }
-                    // Every peer has failed this range this many times running, so
-                    // it is not transient lag — it is a peer that cannot answer at
-                    // all (a `get_logs` range cap below `max_block_range` is the
-                    // usual cause). Treat it as "no second source" and apply that
-                    // policy, loudly, rather than staying stopped for ever on a
-                    // configuration problem nothing else would report.
-                    warn!(
-                        chain_id = source.chain_id,
-                        %reason,
-                        from_block,
-                        scanned_to,
-                        attempts = inconclusive_streak,
-                        "NO PEER CAN CORROBORATE this range after {INCONCLUSIVE_LIMIT} attempts — \
-                         treating it as having no second source. Usual cause: a peer's eth_getLogs \
-                         range cap is below this chain's max_block_range. Fix the peer list (audit H-4)."
-                    );
-                    if corroborate.require {
-                        warn!(
-                            chain_id = source.chain_id,
-                            "WITHHOLDING: [corroborate] require = true (audit H-4)"
-                        );
-                        tokio::time::sleep(retry).await;
-                        continue;
-                    }
+                    tokio::time::sleep(retry).await;
+                    continue;
                 }
                 provider::Corroboration::Unavailable => {
                     if corroborate.require {

@@ -246,12 +246,18 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
   against and every signature rests on it alone. Each endpoint must be able to serve
   `eth_getLogs` over that chain's `max_block_range`: several public providers cap it
   (`1rpc.io` at 50 blocks, a free `drpc` key at 10,000), and a peer that cannot answer
-  shows up as `no second opinion on this range yet` and then, after 10 windows, as
-  `NO PEER CAN CORROBORATE`. `[corroborate] require = true` (bridge config
-  `.corroborate.require`) withholds signatures instead of signing unverified when a
-  chain is down to one endpoint. Watch for `RPC ENDPOINTS DISAGREE` — that line means
-  an endpoint is wrong about the chain and it has been demoted; investigate before
-  resuming.
+  shows up as `no second opinion on this range yet` (the scanner halves its window
+  and retries) and, every 10 windows, as the error `NO PEER HAS CORROBORATED`.
+  **An uncorroborated window is never signed** (audit round 6 — it used to be signed
+  after 10 attempts, which let a lying endpoint switch the check off), so that error
+  means the chain is not being signed at all until the `rpcs` list is fixed. A chain
+  configured with two or more `rpcs` also refuses to START scanning on fewer than two
+  healthy ones. `[corroborate] require = true` (bridge config `.corroborate.require`)
+  now only matters for a chain configured with a single endpoint: it withholds instead
+  of signing on that one source. Watch for `RPC ENDPOINTS DISAGREE` — that line means
+  an endpoint is wrong about the chain. With two endpoints nobody can tell which, so
+  nothing is signed and nobody is demoted until one is removed; with three or more
+  the majority decides. Give each validator a different primary where possible.
 - **Seal the Solana gate, and seal it last.** Since H-5 `claim` returns `NotSealed` (`Custom(26)`) until `gate-admin seal` has run, and afterwards a new asset binding needs `gate-admin schedule-governance --register-asset --debridge-id … --mint … --vault … --bridge-decimals …` plus the 48 h delay. `deploy-from-json.sh` runs it (honouring `gate.seal`); a gate left unsealed takes transfers and settles none of them.
 
 ---

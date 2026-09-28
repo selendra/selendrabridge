@@ -61,10 +61,12 @@ pub struct Config {
 
 /// H-4: the second-source policy for the transfer path.
 ///
-/// Corroboration itself is not optional — whenever two or more endpoints survive
-/// the startup chainId probe, every scan window is checked against a second one
-/// and a disagreement discards the window. This policy only decides what happens
-/// when there is NO second endpoint to ask.
+/// Corroboration itself is not optional — whenever two or more endpoints are
+/// configured, every scan window must be agreed by a second one before anything
+/// in it is signed: a disagreement or an inconclusive window is never signed, and
+/// the scan loop will not start on fewer than two healthy endpoints (audit round
+/// 6). This policy only decides what happens when a chain is configured with ONE
+/// endpoint, so there is nothing to ask.
 ///
 /// The default is advisory, deliberately, and it is the same call the repo already
 /// made for `[allowlist] require`: flipping it to fail-closed would stop every
