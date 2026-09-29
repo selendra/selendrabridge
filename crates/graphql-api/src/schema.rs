@@ -1074,13 +1074,15 @@ impl Query {
         fallback
     }
 
-    /// A recent blockhash for a Solana pool's cluster. The browser builds and
+    /// A recent blockhash for a Solana chain's cluster (its pool's or its gate's
+    /// endpoint). The browser builds and
     /// signs its own swap transaction — this is the one piece it cannot derive,
     /// and passing it through here keeps the RPC credential server-side.
     /// `null` for an EVM chain or an unconfigured one.
     #[graphql(complexity = "CHAIN_READ_COST")]
     async fn solana_blockhash(&self, ctx: &Context<'_>, chain_id: u64) -> Option<String> {
-        state(ctx).swaps.solana_blockhash(chain_id).await
+        let st = state(ctx);
+        st.swaps.solana_blockhash(chain_id, st.chains.solana_gate(chain_id)).await
     }
 
     /// SPL balance of a token account, as a decimal string ("0" when the
@@ -1093,7 +1095,8 @@ impl Query {
         chain_id: u64,
         account: String,
     ) -> Option<String> {
-        state(ctx).swaps.solana_token_balance(chain_id, &account).await
+        let st = state(ctx);
+        st.swaps.solana_token_balance(chain_id, &account, st.chains.solana_gate(chain_id)).await
     }
 
     /// Confirmation state of a Solana transaction: `pending`, `processed`,
@@ -1105,7 +1108,8 @@ impl Query {
         chain_id: u64,
         signature: String,
     ) -> Option<String> {
-        state(ctx).swaps.solana_signature_status(chain_id, &signature).await
+        let st = state(ctx);
+        st.swaps.solana_signature_status(chain_id, &signature, st.chains.solana_gate(chain_id)).await
     }
 
     /// Aggregate counts across the whole store.

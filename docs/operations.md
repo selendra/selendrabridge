@@ -421,6 +421,29 @@ Other secrets in the system:
 They are anvil's well-known development keys, so nothing there is at risk today, and `.dockerignore` excludes them from the Docker build context — as it does every generated stack (`docker/*/configs`, `.env`, `keys`), `.solana/`, `config/deployments/`, the `*.local` configs and the root-level `*.toml` the test suites write, so `COPY . .` in the builder stage cannot bake a real key into an image layer.
 The pattern is still the one to break before a real key goes anywhere near it.
 
+### 6.1 The governance key is not a service key (audit T-5)
+
+The EVM gate/pool `owner()` holds governance — `scheduleUpgrade`, `scheduleGovernance`, `transferOwnership`, `seal` — and the Solana gate's owner is whoever signed `init`, permanently. Neither key belongs in a running container. The deploy scripts leave the deployer as owner **and** as each pool's oracle, so a stack that runs its price keeper with the deployer key has put governance on a long-lived service. Check with:
+
+```bash
+bash scripts/rotate-keys.sh docker/<stack>/configs/chains.json status
+```
+
+Every `owner`, `oracle` and `guardian` column printed there must be a different key, and none of them the deployer's hot key. To get there on EVM:
+
+1. `handover` — signed by the current owner from a keystore (never argv). Moves each pool's oracle to a new low-value key, optionally appoints a guardian on every gate and pool, and starts the two-step `transferOwnership` to the cold owner (hardware wallet or multisig). Dry run by default; `--execute` sends.
+   ```bash
+   bash scripts/rotate-keys.sh <chains.json> handover --keystore <owner.json> \
+        --new-oracle 0x… --new-owner 0x… --guardian 0x… [--execute]
+   ```
+2. Put the new oracle's key in `price-keeper.toml` `[oracle]` and restart `price-keeper`. Until then it logs `we are not this pool's oracle` — prices go stale, they are not moved.
+3. `accept` — signed by the new owner: `acceptOwnership()` on every gate and pool.
+4. `status` again.
+
+**Set a guardian.** `cancelScheduledUpgrade` and `cancelScheduledGovernance` accept only the owner or the guardian. With no guardian, the 48 h timelock can be cancelled only by the key it is meant to protect against: a stolen owner key schedules an upgrade, and nobody else can stop it.
+
+On Solana the gate has no ownership transfer, so the owner keypair must never be a service key. Move the swap pool's oracle off it with `swap-admin set-oracle --oracle <pubkey>` and point `price_keeper.solana_oracle_keypair` at the new keypair. The compose generator mounts each service's **own** keyfile (`./keys/<file>`), not the whole `keys/` directory. Before that change, every Solana relayer could read the price keeper's key, so on a stack where that key was the owner, every relayer held governance too. Regenerate a stack to pick up the change.
+
 **RPC urls are secrets too.** A hosted provider's url *is* its API key. Both launchers therefore keep the url the services dial (`rpc_url` / `rpcs[0]`) separate from the one the GraphQL API may hand to browsers (`public_rpc_url`, from `PUBLIC_RPCS[chain]` in `run.config` or `chains[].public_rpc` in `bridge.config.json`). The API serves only the public one — `null` when there is none, and the UI then reads through the wallet's provider — and `--production` refuses to start a registry with a chain missing it. The generated compose file references RPC urls as `${RPC_<chain>}` variables resolved from the stack's gitignored `.env`; `docker/*/docker-compose.yml` is gitignored since the H-4 leak, and the leaked key (`alch_0…`) must be treated as burned and rotated at the provider.
 
 ---

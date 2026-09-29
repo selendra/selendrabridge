@@ -577,54 +577,73 @@ impl Swaps {
         Some(out)
     }
 
-    /// A recent blockhash for the Solana chain's pool, so the browser can build
-    /// a transaction. `None` for an EVM chain (a wallet supplies its own nonce).
-    pub async fn solana_blockhash(&self, chain_id: u64) -> Option<String> {
-        match self.pools.get(&chain_id)? {
-            // A finalized hash stays valid for ~60s; every browser can share one
-            // for a couple of seconds.
-            Backend::Solana(sol) => {
-                self.upstream
-                    .cached(format!("blockhash:{chain_id}"), |_| BLOCKHASH_TTL, async {
-                        sol.latest_blockhash().await.ok()
-                    })
-                    .await
-            }
-            Backend::Evm { .. } => None,
+    /// The Solana cluster endpoint for `chain_id`: its swap pool's, else its
+    /// bridge gate's. A cluster read (blockhash, balance, signature status)
+    /// needs neither program, and a mesh may list a Solana gate with no pool —
+    /// without the fallback no send out of Solana can be built in the browser.
+    /// `None` for an EVM chain or an unconfigured one.
+    fn solana_rpc<'a>(
+        &'a self,
+        chain_id: u64,
+        gate: Option<&'a crate::solana_pool::SolanaGate>,
+    ) -> Option<&'a str> {
+        match self.pools.get(&chain_id) {
+            Some(Backend::Solana(sol)) => Some(sol.rpc()),
+            Some(Backend::Evm { .. }) => None,
+            None => gate.map(|g| g.rpc()),
         }
+    }
+
+    /// A recent blockhash for the Solana chain, so the browser can build a
+    /// transaction. `None` for an EVM chain (a wallet supplies its own nonce).
+    pub async fn solana_blockhash(
+        &self,
+        chain_id: u64,
+        gate: Option<&crate::solana_pool::SolanaGate>,
+    ) -> Option<String> {
+        let rpc = self.solana_rpc(chain_id, gate)?;
+        // A finalized hash stays valid for ~60s; every browser can share one
+        // for a couple of seconds.
+        self.upstream
+            .cached(format!("blockhash:{chain_id}"), |_| BLOCKHASH_TTL, async {
+                crate::solana_pool::latest_blockhash(rpc).await.ok()
+            })
+            .await
     }
 
     /// SPL balance of a token account on the Solana chain.
-    pub async fn solana_token_balance(&self, chain_id: u64, account: &str) -> Option<String> {
-        match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => {
-                let account = crate::solana_pool::valid_pubkey(account).ok()?;
-                self.upstream
-                    .cached(format!("balance:{chain_id}:{account}"), |_| READ_TTL, async {
-                        sol.token_balance(account).await.ok()
-                    })
-                    .await
-            }
-            Backend::Evm { .. } => None,
-        }
+    pub async fn solana_token_balance(
+        &self,
+        chain_id: u64,
+        account: &str,
+        gate: Option<&crate::solana_pool::SolanaGate>,
+    ) -> Option<String> {
+        let rpc = self.solana_rpc(chain_id, gate)?;
+        let account = crate::solana_pool::valid_pubkey(account).ok()?;
+        self.upstream
+            .cached(format!("balance:{chain_id}:{account}"), |_| READ_TTL, async {
+                crate::solana_pool::token_balance(rpc, account).await.ok()
+            })
+            .await
     }
 
     /// Confirmation state of a Solana signature.
-    pub async fn solana_signature_status(&self, chain_id: u64, signature: &str) -> Option<String> {
-        match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => {
-                let signature = crate::solana_pool::valid_signature(signature).ok()?;
-                // `finalized` and `failed` never change, so they are kept; any
-                // other state is about to, so it is only metered.
-                let ttl = |s: &str| if matches!(s, "finalized" | "failed") { SETTLED_TTL } else { Duration::ZERO };
-                self.upstream
-                    .cached(format!("sigstatus:{chain_id}:{signature}"), ttl, async {
-                        sol.signature_status(signature).await.ok()
-                    })
-                    .await
-            }
-            Backend::Evm { .. } => None,
-        }
+    pub async fn solana_signature_status(
+        &self,
+        chain_id: u64,
+        signature: &str,
+        gate: Option<&crate::solana_pool::SolanaGate>,
+    ) -> Option<String> {
+        let rpc = self.solana_rpc(chain_id, gate)?;
+        let signature = crate::solana_pool::valid_signature(signature).ok()?;
+        // `finalized` and `failed` never change, so they are kept; any other
+        // state is about to, so it is only metered.
+        let ttl = |s: &str| if matches!(s, "finalized" | "failed") { SETTLED_TTL } else { Duration::ZERO };
+        self.upstream
+            .cached(format!("sigstatus:{chain_id}:{signature}"), ttl, async {
+                crate::solana_pool::signature_status(rpc, signature).await.ok()
+            })
+            .await
     }
 
     /// The meter for other proxy-shaped fields (`solanaGateContext`).
@@ -963,7 +982,7 @@ mod tests {
             let mut swaps = Swaps::new();
             swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
             for _ in 0..3 {
-                assert_eq!(swaps.solana_signature_status(9, &sig).await.as_deref(), Some(status));
+                assert_eq!(swaps.solana_signature_status(9, &sig, None).await.as_deref(), Some(status));
             }
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), want_calls, "{status}");
         }
@@ -976,8 +995,32 @@ mod tests {
         let url = mock_solana("finalized", calls.clone()).await;
         let mut swaps = Swaps::new();
         swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
-        assert_eq!(swaps.solana_signature_status(9, "not-a-signature").await, None);
-        assert_eq!(swaps.solana_token_balance(9, "0xnope").await, None);
+        assert_eq!(swaps.solana_signature_status(9, "not-a-signature", None).await, None);
+        assert_eq!(swaps.solana_token_balance(9, "0xnope", None).await, None);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Live on mesh10 (2026-09-29): the registry lists a Solana GATE but no
+    /// Solana swap POOL, and `solanaBlockhash` answered null — so the browser
+    /// could not build any send out of Solana. The cluster reads now fall back
+    /// to the gate's endpoint.
+    #[tokio::test]
+    async fn cluster_reads_use_the_gate_when_there_is_no_pool() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana("finalized", calls.clone()).await;
+        let mut chains = crate::chain::Chains::new();
+        chains.add(9, &url, SOL_PROGRAM).unwrap();
+        let swaps = Swaps::new();
+        let gate = chains.solana_gate(9);
+        assert!(gate.is_some());
+
+        assert_eq!(
+            swaps.solana_blockhash(9, gate).await.as_deref(),
+            Some("EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N")
+        );
+        let sig = bs58::encode([7u8; 64]).into_string();
+        assert_eq!(swaps.solana_signature_status(9, &sig, gate).await.as_deref(), Some("finalized"));
+        // No pool and no gate: still nothing to ask.
+        assert_eq!(swaps.solana_blockhash(10, chains.solana_gate(10)).await, None);
     }
 }

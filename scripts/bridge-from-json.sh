@@ -501,12 +501,13 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
 done
 (( ${#KEEP_FILES[@]} >= 1 )) || warn "no enabled keepers — signatures will collect but nothing will claim on-chain"
 
-SOL_FILES=() SOL_NAMES=()
+SOL_FILES=() SOL_NAMES=() SOL_KEYS=()
 if [[ "$SOLANA_ON" == "true" ]]; then
   for idx in $(j '[.solana.relayers[] | select(.enabled != false)] | to_entries[].key'); do
     rname="$(jq -r "[.solana.relayers[] | select(.enabled != false)] | .[$idx].name" "$CONFIG")"
     rjson=".solana.relayers[] | select(.name == \"$rname\")"
     cfg="$CFG_DIR/solana-relayer-$rname.toml"
+    rkey=""
     {
       echo "[source]"
       echo "chain_id = $SOL_CHAIN_ID"
@@ -588,6 +589,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         # The claim-submitting half (EVM -> Solana). Absent => this process only
         # SIGNS, which is a valid split: a validator need not be a keeper.
         kp="$(jq -r "($rjson).payer_keypair" "$CONFIG")"
+        rkey="$(basename "$kp")"
         if [[ -n "$KEYS_DIR" ]]; then kp="$KEYS_DIR/$(basename "$kp")"
         elif [[ "$kp" != /* ]]; then kp="$ROOT/$kp"; fi
         echo
@@ -596,7 +598,7 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         echo "poll_interval_ms = $(jq -r "($rjson).poll_interval_ms // 2000" "$CONFIG")"
       fi
     } > "$cfg"
-    SOL_FILES+=("$cfg"); SOL_NAMES+=("$rname")
+    SOL_FILES+=("$cfg"); SOL_NAMES+=("$rname"); SOL_KEYS+=("$rkey")
     info "solana relayer $rname -> $cfg"
   done
 fi
@@ -873,7 +875,11 @@ if [[ "$MODE" == "compose" ]]; then
     if [[ -n "$SPK_CFG" ]]; then
       printf '  solana-price-keeper:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$CTX"
       printf '    command: ["solana-price-keeper", "/configs/solana-price-keeper.toml"]\n'
-      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys:/keys:ro\n\n'
+      # Only its own keyfile, never the whole keys/ directory (audit T-5): the
+      # directory also holds the relayer payer, and on a stack where the oracle
+      # is still the gate owner, one mount of it hands every service governance.
+      k="$(basename "$SPK_KEYPAIR")"
+      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys/%s:/keys/%s:ro\n\n' "$k" "$k"
     fi
 
     # --- solana relayers ---
@@ -892,7 +898,11 @@ if [[ "$MODE" == "compose" ]]; then
       for cid in "${CHAIN_IDS[@]}"; do
         printf '      RPC_%s: "${RPC_%s:?set RPC_%s in .env}"\n' "$cid" "$cid" "$cid"
       done
-      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys:/keys:ro\n      - solana-%s-state:/data\n' "$n"
+      # Only this relayer's own payer (a signing-only relayer mounts no key):
+      # the keys/ directory also holds the price keeper's oracle key.
+      printf '    volumes:\n      - ./configs:/configs:ro\n'
+      [[ -n "${SOL_KEYS[$i]}" ]] && printf '      - ./keys/%s:/keys/%s:ro\n' "${SOL_KEYS[$i]}" "${SOL_KEYS[$i]}"
+      printf '      - solana-%s-state:/data\n' "$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
     done
 

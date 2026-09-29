@@ -76,6 +76,9 @@ test("the chain registry renders every chain the backend serves", async ({ page 
   // Chain names come from the backend registry, not from any local constant —
   // so the assertion is derived from that registry too.
   await page.locator(".filters__field").first().locator(".dd__trigger").click();
+  // The registry loads asynchronously; reading the options straight away can
+  // catch the dropdown holding only "Any chain" (seen live on mesh10).
+  await expect(page.getByRole("option")).toHaveCount(chains.length + 1);
   const options = (await page.getByRole("option").allTextContents()).join(" ");
   for (const c of chains) {
     expect(options, `chain ${c.chainId} (${c.name}) missing from the filter`).toContain(c.name);

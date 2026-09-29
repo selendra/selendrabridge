@@ -273,85 +273,9 @@ impl SolanaPool {
         raw.get(44).copied().ok_or_else(|| anyhow::anyhow!("mint account is too short"))
     }
 
-    /// A recent blockhash, for a transaction the BROWSER builds and a wallet
-    /// signs.
-    ///
-    /// The UI cannot fetch this itself: the configured endpoint is a credential
-    /// (a hosted RPC URL carries its API key), and hardcoding a public cluster
-    /// URL into the app is a different deployment's problem. So the API — which
-    /// already holds the credential — passes through this one opaque value.
-    /// Everything else in the transaction is derived in the browser, because a
-    /// destination account taken on trust from a server is a destination that
-    /// can be swapped for someone else's.
-    pub async fn latest_blockhash(&self) -> anyhow::Result<String> {
-        // FINALIZED, not confirmed. The wallet broadcasts through its OWN node,
-        // which may not have seen a blockhash this one only just confirmed —
-        // the transaction then fails with "Blockhash not found", and the user
-        // sees a rejection they cannot act on. A finalized hash is ~32 slots
-        // old, known everywhere, and still far inside the ~150-slot validity
-        // window, so it costs nothing to be safe here.
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
-            "params": [{"commitment": "finalized"}],
-        });
-        let resp: serde_json::Value =
-            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("getLatestBlockhash failed: {err}");
-        }
-        resp["result"]["value"]["blockhash"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("no blockhash in response"))
-    }
-
-    /// Confirmation state of a signature: `confirmed`, `finalized`, `failed`,
-    /// or `pending` while the cluster has not seen it yet.
-    pub async fn signature_status(&self, signature: &str) -> anyhow::Result<String> {
-        // Caller-supplied: validate the SHAPE before it is spliced into a
-        // request to the operator's (keyed) RPC. Anything else is refused here,
-        // not forwarded for the upstream to reject — a proxy that relays
-        // arbitrary strings is an oracle for probing the endpoint behind it.
-        let signature = valid_signature(signature)?;
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
-            "params": [[signature], {"searchTransactionHistory": true}],
-        });
-        let resp: serde_json::Value =
-            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
-        if let Some(err) = resp.get("error") {
-            anyhow::bail!("getSignatureStatuses failed: {err}");
-        }
-        let v = &resp["result"]["value"][0];
-        if v.is_null() {
-            return Ok("pending".into());
-        }
-        if !v["err"].is_null() {
-            return Ok("failed".into());
-        }
-        Ok(v["confirmationStatus"].as_str().unwrap_or("processed").to_string())
-    }
-
-    /// The SPL balance of a token account, as a decimal string.
-    ///
-    /// The UI derives the account address itself and passes it in; this only
-    /// reads it, so a wrong answer here can mislead a balance display but can
-    /// never redirect funds.
-    pub async fn token_balance(&self, account: &str) -> anyhow::Result<String> {
-        // Caller-supplied — see `signature_status`.
-        let account = valid_pubkey(account)?;
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountBalance",
-            "params": [account, {"commitment": "confirmed"}],
-        });
-        let resp: serde_json::Value =
-            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
-        // A missing account is "no balance", not an error: a user who has never
-        // held this mint simply has no associated account yet.
-        if resp.get("error").is_some() {
-            return Ok("0".into());
-        }
-        Ok(resp["result"]["value"]["amount"].as_str().unwrap_or("0").to_string())
+    /// The cluster endpoint this pool reads through.
+    pub fn rpc(&self) -> &str {
+        &self.rpc
     }
 
     /// `symbol` for a mint, falling back to a truncated address.
@@ -361,6 +285,95 @@ impl SolanaPool {
             format!("{short}…")
         })
     }
+}
+
+// --- cluster-level reads -----------------------------------------------------
+//
+// Nothing below depends on a program: a blockhash, a signature's status and a
+// token balance are properties of the cluster. They used to exist only as
+// `SolanaPool` methods, so a mesh with a Solana GATE but no Solana swap POOL
+// in the registry (mesh10) answered `solanaBlockhash` with null — and no send
+// out of Solana could be built in the browser at all.
+
+/// A recent blockhash, for a transaction the BROWSER builds and a wallet
+/// signs.
+///
+/// The UI cannot fetch this itself: the configured endpoint is a credential
+/// (a hosted RPC URL carries its API key), and hardcoding a public cluster
+/// URL into the app is a different deployment's problem. So the API — which
+/// already holds the credential — passes through this one opaque value.
+/// Everything else in the transaction is derived in the browser, because a
+/// destination account taken on trust from a server is a destination that
+/// can be swapped for someone else's.
+pub async fn latest_blockhash(rpc: &str) -> anyhow::Result<String> {
+    // FINALIZED, not confirmed. The wallet broadcasts through its OWN node,
+    // which may not have seen a blockhash this one only just confirmed —
+    // the transaction then fails with "Blockhash not found", and the user
+    // sees a rejection they cannot act on. A finalized hash is ~32 slots
+    // old, known everywhere, and still far inside the ~150-slot validity
+    // window, so it costs nothing to be safe here.
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+        "params": [{"commitment": "finalized"}],
+    });
+    let resp: serde_json::Value =
+        http_client().post(rpc).json(&body).send().await?.json().await?;
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("getLatestBlockhash failed: {err}");
+    }
+    resp["result"]["value"]["blockhash"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("no blockhash in response"))
+}
+
+/// Confirmation state of a signature: `confirmed`, `finalized`, `failed`,
+/// or `pending` while the cluster has not seen it yet.
+pub async fn signature_status(rpc: &str, signature: &str) -> anyhow::Result<String> {
+    // Caller-supplied: validate the SHAPE before it is spliced into a
+    // request to the operator's (keyed) RPC. Anything else is refused here,
+    // not forwarded for the upstream to reject — a proxy that relays
+    // arbitrary strings is an oracle for probing the endpoint behind it.
+    let signature = valid_signature(signature)?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+        "params": [[signature], {"searchTransactionHistory": true}],
+    });
+    let resp: serde_json::Value =
+        http_client().post(rpc).json(&body).send().await?.json().await?;
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("getSignatureStatuses failed: {err}");
+    }
+    let v = &resp["result"]["value"][0];
+    if v.is_null() {
+        return Ok("pending".into());
+    }
+    if !v["err"].is_null() {
+        return Ok("failed".into());
+    }
+    Ok(v["confirmationStatus"].as_str().unwrap_or("processed").to_string())
+}
+
+/// The SPL balance of a token account, as a decimal string.
+///
+/// The UI derives the account address itself and passes it in; this only
+/// reads it, so a wrong answer here can mislead a balance display but can
+/// never redirect funds.
+pub async fn token_balance(rpc: &str, account: &str) -> anyhow::Result<String> {
+    // Caller-supplied — see `signature_status`.
+    let account = valid_pubkey(account)?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountBalance",
+        "params": [account, {"commitment": "confirmed"}],
+    });
+    let resp: serde_json::Value =
+        http_client().post(rpc).json(&body).send().await?.json().await?;
+    // A missing account is "no balance", not an error: a user who has never
+    // held this mint simply has no associated account yet.
+    if resp.get("error").is_some() {
+        return Ok("0".into());
+    }
+    Ok(resp["result"]["value"]["amount"].as_str().unwrap_or("0").to_string())
 }
 
 /// What a browser needs to build a gate `send` on Solana.
@@ -393,6 +406,10 @@ pub struct SolanaGate {
 }
 
 impl SolanaGate {
+    /// The cluster endpoint this gate reads through.
+    pub fn rpc(&self) -> &str {
+        &self.rpc
+    }
     pub fn new(rpc: impl Into<String>, program: impl Into<String>) -> Self {
         Self { rpc: rpc.into(), program: program.into() }
     }
