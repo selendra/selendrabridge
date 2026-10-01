@@ -167,6 +167,13 @@ export function SwapView({ chains, wallet, solana }: Props) {
       const hash = await sendApprove(wallet.request, wallet.address, tin.token, pool.address, amountBase, chainId);
       setTx({ kind: "pending", label: "Confirming approval…", hash });
       await waitReceipt(wallet.request, hash);
+      // Same lagging-node hazard as BridgeView.doApprove: wait, bounded, until a
+      // read actually shows the new allowance before the refresh.
+      for (let i = 0; i < 15; i++) {
+        const a = await readAllowance(wallet.request, tin.token, wallet.address, pool.address).catch(() => 0n);
+        if (a >= amountBase) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
       await refreshOnchain();
       setTx({ kind: "idle" });
     } catch (e) {

@@ -219,7 +219,22 @@ $DRY_RUN && { echo; info "--dry-run: nothing was sent"; exit 0; }
 # --- helpers ---------------------------------------------------------------
 deployed_to() { grep deployedTo | grep -oE '0x[0-9a-fA-F]{40}' | head -1; }
 fc()    { ( cd "$CONTRACTS" && forge create "$1" --rpc-url "$2" "${AUTH[@]}" --broadcast --json "${@:3}" ) | deployed_to; }
-csend() { cast send "$1" "$2" "${@:3}" "${AUTH[@]}" >/dev/null; }
+# A load-balanced public endpoint can answer the NEXT send's nonce lookup from a
+# backend that has not seen the previous (already mined) transaction, and the
+# node then rejects it: "nonce too low" or "replacement transaction underpriced".
+# Both mean the transaction was NOT accepted, so resending is safe; anything
+# else (notably "already known", which means it WAS) fails as before. Killed
+# the mesh11 deploy twice on Base Sepolia (2026-10-01).
+csend() {
+  local out attempt
+  for attempt in 1 2 3 4 5; do
+    if out="$(cast send "$1" "$2" "${@:3}" "${AUTH[@]}" 2>&1 >/dev/null)"; then return 0; fi
+    grep -qiE 'nonce too low|replacement transaction underpriced' <<<"$out" || { printf '%s\n' "$out" >&2; return 1; }
+    warn "stale nonce from the endpoint (attempt $attempt) — retrying"
+    sleep $((attempt * 3))
+  done
+  printf '%s\n' "$out" >&2; return 1
+}
 debridge_id() { printf '0x%064x%s\n' "$1" "${2#0x}" | xargs cast keccak; }   # keccak(packed(uint256,address))
 scaled()      { local whole="$1" dec="$2"; [[ "$whole" =~ ^[0-9]+$ ]] || die "amount must be a whole number: $whole"
                 printf '%s%s\n' "$whole" "$(printf '0%.0s' $(seq 1 "$dec"))"; }

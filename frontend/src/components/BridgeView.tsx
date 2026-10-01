@@ -543,6 +543,16 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
       const hash = await sendApprove(wallet.request, wallet.address, token, spender, amountBase, fromChainId);
       setTx({ kind: "pending", label: "Confirming approval…", hash });
       await waitReceipt(wallet.request, hash);
+      // A load-balanced RPC can answer the next read from a node that has not
+      // seen the approval's block yet. One read then reports the OLD allowance
+      // and the button sits on "Approve" for a transfer that is already approved
+      // (seen live on Base Sepolia, 2026-10-01). Wait, bounded, until the
+      // allowance is visible before the refresh that drives the button.
+      for (let i = 0; i < 15; i++) {
+        const a = await readAllowance(wallet.request, token, wallet.address, spender).catch(() => 0n);
+        if (a >= amountBase) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
       await refreshOnchain();
       setTx({ kind: "idle" });
     } catch (e) {
