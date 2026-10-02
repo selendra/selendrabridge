@@ -235,6 +235,10 @@ services:
       # through the sig-store's Read-scoped routes instead.
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN, e.g. $(openssl rand -hex 32)}"
       RUST_LOG: "graphql_api=info"
+      # M7-5: believe X-Forwarded-For from the frontend nginx on the compose
+      # network, or every UI user shares ONE rate-limit bucket. The port below
+      # is loopback-only, so no outside client can claim to be a proxy.
+      GRAPHQL_TRUSTED_PROXIES: "${GRAPHQL_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
     volumes:
       - ./docker/configs/chains.json:/configs/chains.json:ro
     ports: ["127.0.0.1:8088:8088"]

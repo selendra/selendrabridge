@@ -86,8 +86,21 @@ struct Args {
     auth_token: Option<String>,
     /// Validators: read + deposit signatures/attestations. Cannot mark claimed or
     /// edit the allowlist.
+    ///
+    /// LEGACY SHARED form: every holder shares ONE rate-limit bucket, so one of
+    /// them flooding the store 429s every validator (audit round 7, M7-11).
+    /// Prefer `SIG_STORE_VALIDATOR_TOKENS`.
     #[arg(long, env = "SIG_STORE_VALIDATOR_TOKEN")]
     validator_token: Option<String>,
+    /// One Sign token PER validator (and per Solana relayer), each with the same
+    /// scopes as `SIG_STORE_VALIDATOR_TOKEN` but its own rate-limit bucket and
+    /// its own identity (audit round 7, M7-11). Comma-, space- or
+    /// newline-separated entries, each `label:token` or a bare `token`; the
+    /// label names the holder (a service name today; a validator address is
+    /// what H7-3's validator-set check will map it to). Labels are logged,
+    /// tokens never. A token containing `:` must be labelled.
+    #[arg(long, env = "SIG_STORE_VALIDATOR_TOKENS")]
+    validator_tokens: Option<String>,
     /// Keeper: read + record a claim tx. Cannot deposit signatures.
     #[arg(long, env = "SIG_STORE_KEEPER_TOKEN")]
     keeper_token: Option<String>,
@@ -132,8 +145,25 @@ struct Args {
 impl Args {
     /// Assemble the scoped token set. Absent/empty tokens are dropped by
     /// [`Auth::new`], so an unset variable can never authenticate a request.
-    fn auth(&self) -> Auth {
+    fn auth(&self) -> anyhow::Result<Auth> {
         let mut entries: Vec<(String, std::collections::HashSet<Scope>)> = Vec::new();
+        let per_validator = parse_validator_tokens(self.validator_tokens.as_deref().unwrap_or(""))?;
+        for (_, t) in &per_validator {
+            entries.push((t.clone(), [Scope::Read, Scope::Sign].into_iter().collect()));
+        }
+        if !per_validator.is_empty() {
+            info!(
+                validators = ?per_validator.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+                "per-validator Sign tokens: one rate-limit bucket and one identity each (M7-11)"
+            );
+        }
+        if self.validator_token.as_deref().is_some_and(|t| !t.is_empty()) {
+            warn!(
+                "SIG_STORE_VALIDATOR_TOKEN is ONE token shared by every holder, and so one rate-limit \
+                 bucket: any of them flooding the store refuses every validator's writes (audit round \
+                 7, M7-11). Issue one token per validator in SIG_STORE_VALIDATOR_TOKENS instead."
+            );
+        }
         if let Some(t) = self.auth_token.clone().filter(|t| !t.is_empty()) {
             warn!(
                 "SIG_STORE_TOKEN grants ALL scopes to every holder (read+sign+relay+indexer+admin). \
@@ -157,8 +187,43 @@ impl Args {
         if let Some(t) = self.indexer_token.clone() {
             entries.push((t, [Scope::Read, Scope::Indexer].into_iter().collect()));
         }
-        Auth::new(entries)
+        Ok(Auth::new(entries).with_identities(per_validator.into_iter().map(|(l, t)| (t, l))))
     }
+}
+
+/// Parse `SIG_STORE_VALIDATOR_TOKENS` into (label, token) pairs (M7-11).
+///
+/// Entries are separated by commas or whitespace (so a compose string or a
+/// file of one per line both work); each is `label:token`, or a bare token,
+/// which is labelled `validator#<n>`. Empty entries are skipped. A repeated
+/// token or label is a startup ERROR rather than a merge: two holders behind
+/// one token would be one bucket and one identity again, which is the finding.
+fn parse_validator_tokens(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (i, entry) in raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .enumerate()
+    {
+        let (label, token) = match entry.split_once(':') {
+            Some((l, t)) => (l.trim().to_string(), t.trim().to_string()),
+            None => (format!("validator#{i}"), entry.to_string()),
+        };
+        anyhow::ensure!(!label.is_empty(), "SIG_STORE_VALIDATOR_TOKENS entry {i} has an empty label");
+        anyhow::ensure!(!token.is_empty(), "SIG_STORE_VALIDATOR_TOKENS entry {label:?} has an empty token");
+        anyhow::ensure!(
+            !out.iter().any(|(_, t)| *t == token),
+            "SIG_STORE_VALIDATOR_TOKENS: entry {label:?} repeats another entry's token — each validator \
+             needs its OWN token (audit round 7, M7-11)"
+        );
+        anyhow::ensure!(
+            !out.iter().any(|(l, _)| *l == label),
+            "SIG_STORE_VALIDATOR_TOKENS: label {label:?} appears twice"
+        );
+        out.push((label, token));
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -173,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
     log_scrub::init("sig_store=info,bridge_db=info");
 
     let args = Args::parse();
-    let auth = args.auth();
+    let auth = args.auth()?;
     let db = Db::connect(&args.database_url).await?;
     info!("connected to Postgres and applied schema");
 
@@ -333,7 +398,7 @@ fn require_credentials(auth: &Auth, allow_unauthenticated: bool) -> anyhow::Resu
     anyhow::bail!(
         "refusing to start: no bearer token is configured, which would leave signatures, \
          claim status and the allowlist world-writable. Set at least one of \
-         SIG_STORE_VALIDATOR_TOKEN / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN / \
+         SIG_STORE_VALIDATOR_TOKENS / _KEEPER_TOKEN / _READER_TOKEN / _ADMIN_TOKEN / \
          _INDEXER_TOKEN (or the legacy SIG_STORE_TOKEN), or pass --allow-unauthenticated \
          to accept an open store on a trusted local network."
     )
@@ -720,7 +785,10 @@ mod tests {
     }
 
     fn app_limited(writes: RateLimit) -> Router {
-        let auth = test_auth();
+        app_with(test_auth(), writes)
+    }
+
+    fn app_with(auth: Auth, writes: RateLimit) -> Router {
         let read = Router::new()
             .route("/submissions", get(|| async { "list" }))
             .route("/allowed/tokens", get(|| async { "tokens" }))
@@ -932,6 +1000,86 @@ mod tests {
         assert_eq!(status_on(app.clone(), "POST", uri, Some(OBS)).await, StatusCode::TOO_MANY_REQUESTS);
     }
 
+    // --- M7-11: one Sign token per validator ----------------------------------
+
+    fn args_with_validator_tokens(list: &str) -> Args {
+        Args {
+            bind: String::new(),
+            database_url: String::new(),
+            auth_token: None,
+            validator_token: None,
+            validator_tokens: Some(list.into()),
+            keeper_token: Some(KEEP.into()),
+            reader_token: None,
+            admin_token: None,
+            indexer_token: None,
+            rate_per_second: 1.0,
+            rate_burst: 1,
+            max_body_bytes: 1,
+            allow_unauthenticated: false,
+            parked_marker_ttl_secs: 0,
+        }
+    }
+
+    /// THE finding. Every validator held the same Sign token, so they shared ONE
+    /// rate-limit bucket: one holder sending 50+ req/s 429'd every validator's
+    /// upserts. Each per-validator token is now its own bucket.
+    #[tokio::test]
+    async fn per_validator_tokens_have_independent_rate_limit_buckets() {
+        let auth = args_with_validator_tokens("val-1:tok-one,val-2:tok-two").auth().unwrap();
+        let app = app_with(auth, RateLimit::new(2, 0.001));
+        for _ in 0..2 {
+            assert_eq!(status_on(app.clone(), "POST", "/submissions", Some("tok-one")).await, StatusCode::OK);
+        }
+        assert_eq!(
+            status_on(app.clone(), "POST", "/submissions", Some("tok-one")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "premise: val-1 has exhausted its own budget"
+        );
+        assert_eq!(
+            status_on(app.clone(), "POST", "/submissions", Some("tok-two")).await,
+            StatusCode::OK,
+            "val-2 must be unaffected by val-1's flood"
+        );
+    }
+
+    /// Each token carries exactly the validator scopes, and names its holder —
+    /// the hook H7-3's validator-set check will use.
+    #[test]
+    fn per_validator_tokens_carry_sign_only_and_an_identity() {
+        let auth = args_with_validator_tokens("val-1:tok-one\nval-2:tok-two").auth().unwrap();
+        for t in ["tok-one", "tok-two"] {
+            assert!(auth.grants(t, Scope::Sign) && auth.grants(t, Scope::Read));
+            for s in [Scope::Relay, Scope::Admin, Scope::Indexer] {
+                assert!(!auth.grants(t, s), "{t} must not carry {}", s.as_str());
+            }
+        }
+        assert_eq!(auth.identity("tok-one").as_deref(), Some("val-1"));
+        assert_eq!(auth.identity("tok-two").as_deref(), Some("val-2"));
+        assert_eq!(auth.identity(KEEP), None);
+        assert_eq!(auth.identity("nope"), None);
+        assert!(!auth.grants("nope", Scope::Sign));
+    }
+
+    #[test]
+    fn the_validator_token_list_parses_and_refuses_shared_tokens() {
+        assert_eq!(
+            parse_validator_tokens(" a:x , b:y\nzzz ,, ").unwrap(),
+            vec![("a".into(), "x".into()), ("b".into(), "y".into()), ("validator#2".into(), "zzz".into())]
+        );
+        assert!(parse_validator_tokens("").unwrap().is_empty());
+        let e = parse_validator_tokens("a:x,b:x").unwrap_err().to_string();
+        assert!(e.contains("OWN token"), "two validators behind one token is the finding: {e}");
+        assert!(parse_validator_tokens("a:x,a:y").is_err(), "duplicate label");
+        assert!(parse_validator_tokens("a:").is_err(), "empty token");
+        assert!(parse_validator_tokens(":x").is_err(), "empty label");
+        // The legacy single token still works alongside (compatibility).
+        let mut args = args_with_validator_tokens("val-1:tok-one");
+        args.validator_token = Some(VAL.into());
+        let auth = args.auth().unwrap();
+        assert!(auth.grants(VAL, Scope::Sign) && auth.grants("tok-one", Scope::Sign));
+    }
+
     /// With no indexer token configured the scope exists but nothing holds it —
     /// the routes stay closed rather than falling open to some other credential.
     #[test]
@@ -941,6 +1089,7 @@ mod tests {
             database_url: String::new(),
             auth_token: None,
             validator_token: Some(VAL.into()),
+            validator_tokens: None,
             keeper_token: Some(KEEP.into()),
             reader_token: Some(READ.into()),
             admin_token: Some(ADMIN.into()),
@@ -951,13 +1100,13 @@ mod tests {
             allow_unauthenticated: false,
             parked_marker_ttl_secs: 0,
         };
-        let auth = args.auth();
+        let auth = args.auth().unwrap();
         assert!(auth.is_enforced());
         for t in [VAL, KEEP, READ, ADMIN, "", "nope"] {
             assert!(!auth.grants(t, Scope::Indexer), "{t:?} must not gain Indexer by default");
         }
         // And once set, it grants Indexer + Read and nothing more.
-        let auth = Args { indexer_token: Some(OBS.into()), ..args }.auth();
+        let auth = Args { indexer_token: Some(OBS.into()), ..args }.auth().unwrap();
         assert!(auth.grants(OBS, Scope::Indexer) && auth.grants(OBS, Scope::Read));
         for s in [Scope::Sign, Scope::Relay, Scope::Admin] {
             assert!(!auth.grants(OBS, s), "the indexer token must not carry {}", s.as_str());

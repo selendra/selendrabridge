@@ -284,6 +284,14 @@ pub enum AllowlistRefusal {
          there, so the served list has been truncated or replaced. Refusing to act on it."
     )]
     MissingPin(String),
+    #[error(
+        "the store served an allowlist whose {0} list is EMPTY while `[allowlist] require = true`. \
+         An empty dimension means \"allow every {0}\", so a store serving only the other list \
+         switches this check off just as an entirely empty list would (audit round 7, M7-10). \
+         Refusing until both lists have entries (or set `require = false`, with no pins, to opt \
+         out deliberately)."
+    )]
+    EmptyDimension(&'static str),
 }
 
 /// The locally-configured expectations an allowlist must meet before this node
@@ -336,6 +344,22 @@ impl AllowlistPolicy {
                 Ok(None)
             }
             AllowlistView::Enforcing(list) => {
+                // M7-10 (audit round 7): `Enforcing` only says the store served
+                // at least ONE entry somewhere. Each dimension is opt-in on its
+                // own (`token_allowed` / `chain_allowed` pass everything on an
+                // empty list), so under `required()` each must be non-empty
+                // separately — otherwise pinned chains + `tokens = []` switches
+                // the token check off (the last line of defence M7-1 relies on),
+                // and vice versa. A locally pinned dimension is never overridden
+                // by an empty served one: it fails here, or on `MissingPin` below.
+                if self.required() {
+                    if list.debridge_ids.is_empty() {
+                        return Err(AllowlistRefusal::EmptyDimension("token"));
+                    }
+                    if list.chains.is_empty() {
+                        return Err(AllowlistRefusal::EmptyDimension("chain pair"));
+                    }
+                }
                 for t in &self.pinned_tokens {
                     if !list.has_token(t) {
                         return Err(AllowlistRefusal::MissingPin(t.to_ascii_lowercase()));
@@ -421,6 +445,43 @@ mod tests {
         assert!(matches!(chains.check(AllowlistView::Enforcing(listed())), Err(AllowlistRefusal::MissingPin(_))));
         let live = AllowlistPolicy { pinned_chains: vec![(1, 2)], ..Default::default() };
         assert!(matches!(live.check(AllowlistView::Enforcing(listed())), Ok(Some(_))));
+    }
+
+    /// Audit round 7, M7-10. `require = true` used to be satisfied by ONE
+    /// non-empty dimension: a store serving the pinned chains with `tokens = []`
+    /// switched the token check off (and vice versa). Each dimension must now be
+    /// non-empty on its own, and a local pin is never overridden by an empty
+    /// served dimension.
+    #[test]
+    fn a_half_empty_served_allowlist_is_refused_when_required() {
+        let chains_only = Allowlist::from_parts(&[], &[AllowedChain { chain_id_from: 1, chain_id_to: 2 }]);
+        let tokens_only = Allowlist::from_parts(
+            &[AllowedToken { chain_id: 1, token: "0x11".into(), debridge_id: TOKEN.into(), symbol: None }],
+            &[],
+        );
+        let required = AllowlistPolicy { require: true, ..Default::default() };
+        assert_eq!(
+            required.check(AllowlistView::Enforcing(chains_only.clone())).unwrap_err(),
+            AllowlistRefusal::EmptyDimension("token")
+        );
+        assert_eq!(
+            required.check(AllowlistView::Enforcing(tokens_only.clone())).unwrap_err(),
+            AllowlistRefusal::EmptyDimension("chain pair")
+        );
+        // Pinned chains, served chains intact but tokens emptied: refused.
+        let pin_chain = AllowlistPolicy { pinned_chains: vec![(1, 2)], ..Default::default() };
+        assert!(pin_chain.check(AllowlistView::Enforcing(chains_only.clone())).is_err());
+        // Pinned token, served token list empty: refused.
+        let pin_token = AllowlistPolicy { pinned_tokens: vec![TOKEN.into()], ..Default::default() };
+        assert!(pin_token.check(AllowlistView::Enforcing(chains_only.clone())).is_err());
+        // Pinned token present, but chain list served empty: refused too.
+        assert!(pin_token.check(AllowlistView::Enforcing(tokens_only.clone())).is_err());
+        // Both dimensions populated: fine.
+        assert!(matches!(required.check(AllowlistView::Enforcing(listed())), Ok(Some(_))));
+        // The legacy default keeps per-dimension opt-in semantics.
+        let legacy = AllowlistPolicy::default();
+        assert!(matches!(legacy.check(AllowlistView::Enforcing(chains_only)), Ok(Some(_))));
+        assert!(matches!(legacy.check(AllowlistView::Enforcing(tokens_only)), Ok(Some(_))));
     }
 
     /// The view the backend builds must distinguish the two cases the fix rests

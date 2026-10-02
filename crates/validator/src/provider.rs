@@ -50,6 +50,9 @@ struct Endpoint {
 pub struct Failover {
     endpoints: Vec<Endpoint>,
     active: usize,
+    /// Every endpoint's head at the last [`Failover::scan_head`], for the idle
+    /// warning (M7-8): (redacted url, head or the error).
+    last_heads: Vec<(String, Result<u64, String>)>,
 }
 
 /// The verdict of the H-4 second-source check on one scan window.
@@ -182,6 +185,29 @@ pub fn majority<T: PartialEq + Clone + std::fmt::Debug>(
         disagreement: true,
     })
 }
+
+/// The largest value that a STRICT MAJORITY of `values` are at or above — the
+/// `(n/2 + 1)`-th largest. `None` only for an empty slice.
+///
+/// Used where a value is safe in one direction only (L7-12, M7-8): a minority
+/// can neither raise the result above what a majority reported nor drag it
+/// down. For one value it is that value; for two, the smaller (both must
+/// vouch); for three, the median.
+pub fn majority_floor<T: Ord + Copy>(values: &[T]) -> Option<T> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    Some(v[values.len() / 2])
+}
+
+/// How far (in blocks) the serving endpoint's head may trail the majority head
+/// before [`Failover::scan_head`] stops asking it first (audit round 7, M7-8).
+/// Generous on purpose: heads are read one after another, so honest endpoints
+/// differ by a few blocks on a fast chain, and flapping between them would only
+/// make the logs noisier. A stuck endpoint trails by far more.
+pub const HEAD_LAG_ROTATE: u64 = 64;
 
 /// Ask every endpoint the same question, sequentially. Returns the answers (by
 /// redacted url) and the failures, for [`majority`] and the caller's log line.
@@ -335,7 +361,84 @@ impl Failover {
             !endpoints.is_empty(),
             "no healthy RPC endpoints for chain {expected_chain_id}"
         );
-        Ok(Self { endpoints, active: 0 })
+        Ok(Self { endpoints, active: 0, last_heads: Vec::new() })
+    }
+
+    /// Every endpoint's head at the last [`Failover::scan_head`], one line, for
+    /// a log message. Urls are redacted.
+    pub fn heads_summary(&self) -> String {
+        if self.last_heads.is_empty() {
+            return "no head read yet".into();
+        }
+        self.last_heads
+            .iter()
+            .map(|(u, h)| match h {
+                Ok(h) => format!("{u}={h}"),
+                Err(e) => format!("{u}=ERR({e})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The chain head the scan loop should work towards (audit round 7, M7-8).
+    ///
+    /// It used to be the ACTIVE endpoint's head alone. Failover rotates on
+    /// ERROR, and a stuck or lagging endpoint answers happily with an old
+    /// number — so the loop saw `confirmed < from_block`, slept, and asked the
+    /// same endpoint again, for ever, without a word. With three endpoints each
+    /// stuck one silently stopped about a third of the fleet.
+    ///
+    /// Now every endpoint is asked, and the head is the one a STRICT MAJORITY of
+    /// those that answered has reached ([`majority_floor`]): a stuck endpoint
+    /// cannot drag it down and an inflated one cannot push it up. When the
+    /// active endpoint trails that head by more than [`HEAD_LAG_ROTATE`] (or
+    /// cannot answer), the first endpoint in stagger order that HAS reached it
+    /// becomes the serving one.
+    ///
+    /// This changes WHO IS ASKED FIRST, never what may be signed: serving confers
+    /// no trust ([`Failover::get_logs_corroborated`] still bounds every window by
+    /// a checking peer's head and needs a majority to agree on its logs), and the
+    /// head only decides how far the next window may reach. With two endpoints
+    /// the head is the lower of the two, as before — one stuck endpoint of two
+    /// leaves nothing to corroborate against, which the scan loop's idle warning
+    /// now reports instead of staying silent.
+    pub async fn scan_head(&mut self) -> anyhow::Result<u64> {
+        let n = self.endpoints.len();
+        let mut heads: Vec<(usize, u64)> = Vec::new();
+        let mut report = Vec::with_capacity(n);
+        for (idx, ep) in self.endpoints.iter().enumerate() {
+            match ep.provider.get_block_number().await {
+                Ok(h) => {
+                    heads.push((idx, h));
+                    report.push((ep.url.clone(), Ok(h)));
+                }
+                Err(e) => report.push((ep.url.clone(), Err(e.to_string()))),
+            }
+        }
+        self.last_heads = report;
+        let values: Vec<u64> = heads.iter().map(|&(_, h)| h).collect();
+        let Some(head) = majority_floor(&values) else {
+            anyhow::bail!("all {n} RPC endpoints failed to report a head: {}", self.heads_summary());
+        };
+        let active_head = heads.iter().find(|&&(i, _)| i == self.active).map(|&(_, h)| h);
+        if active_head.is_none_or(|h| h.saturating_add(HEAD_LAG_ROTATE) < head) {
+            let to = (1..n)
+                .map(|k| (self.active + k) % n)
+                .find(|i| heads.iter().any(|&(j, h)| j == *i && h >= head));
+            if let Some(to) = to {
+                warn!(
+                    from = %self.endpoints[self.active].url,
+                    to = %self.endpoints[to].url,
+                    active_head = ?active_head,
+                    majority_head = head,
+                    heads = %self.heads_summary(),
+                    "serving RPC endpoint TRAILS the head a majority of endpoints report \
+                     (stuck or lagging) — asking another first (audit round 7, M7-8)"
+                );
+                self.active = to;
+            }
+        }
+        Ok(head)
     }
 
     /// The active endpoint, REDACTED (scheme + host). Safe to log.
@@ -546,7 +649,39 @@ impl Failover {
                 anyhow::bail!("get_logs from serving endpoint {url} failed: {e}");
             }
         };
-        let served_keys = log_set(&served);
+        // M7-9 (audit round 7): a node never returns two logs at one (block,
+        // logIndex). A served list that does is malformed on its face — no peer
+        // need be asked — and processing it would replay the second copy into
+        // the nonce check, which reads it as DUPLICATED_NONCE and pauses the
+        // scanner persistently. Withhold the window and stop asking this
+        // endpoint first: unlike a 1-vs-1 split, this is evidence about the
+        // serving endpoint itself, and serving confers no trust on whoever is
+        // asked next (they still need a majority to agree with them).
+        let dups = duplicate_positions(&served);
+        if dups > 0 {
+            let served_by = self.endpoints[s].url.clone();
+            self.active = (s + 1) % n;
+            warn!(
+                from = %served_by,
+                to = %self.endpoints[self.active].url,
+                duplicates = dups,
+                "serving RPC returned the SAME log position more than once — withholding the \
+                 window and asking another endpoint first (audit round 7, M7-9)"
+            );
+            return Ok(Some((
+                served,
+                scanned_to,
+                Corroboration::Disagreed {
+                    checked_by: served_by.clone(),
+                    served_by,
+                    detail: format!(
+                        "blocks {from_block}..={scanned_to}: the serving endpoint returned {dups} \
+                         log(s) at a (block, logIndex) it had already returned"
+                    ),
+                },
+            )));
+        }
+        let served_keys = log_bag(&served);
 
         let mut answers: Vec<(usize, Vec<Log>)> = Vec::new();
         for &(idx, head) in &peers {
@@ -559,7 +694,7 @@ impl Failover {
             }
             match self.logs_from(idx, filter, from_block, scanned_to).await {
                 Ok(logs) => {
-                    let agrees = log_set(&logs) == served_keys;
+                    let agrees = log_bag(&logs) == served_keys;
                     answers.push((idx, logs));
                     // The common case: the first peer agrees and nobody has
                     // dissented. A third call would buy nothing.
@@ -616,11 +751,74 @@ pub fn corroborated_window_end(
         .find_map(|&head| clamp_scan_window(from_block, serving_to, head, confirmations))
 }
 
-/// The set of log identities in `logs`, orphaned logs excluded: the caller drops
-/// them anyway, and two nodes differing on `removed` mid-reorg is lag, not
-/// dishonesty.
-fn log_set(logs: &[Log]) -> std::collections::BTreeSet<LogKey> {
-    logs.iter().filter(|l| !l.removed).map(log_key).collect()
+/// The MULTISET of log identities in `logs` (identity -> how many times it was
+/// returned), orphaned logs excluded: the caller drops them anyway, and two
+/// nodes differing on `removed` mid-reorg is lag, not dishonesty.
+///
+/// A multiset, not a set (audit round 7, M7-9): with a set, an endpoint that
+/// returned a genuine log TWICE compared equal to its honest peers, the window
+/// was Agreed, and the second copy then paused the scanner on DUPLICATED_NONCE.
+type LogBag = std::collections::BTreeMap<LogKey, usize>;
+
+fn log_bag(logs: &[Log]) -> LogBag {
+    let mut bag = LogBag::new();
+    for l in logs.iter().filter(|l| !l.removed) {
+        *bag.entry(log_key(l)).or_default() += 1;
+    }
+    bag
+}
+
+/// How many entries of `a` (counted with multiplicity) `b` lacks.
+fn bag_excess(a: &LogBag, b: &LogBag) -> usize {
+    a.iter().map(|(k, &n)| n.saturating_sub(b.get(k).copied().unwrap_or(0))).sum()
+}
+
+/// How many non-orphaned logs in `logs` sit at a (block, logIndex) an earlier
+/// one already occupies. Zero for anything an honest node returns.
+pub fn duplicate_positions(logs: &[Log]) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    logs.iter()
+        .filter(|l| !l.removed)
+        .filter(|l| !seen.insert((l.block_number, l.log_index)))
+        .count()
+}
+
+/// Drop exact duplicate copies of a log from `logs` before it is processed
+/// (audit round 7, M7-9; defence in depth behind the corroboration check,
+/// and the only guard on a deliberately single-endpoint chain). Returns how
+/// many copies were dropped.
+///
+/// Two DIFFERENT logs at one (block, logIndex) cannot both be real, and there
+/// is no telling which one is: that is an `Err` and the window must be neither
+/// signed nor advanced. Dropping an exact copy signs nothing new — the first
+/// copy yields the identical signature — it only stops the second from
+/// tripping a persisted DUPLICATED_NONCE stop on an anomaly that is not one.
+pub fn dedupe_logs(logs: &mut Vec<Log>) -> Result<usize, String> {
+    let mut seen: std::collections::BTreeMap<(Option<u64>, Option<u64>), LogKey> =
+        std::collections::BTreeMap::new();
+    let before = logs.len();
+    let mut conflict = None;
+    logs.retain(|l| {
+        let pos = (l.block_number, l.log_index);
+        let key = log_key(l);
+        match seen.get(&pos) {
+            None => {
+                seen.insert(pos, key);
+                true
+            }
+            Some(k) if *k == key => false,
+            Some(_) => {
+                conflict.get_or_insert(pos);
+                true
+            }
+        }
+    });
+    if let Some((block, index)) = conflict {
+        return Err(format!(
+            "two DIFFERENT logs at block {block:?} logIndex {index:?} — at most one can be real"
+        ));
+    }
+    Ok(before - logs.len())
 }
 
 /// The outcome of counting endpoints' answers for one window. Indices are into
@@ -649,9 +847,8 @@ pub fn tally(served: &[Log], answers: &[(usize, Vec<Log>)], from_block: u64, sca
     if answers.is_empty() {
         return Tally::NoAnswer;
     }
-    let mine = log_set(served);
-    let sets: Vec<(usize, std::collections::BTreeSet<LogKey>)> =
-        answers.iter().map(|(idx, logs)| (*idx, log_set(logs))).collect();
+    let mine = log_bag(served);
+    let sets: Vec<(usize, LogBag)> = answers.iter().map(|(idx, logs)| (*idx, log_bag(logs))).collect();
     let total = sets.len() + 1;
     let for_served = 1 + sets.iter().filter(|(_, s)| *s == mine).count();
     if for_served * 2 > total {
@@ -673,8 +870,8 @@ pub fn tally(served: &[Log], answers: &[(usize, Vec<Log>)], from_block: u64, sca
             .then(|| backers.into_iter().find(|&i| i != first_dissenter))
             .flatten()
     });
-    let fabricated = mine.difference(theirs).count();
-    let withheld = theirs.difference(&mine).count();
+    let fabricated = bag_excess(&mine, theirs);
+    let withheld = bag_excess(theirs, &mine);
     Tally::Disagreed {
         first_dissenter,
         promote,
@@ -913,7 +1110,7 @@ mod round6_tests {
     // ---- end to end, against two stub JSON-RPC endpoints -------------------
 
     /// A JSON-RPC endpoint that reports `head` and serves `logs` for any range.
-    async fn stub(head: u64, logs: serde_json::Value) -> String {
+    pub(super) async fn stub(head: u64, logs: serde_json::Value) -> String {
         use axum::{routing::post, Json, Router};
         let app = Router::new().route(
             "/",
@@ -935,7 +1132,7 @@ mod round6_tests {
         format!("http://{addr}/")
     }
 
-    fn rpc_log(block: u64, id: u8) -> serde_json::Value {
+    pub(super) fn rpc_log(block: u64, id: u8) -> serde_json::Value {
         serde_json::json!({
             "address": format!("{:#x}", Address::repeat_byte(0xAA)),
             "topics": [format!("{:#x}", B256::repeat_byte(0xF4)), format!("{:#x}", B256::repeat_byte(id))],
@@ -949,7 +1146,7 @@ mod round6_tests {
         })
     }
 
-    fn pool(urls: &[String]) -> Failover {
+    pub(super) fn pool(urls: &[String]) -> Failover {
         Failover {
             endpoints: urls
                 .iter()
@@ -959,6 +1156,7 @@ mod round6_tests {
                 })
                 .collect(),
             active: 0,
+            last_heads: Vec::new(),
         }
     }
 
@@ -1104,5 +1302,142 @@ mod agreed_read_tests {
     async fn a_single_endpoint_chain_reads_single_source_only_by_configuration() {
         assert_eq!(run(&[Some(6)], 1).await.0.unwrap(), 6);
         assert!(run(&[Some(6)], 2).await.0.is_err());
+    }
+}
+
+/// Audit round 7: M7-8 (a stuck serving endpoint silently stopped a validator)
+/// and M7-9 (a duplicated log tripped a persisted DUPLICATED_NONCE pause).
+#[cfg(test)]
+mod round7_tests {
+    use super::round6_tests::{pool, rpc_log, stub};
+    use super::*;
+    use alloy::primitives::{Address, Bytes, B256, U256};
+
+    fn sent(block: u64, index: u64, id: u8) -> Log {
+        let mut l = Log::default();
+        l.inner.address = Address::repeat_byte(0xAA);
+        l.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![B256::repeat_byte(0xF4), B256::repeat_byte(id)],
+            Bytes::from(U256::from(1_000_000u64).to_be_bytes::<32>().to_vec()),
+        );
+        l.block_number = Some(block);
+        l.log_index = Some(index);
+        l.transaction_hash = Some(B256::repeat_byte(id));
+        l
+    }
+
+    // ---- M7-8 -----------------------------------------------------------
+
+    #[test]
+    fn majority_floor_outvotes_one_stuck_head() {
+        assert_eq!(majority_floor(&[50u64, 10_000, 10_000]), Some(10_000));
+        assert_eq!(majority_floor(&[50u64, 10_000]), Some(50), "two endpoints: both must have reached it");
+    }
+
+    /// THE finding, end to end with three mock endpoints. The serving endpoint
+    /// is stuck at block 50 and two honest ones are at 10_000. Before the fix
+    /// the head came from the stuck one, `confirmed < from_block`, and the
+    /// loop slept for ever without a word. Now the head is the majority's, the
+    /// stuck endpoint stops being asked first, and the window is scanned and
+    /// corroborated by the honest pair.
+    #[tokio::test]
+    async fn a_stuck_serving_endpoint_no_longer_stops_the_scan() {
+        let stuck = stub(50, serde_json::json!([])).await;
+        let a = stub(10_000, serde_json::json!([rpc_log(9_050, 1)])).await;
+        let b = stub(10_000, serde_json::json!([rpc_log(9_050, 1)])).await;
+        let mut f = pool(&[stuck.clone(), a.clone(), b]);
+        assert_eq!(f.active_url(), stuck, "premise: the stuck endpoint serves");
+
+        let head = f.scan_head().await.unwrap();
+        assert_eq!(head, 10_000, "the stuck endpoint is outvoted");
+        assert_eq!(f.active_url(), a, "the stuck endpoint is no longer asked first");
+        assert!(f.heads_summary().contains("=50"), "{}", f.heads_summary());
+
+        let (logs, scanned_to, verdict) =
+            f.get_logs_corroborated(&Filter::new(), 9_000, 9_099, 10).await.unwrap().unwrap();
+        assert!(matches!(verdict, Corroboration::Agreed { .. }), "got {verdict:?}");
+        assert_eq!(scanned_to, 9_099);
+        assert_eq!(logs.len(), 1);
+    }
+
+    /// A head that is merely a few blocks behind is not a reason to rotate,
+    /// and an INFLATED head can neither drag the scan head up nor get itself
+    /// asked first.
+    #[tokio::test]
+    async fn small_lag_does_not_rotate_and_an_inflated_head_is_outvoted() {
+        let a = stub(9_990, serde_json::json!([])).await;
+        let b = stub(10_000, serde_json::json!([])).await;
+        let liar = stub(u64::MAX / 2, serde_json::json!([])).await;
+        let mut f = pool(&[a.clone(), b, liar]);
+        assert_eq!(f.scan_head().await.unwrap(), 10_000);
+        assert_eq!(f.active_url(), a, "10 blocks behind is within HEAD_LAG_ROTATE");
+    }
+
+    /// Two endpoints, one stuck: no majority has reached the honest head, so
+    /// the scan head stays low (there is nothing to corroborate against) —
+    /// and the scan loop now says so through its idle warning.
+    #[tokio::test]
+    async fn two_endpoints_one_stuck_keeps_the_strict_rule() {
+        let stuck = stub(50, serde_json::json!([])).await;
+        let ok = stub(10_000, serde_json::json!([])).await;
+        let mut f = pool(&[stuck, ok]);
+        assert_eq!(f.scan_head().await.unwrap(), 50);
+    }
+
+    // ---- M7-9 -----------------------------------------------------------
+
+    /// THE finding, pure half: the same genuine log returned twice used to
+    /// compare EQUAL to the honest peer's answer (set semantics).
+    #[test]
+    fn a_duplicated_log_is_a_disagreement() {
+        let honest = vec![sent(101, 0, 1)];
+        let doubled = vec![sent(101, 0, 1), sent(101, 0, 1)];
+        match tally(&doubled, &[(1, honest.clone())], 100, 200) {
+            Tally::Disagreed { detail, .. } => assert!(detail.contains("1 log(s) only the serving"), "{detail}"),
+            t => panic!("a duplicated log must not be Agreed, got {t:?}"),
+        }
+        // A duplicating PEER is a dissenter too, and with three endpoints it
+        // is simply outvoted.
+        assert_eq!(
+            tally(&honest, &[(1, doubled), (2, honest.clone())], 100, 200),
+            Tally::Agreed { by: 2, dissenters: 1 }
+        );
+    }
+
+    #[test]
+    fn duplicate_positions_are_counted() {
+        assert_eq!(duplicate_positions(&[sent(101, 0, 1), sent(101, 1, 2)]), 0);
+        assert_eq!(duplicate_positions(&[sent(101, 0, 1), sent(101, 0, 1)]), 1);
+        assert_eq!(duplicate_positions(&[sent(101, 0, 1), sent(101, 0, 9)]), 1);
+    }
+
+    /// End to end: the serving endpoint returns a genuine log twice. Before,
+    /// the window was Agreed and the copy paused the scanner. Now it is
+    /// withheld, and the duplicating endpoint stops being asked first.
+    #[tokio::test]
+    async fn a_serving_endpoint_returning_a_log_twice_is_withheld_and_rotated() {
+        let dup = stub(200, serde_json::json!([rpc_log(150, 1), rpc_log(150, 1)])).await;
+        let honest = stub(200, serde_json::json!([rpc_log(150, 1)])).await;
+        let mut f = pool(&[dup.clone(), honest.clone()]);
+        let (_, _, verdict) =
+            f.get_logs_corroborated(&Filter::new(), 100, 5_000, 10).await.unwrap().unwrap();
+        assert!(matches!(verdict, Corroboration::Disagreed { .. }), "got {verdict:?}");
+        assert_eq!(f.active_url(), honest, "the duplicating endpoint is no longer asked first");
+        // With the honest one serving, the duplicating PEER dissents: a 1-vs-1
+        // split, withheld — never signed, never paused.
+        let (_, _, verdict) =
+            f.get_logs_corroborated(&Filter::new(), 100, 5_000, 10).await.unwrap().unwrap();
+        assert!(matches!(verdict, Corroboration::Disagreed { .. }), "got {verdict:?}");
+    }
+
+    #[test]
+    fn dedupe_drops_exact_copies_and_refuses_conflicts() {
+        let mut logs = vec![sent(101, 0, 1), sent(101, 0, 1), sent(102, 0, 2)];
+        assert_eq!(dedupe_logs(&mut logs), Ok(1));
+        assert_eq!(logs.len(), 2);
+        let mut conflicting = vec![sent(101, 0, 1), sent(101, 0, 9)];
+        assert!(dedupe_logs(&mut conflicting).is_err(), "two different logs at one position");
+        let mut clean = vec![sent(101, 0, 1), sent(101, 1, 2)];
+        assert_eq!(dedupe_logs(&mut clean), Ok(0));
     }
 }

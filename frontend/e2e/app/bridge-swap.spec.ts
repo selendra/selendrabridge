@@ -1,6 +1,6 @@
 import { test, expect, startApp, connectWallet, gotoView } from "../fixtures/app";
 import { driftChain, sentTransactions, ACCOUNT } from "../fixtures/wallet";
-import { GATE_A, ROUTER_A, ROUTER_B, STABLE_B, TOKEN_18 } from "../fixtures/backend";
+import { GATE_A, ROUTER_A, ROUTER_B, STABLE_A, STABLE_B, TOKEN_18, TOKEN_6 } from "../fixtures/backend";
 import { SENT_SIGNATURE } from "../../src/wallet/eth";
 import { bytesToHex, keccak256 } from "../../src/wallet/keccak";
 
@@ -138,6 +138,113 @@ test.describe("form", () => {
     await page.getByRole("button", { name: "1%", exact: true }).click();
     await expect(arrives).not.toHaveText(at05!);
   });
+});
+
+/**
+ * Audit round 7, M7-7. The two slippage floors are signed into the
+ * submissionId and `finalize` is permissionless, so a floor of 0 (a missing
+ * quote) or one quoted for another amount, or in the wrong decimals, is a
+ * destination swap that never blocks on price.
+ */
+test.describe("slippage floors (M7-7)", () => {
+  const amountInput = (page: import("@playwright/test").Page) =>
+    page.locator(".field").filter({ hasText: "Amount" }).locator("input");
+  /** The seven static words of swapAndBridge, after the selector. */
+  const swapWords = async (page: import("@playwright/test").Page) => {
+    const txs = await sentTransactions(page);
+    const tx = txs.find((t) => t.data.startsWith("0x07c1462d"))!;
+    return tx.data.slice(10).match(/.{64}/g)!.map((w) => BigInt("0x" + w));
+  };
+
+  test("refuses to submit without a quote rather than signing a floor of 0", async ({ page }) => {
+    await openCrossSwap(page, { backend: { swapQuote: null } });
+    await field(page, "Final token").fill(TOKEN_6);
+    await amountInput(page).fill("5");
+    await expect(primaryButton(page)).toHaveText(/No price quote — refusing to send/, { timeout: 10_000 });
+    await expect(primaryButton(page)).toBeDisabled();
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
+
+  test("a quote for the previous amount never enables the button", async ({ page }) => {
+    await openCrossSwap(page);
+    await field(page, "Final token").fill(STABLE_B);
+    await amountInput(page).fill("5");
+    await expect(primaryButton(page)).toHaveText("Swap & Bridge");
+
+    // Hold every later quote, so the window between typing and the new quote
+    // is wide open — before the fix the button stayed "Swap & Bridge" here,
+    // armed with the floors for 5.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route("**/graphql", async (route) => {
+      if (String(route.request().postData()).includes("swapQuote(")) await gate;
+      return route.fallback();
+    });
+    await amountInput(page).fill("6");
+    await expect(primaryButton(page)).toHaveText("Updating quote…");
+    await expect(primaryButton(page)).toBeDisabled();
+    await page.waitForTimeout(600); // well past the debounce: still held
+    await expect(primaryButton(page)).toBeDisabled();
+
+    release();
+    await expect(primaryButton(page)).toHaveText("Swap & Bridge", { timeout: 10_000 });
+    await primaryButton(page).click();
+    await expect(page.locator(".txbar--done")).toContainText(/Swapped & locked/, { timeout: 15_000 });
+    const w = await swapWords(page);
+    expect(w[1]).toBe(6n * 10n ** 18n); // amountIn
+    expect(w[2]).toBe((6n * 10n ** 18n * 9950n) / 10000n); // minStableOut, for 6 — not 5
+  });
+
+  // The mock quote echoes its input amount, so `finalMinOut` exposes exactly
+  // what leg 2 was quoted with.
+  const pool = (chainId: number, stable: string, stableDec: number, other: string, otherDec: number) => ({
+    chainId,
+    address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    stable,
+    tokens: [
+      { token: stable, symbol: "USDS", decimals: stableDec, price: "1000000000000000000",
+        reserve: (10n ** 40n).toString(), maxSwapUsd: "1", isStable: true },
+      { token: other, symbol: "TST", decimals: otherDec, price: "1000000000000000000",
+        reserve: (10n ** 40n).toString(), maxSwapUsd: "1", isStable: false },
+    ],
+  });
+
+  for (const c of [
+    // 6-dec source stable (unit 1) -> 18-dec destination stable (unit 10^12):
+    // before the fix finalMinOut was 10^12 too SMALL — no protection at all.
+    { name: "6 -> 18 decimals", srcDec: 6, srcUnit: "1", dstDec: 18, dstUnit: 10n ** 12n, atDest: 5n * 10n ** 30n },
+    // 18-dec source (unit 10^12) -> 6-dec destination (unit 1): 10^12 too LARGE,
+    // so every destination swap failed into the fallback.
+    { name: "18 -> 6 decimals", srcDec: 18, srcUnit: (10n ** 12n).toString(16), dstDec: 6, dstUnit: 1n, atDest: 5_000_000n },
+  ]) {
+    for (const finalIsStable of [true, false]) {
+      test(`leg 2 is quoted in destination-local units: ${c.name}, final ${finalIsStable ? "= stable" : "via pool"}`, async ({ page }) => {
+        await startApp(page, {
+          wallet: { chainId: 1337, calls: { ...CALLS, "4e3ff796": c.srcUnit }, receiptLogs: [sentLog] },
+          backend: {
+            swapPool: {
+              1337: pool(1337, STABLE_A, c.srcDec, TOKEN_18, 18),
+              1338: pool(1338, STABLE_B, c.dstDec, TOKEN_6, 6),
+            },
+          },
+          chainRpc: { bridgeUnit: c.dstUnit },
+        });
+        await connectWallet(page);
+        await gotoView(page, "Bridge");
+        await page.getByRole("button", { name: "Swap on arrival" }).click();
+        await field(page, "Final token").fill(finalIsStable ? STABLE_B : TOKEN_6);
+        // 5 TOKEN_18 -> echoed as 5e18 source-local stable.
+        await amountInput(page).fill("5");
+        await expect(primaryButton(page)).toHaveText("Swap & Bridge", { timeout: 10_000 });
+        await primaryButton(page).click();
+        await expect(page.locator(".txbar--done")).toContainText(/Swapped & locked/, { timeout: 15_000 });
+
+        const w = await swapWords(page);
+        expect(w[2]).toBe((5n * 10n ** 18n * 9950n) / 10000n); // leg 1: source-local, unchanged
+        expect(w[6]).toBe((c.atDest * 9950n) / 10000n); // leg 2: destination-local
+      });
+    }
+  }
 });
 
 test.describe("the swapAndBridge → finalize lifecycle", () => {

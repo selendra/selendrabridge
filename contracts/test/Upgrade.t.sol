@@ -347,7 +347,7 @@ contract UpgradeTest is Test {
         address newV = vm.addr(0xB0B);
         bytes32 action = gate.addValidatorActionId(newV);
 
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         uint256 readyAt = gate.governanceReadyAt(action);
         assertEq(readyAt, block.timestamp + gate.GOVERNANCE_DELAY());
 
@@ -368,7 +368,7 @@ contract UpgradeTest is Test {
         address newV = vm.addr(0xB0B);
         bytes32 action = gate.addValidatorActionId(newV);
 
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
         gate.setValidator(newV, true);
         assertEq(gate.governanceReadyAt(action), 0, "schedule burned");
@@ -388,7 +388,7 @@ contract UpgradeTest is Test {
         three[2] = vm.addr(0xC0C);
         Gate gate = GateDeployer.deploy(three, 3, DOMAIN_A);
 
-        gate.scheduleGovernance(gate.lowerThresholdActionId(2));
+        gate.scheduleLowerThreshold(2);
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
 
         vm.expectRevert(
@@ -417,7 +417,7 @@ contract UpgradeTest is Test {
         assertEq(gate.threshold(), 3);
 
         // Evicting a compromised key: instant (once the threshold allows it).
-        gate.scheduleGovernance(gate.lowerThresholdActionId(2));
+        gate.scheduleLowerThreshold(2);
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
         gate.setThreshold(2);
         gate.setValidator(three[2], false);
@@ -432,7 +432,7 @@ contract UpgradeTest is Test {
         bytes32 action = gate.addValidatorActionId(newV);
 
         gate.setGuardian(guardian);
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
 
         vm.prank(guardian);
         gate.cancelScheduledGovernance(action);
@@ -450,14 +450,14 @@ contract UpgradeTest is Test {
         bytes32 action = gate.addValidatorActionId(address(0xBAD));
         vm.prank(address(0xBAD));
         vm.expectRevert(Gate.NotOwner.selector);
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(address(0xBAD));
     }
 
     /// A stranger must not be able to cancel a legitimate pending rotation.
     function test_Governance_OnlyOwnerOrGuardianCanCancel() public {
         Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
         bytes32 action = gate.addValidatorActionId(vm.addr(0xB0B));
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(vm.addr(0xB0B));
 
         vm.prank(address(0xBAD));
         vm.expectRevert(Gate.NotAuthorizedToPause.selector);
@@ -472,7 +472,7 @@ contract UpgradeTest is Test {
         Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
         address newV = vm.addr(0xB0B);
         bytes32 action = gate.addValidatorActionId(newV);
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         uint256 readyAt = gate.governanceReadyAt(action);
 
         address v2 = address(new GateV2());

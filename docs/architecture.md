@@ -180,7 +180,7 @@ One `Gate` per chain. It is both the source and the destination; the role depend
 | `cancelled[submissionId]` | destination | Distinguishes a burn from a delivery. |
 | `tokenOf[debridgeId]` | destination | Asset registry: which local ERC-20 backs this asset id. Write-once. |
 | `supportedChain[chainId]` | source | Destinations `send` accepts (M-3). Unlisted ⇒ `UnsupportedChain`; nothing is locked towards a chain with no gate. Instant and reversible; `claim`/`cancel`/`refund` never consult it. |
-| `isSealed` | both | Ends the setup phase (H-1). Until `seal()`, the owner registers corridors instantly; after it, every new `setLocalToken` needs `scheduleGovernance(setLocalTokenActionId(id, token))` + `GOVERNANCE_DELAY`, so a stolen owner key cannot point a corridor at a worthless token and drain the pot. Irreversible. |
+| `isSealed` | both | Ends the setup phase (H-1). Until `seal()`, the owner registers corridors instantly; after it, every new `setLocalToken` needs `scheduleSetLocalToken(id, token)` + `GOVERNANCE_DELAY`, so a stolen owner key cannot point a corridor at a worthless token and drain the pot. Irreversible. |
 
 | `bridgeDecimalsOf[token]` | both | The token's bridge decimals and cached `decimals()` (§2.3). Write-once; delayed after seal. `send`, `claim`, `refund` and `setLocalToken` all require it. |
 
@@ -240,7 +240,8 @@ The guardian is deliberately low-trust: it can stop the bridge but never start i
 A same-chain swap against a single stablecoin as the unit of account.
 Not an AMM: prices are set by an oracle role, and each token's throughput is hard-capped by its own locked reserve.
 
-`setPrice` enforces a per-update deviation cap (`maxPriceDeviationBps`) against the previous price.
+`setPrice(token, expectedOld, newPrice)` is a compare-and-set: it reverts unless the on-chain price is `expectedOld`, so a price-keeper fed a false price by its RPC cannot land a step computed from it (audit 2026-10-02, M7-4).
+Each update may move the price by at most `priceStepCapBps()`, the lesser of `maxPriceDeviationBps` and the swap fee `feeBps`, so a round trip around one update always costs more in fees than it gains (M7-3). A fee-0 pool can be refreshed but not moved.
 
 > **Known gap.** The cap is per call, with no cooldown or time weighting. A compromised oracle key can walk the price arbitrarily far across repeated calls in a single block. See `report.md` M5.
 
@@ -369,7 +370,7 @@ Every route except `/health` requires a bearer token, and each route group deman
 | Scope | Token | Routes |
 | --- | --- | --- |
 | `Read` | any of the four | `GET /submissions`, `/submissions/:id`, `/refund-candidates`, `/history`, `/swaps`, `/allowed/*` |
-| `Sign` | `SIG_STORE_VALIDATOR_TOKEN` | `POST /submissions`, `POST /submissions/:id/attestations` |
+| `Sign` | `SIG_STORE_VALIDATOR_TOKENS` on the store (one `label:token` per validator, M7-11); each validator holds its own as `SIG_STORE_VALIDATOR_TOKEN` | `POST /submissions`, `POST /submissions/:id/attestations` |
 | `Relay` | `SIG_STORE_KEEPER_TOKEN` | `POST /submissions/:id/claimed` |
 | `Admin` | `SIG_STORE_ADMIN_TOKEN` | allowlist mutations under `/allowed/` |
 

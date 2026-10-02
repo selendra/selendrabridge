@@ -58,9 +58,15 @@ contract SwapPool is ReentrancyGuard {
 
     // --- economic parameters ---
     /// @dev swap fee in bps, charged on the USD value (accrues into reserves).
+    ///
+    ///      It is ALSO the largest move a single {setPrice} may make — see
+    ///      {priceStepCapBps}. A pool at fee 0 can therefore re-assert its prices
+    ///      (the staleness refresh) but never move them: give it a fee first.
     uint16 public feeBps;
     /// @dev max allowed price move per setPrice() call, in bps (anti-fat-finger /
-    ///      anti-compromise). Applies only to UPDATES (not the first price).
+    ///      anti-compromise). Applies only to UPDATES (not the first price). The
+    ///      cap actually enforced is the LESSER of this and {feeBps}; see
+    ///      {priceStepCapBps}.
     uint16 public maxPriceDeviationBps;
     /// @dev minimum wall-clock gap between two reprices of the SAME token. The
     ///      per-call deviation cap alone only bounds one step; without a time gate
@@ -135,6 +141,9 @@ contract SwapPool is ReentrancyGuard {
     ///      `StableRepriceForbidden` with extra steps. See {delistToken}.
     error StableDelistForbidden();
     error PriceDeviationTooHigh(uint256 oldPrice, uint256 newPrice, uint16 maxBps);
+    /// @dev {setPrice}'s compare-and-set failed: the price on chain is not the
+    ///      one the oracle planned its step from (audit 2026-10-02, M7-4).
+    error PriceChanged(address token, uint256 expected, uint256 actual);
     /// @dev setPrice() called again before the per-token cooldown elapsed.
     error PriceUpdateTooSoon(address token, uint256 nextAllowed);
     /// @dev the token's price is older than {maxPriceAge}; the pool refuses to
@@ -333,28 +342,67 @@ contract SwapPool is ReentrancyGuard {
         emit TokenListed(token, price, dec);
     }
 
-    /// @notice Update a token's pegged price (oracle-only), bounded by the
-    ///         per-update deviation cap. The stable can never be repriced.
-    function setPrice(address token, uint256 newPrice) external onlyOracle {
+    /// @notice The largest move one {setPrice} may make, in bps of the current
+    ///         price: the LESSER of {maxPriceDeviationBps} and {feeBps}.
+    ///
+    /// @dev    WHY THE FEE BOUNDS THE STEP (audit 2026-10-02, M7-3). Swaps fill at
+    ///         exactly the oracle price, and a price-keeper's capped steps toward
+    ///         its target are predictable without even watching the mempool. With
+    ///         a step of `d` and a fee of `f`, a round trip around one update —
+    ///         buy at the old price, sell at the new one — returns
+    ///         `(1 - f)^2 * (1 + d)` of its capital going up, and
+    ///         `(1 - f)^2 / (1 - d)` going down. At `d <= f` both are below 1
+    ///         (`(1 - f)(1 - f^2)` and `1 - f`), so no sandwich around a single
+    ///         update can profit, however large the capital: what used to be up
+    ///         to `maxPriceDeviationBps` of the attacker's capital per update,
+    ///         taken from reserves, is now a guaranteed loss. Rounding only helps:
+    ///         the fee rounds up against the trader and every output floors.
+    ///
+    ///         The cost is tracking speed — the price moves at most one fee-sized
+    ///         step per {minPriceUpdateInterval}. Size the fee and the interval
+    ///         together against how fast the asset really moves; a price that lags
+    ///         the market is arbitraged whatever this cap is.
+    function priceStepCapBps() public view returns (uint16) {
+        return feeBps < maxPriceDeviationBps ? feeBps : maxPriceDeviationBps;
+    }
+
+    /// @notice Update a token's pegged price (oracle-only), bounded by
+    ///         {priceStepCapBps} and the per-token cooldown. The stable can never
+    ///         be repriced.
+    /// @param  expectedOld the price the oracle planned this step from. The call
+    ///         reverts {PriceChanged} unless it is the price on chain right now.
+    ///
+    /// @dev    COMPARE-AND-SET (audit 2026-10-02, M7-4). The price-keeper steps
+    ///         FROM the current on-chain price toward its target, and it learns
+    ///         that price from an RPC endpoint. A lying endpoint could report any
+    ///         figure and have the oracle key sign a "step toward target" that is
+    ///         really a capped move AWAY from it, every interval. Binding the read
+    ///         into the write makes a lie a revert instead of a wrong price: the
+    ///         step the oracle signs is only ever applied to the price it was
+    ///         computed from. There is deliberately no unconditional variant.
+    function setPrice(address token, uint256 expectedOld, uint256 newPrice) external onlyOracle {
         TokenInfo storage t = tokens[token];
         if (!t.listed) revert TokenNotListed(token);
         if (token == stable) revert StableRepriceForbidden();
         if (newPrice == 0) revert ZeroPrice();
 
+        uint256 oldPrice = t.price;
+        if (oldPrice != expectedOld) revert PriceChanged(token, expectedOld, oldPrice);
+
         // Time gate: the first repricing after listing is free, but every
         // subsequent one must wait out the cooldown. This bounds the RATE of
-        // change — with the per-call cap it caps movement to maxPriceDeviationBps
-        // per interval — so a compromised oracle cannot walk the price in a block.
+        // change — with the per-call cap it caps movement to one step per
+        // interval — so a compromised oracle cannot walk the price in a block.
         uint256 last = lastPriceUpdate[token];
         if (last != 0 && block.timestamp < last + minPriceUpdateInterval) {
             revert PriceUpdateTooSoon(token, last + minPriceUpdateInterval);
         }
 
-        uint256 oldPrice = t.price;
-        // |new - old| / old <= maxDeviation
+        // |new - old| / old <= min(maxDeviation, fee)
+        uint16 cap = priceStepCapBps();
         uint256 diff = newPrice > oldPrice ? newPrice - oldPrice : oldPrice - newPrice;
-        if (diff > Math.mulDiv(oldPrice, maxPriceDeviationBps, BPS_DENOM)) {
-            revert PriceDeviationTooHigh(oldPrice, newPrice, maxPriceDeviationBps);
+        if (diff > Math.mulDiv(oldPrice, cap, BPS_DENOM)) {
+            revert PriceDeviationTooHigh(oldPrice, newPrice, cap);
         }
 
         t.price = newPrice;

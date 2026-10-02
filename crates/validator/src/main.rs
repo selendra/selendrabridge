@@ -190,6 +190,47 @@ async fn main() -> anyhow::Result<()> {
 /// window is now never signed; this only decides how loudly to say so.
 const INCONCLUSIVE_LIMIT: u32 = 10;
 
+/// M7-8: how many consecutive ticks without the cursor moving before the scan
+/// loop says so (and again at every further multiple). Ticks are at least one
+/// poll interval (>= 1s) apart; a 12s-block chain polled every 2s legitimately
+/// idles ~6 ticks between blocks, so this sits well clear of that.
+const IDLE_WARN_TICKS: u32 = 60;
+
+/// M7-11: what one scan window has already durably stored, kept across retries
+/// of THAT window so a sig-store 429 (or any error) mid-batch does not make the
+/// retry re-POST every upsert that already succeeded — which, under a rate
+/// limit, is how a catch-up batch could livelock.
+///
+/// SAFETY. Only the network write is skipped. Every check — the nonce
+/// sequence, the id recomputation, the allowlist, the H-2 scale verdict — still
+/// runs on the replay, in order, exactly as before; a log reaches the skip only
+/// where it would otherwise have been signed and upserted again, and the
+/// signature would have been byte-identical (RFC 6979). So nothing is signed
+/// that was not signed before, and the cursor semantics are untouched: the
+/// block cursor still moves only after a whole batch succeeds, and the nonce
+/// cursor is still rolled back on failure and re-accepted on the replay.
+///
+/// Keyed by the window's `from_block`: any change (the batch succeeded and the
+/// cursor moved, or an operator rescan moved it) starts a fresh set, so it can
+/// never suppress a write for a different range.
+#[derive(Default)]
+struct BatchProgress {
+    from_block: Option<u64>,
+    stored: std::collections::HashSet<B256>,
+}
+
+impl BatchProgress {
+    /// The set for the window starting at `from_block`, cleared if it was
+    /// kept for another one.
+    fn for_window(&mut self, from_block: u64) -> &mut std::collections::HashSet<B256> {
+        if self.from_block != Some(from_block) {
+            self.from_block = Some(from_block);
+            self.stored.clear();
+        }
+        &mut self.stored
+    }
+}
+
 /// Scan one source chain forever: poll for `Sent`, verify, sign, store.
 async fn scan_source(
     source: SourceChain,
@@ -222,6 +263,12 @@ async fn scan_source(
     // How fast we may read while behind. Defaults to the steady-state interval:
     // see `catchup_poll_interval_ms` for why aggression has to be opt-in.
     let catchup_ms = source.catchup_poll_interval_ms.unwrap_or(source.poll_interval_ms);
+    // M7-8: consecutive ticks on which the cursor did not move (see the warning).
+    let mut last_from: Option<u64> = None;
+    let mut idle_ticks: u32 = 0;
+    // M7-11: the submissionIds this loop has already durably stored while
+    // working on the window that starts at `.0`. See `BatchProgress`.
+    let mut progress = BatchProgress::default();
 
     // Multi-RPC failover, with a chainId guard per endpoint. Connecting can fail
     // if every endpoint is momentarily down/wrong-chain; retry rather than kill
@@ -414,6 +461,30 @@ async fn scan_source(
         }
 
         let from_block = runtime.lock().await.next_block();
+        // M7-8: a scanner that stops making progress must say so, whatever the
+        // reason — a stuck endpoint, an unreachable peer, a store refusing
+        // writes. Every path below that leaves the cursor put used to have its
+        // own (or no) log line; this one fires regardless, with every
+        // endpoint's last head, so "silently stopped" is no longer possible.
+        if last_from == Some(from_block) {
+            idle_ticks = idle_ticks.saturating_add(1);
+            if idle_ticks.is_multiple_of(IDLE_WARN_TICKS) {
+                warn!(
+                    chain_id = source.chain_id,
+                    from_block,
+                    cached_head = ?cached_latest,
+                    block_confirmation = source.block_confirmation,
+                    idle_ticks,
+                    heads = %failover.heads_summary(),
+                    "NO PROGRESS: the cursor has not moved for {idle_ticks} ticks — this \
+                     validator is signing nothing on this chain (audit round 7, M7-8). Check \
+                     the heads above for a stuck or lagging RPC endpoint."
+                );
+            }
+        } else {
+            last_from = Some(from_block);
+            idle_ticks = 0;
+        }
         // The head is re-read only when the scanner has caught up to what it last
         // saw. A scanner a million blocks behind learns nothing from asking where
         // the tip is between every 100-block window — and that extra round trip
@@ -423,7 +494,11 @@ async fn scan_source(
         if cached_latest.is_none_or(|l| from_block + source.block_confirmation > l) {
             // Transient RPC failures must not kill the loop (which, pre-fix, also
             // took down every sibling chain). Log, back off, and try again.
-            match failover.get_block_number().await {
+            //
+            // From EVERY endpoint, on a strict majority (audit round 7, M7-8):
+            // a stuck active endpoint used to report an old head, which is not
+            // an error, so nothing rotated and this loop slept for ever.
+            match failover.scan_head().await {
                 Ok(v) => cached_latest = Some(v),
                 Err(e) => {
                     warn!(chain_id = source.chain_id, error = %e, "get_block_number failed; retrying");
@@ -582,6 +657,36 @@ async fn scan_source(
                 );
             }
 
+            // M7-9: never process one log twice. The corroboration check above
+            // now refuses a served list with a repeated position, so this is
+            // defence in depth — and the only guard on a deliberately
+            // single-endpoint chain. An exact copy is dropped (its first copy
+            // signs the identical signature); two DIFFERENT logs at one
+            // position cannot both be real, so the window is withheld.
+            match provider::dedupe_logs(&mut logs) {
+                Ok(0) => {}
+                Ok(dropped) => warn!(
+                    chain_id = source.chain_id,
+                    dropped,
+                    rpc = %failover.active_url(),
+                    "RPC returned the same log more than once — dropped the copies \
+                     (audit round 7, M7-9)"
+                ),
+                Err(why) => {
+                    warn!(
+                        chain_id = source.chain_id,
+                        %why,
+                        from_block,
+                        scanned_to,
+                        rpc = %failover.active_url(),
+                        "RPC returned conflicting logs at one position — signing NOTHING from \
+                         this range (audit round 7, M7-9)"
+                    );
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+            }
+
             // Allowlist for this batch. In sig-store mode a fetch failure is
             // fail-closed (skip the batch) so we never sign a now-disallowed
             // transfer on a stale view; in file mode it is None (no enforcement).
@@ -629,6 +734,7 @@ async fn scan_source(
 
             let mut paused = false;
             let mut batch_failed = false;
+            let stored = progress.for_window(from_block);
             for log in &logs {
                 match handle_log(
                     &signer,
@@ -639,6 +745,7 @@ async fn scan_source(
                     allowlist.as_ref(),
                     bridge_domain,
                     &scale_guard,
+                    stored,
                 )
                 .await
                 {
@@ -709,6 +816,7 @@ async fn handle_log(
     allowlist: Option<&Allowlist>,
     bridge_domain: B256,
     scale: &scale::ScaleGuard,
+    stored: &mut std::collections::HashSet<B256>,
 ) -> anyhow::Result<bool> {
     let decoded = Gate::Sent::decode_log(&log.inner).context("decode Sent")?;
     let ev = &decoded.data;
@@ -859,12 +967,22 @@ async fn handle_log(
         }
     }
 
+    // M7-11: already durably stored by an earlier attempt at this same window,
+    // which then failed on a LATER log. Every check above has run again, in
+    // order, and passed; re-signing would produce the identical signature, so
+    // the only thing skipped is a redundant POST (see `BatchProgress`).
+    if stored.contains(&emitted_id) {
+        runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
+        return Ok(true);
+    }
+
     // EIP-191 eth_sign over the raw 32-byte submissionId.
     let sig = signer.sign_message(emitted_id.as_slice()).await?;
     let sig_hex = encode_signature(&sig);
 
     sink.upsert(record, SignerSig { signer: format!("{signer_addr:#x}"), signature: sig_hex })
         .await?;
+    stored.insert(emitted_id);
 
     // Record the accepted nonce only after a successful sign+store.
     runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
@@ -924,7 +1042,7 @@ mod tests {
         let guard = scale::ScaleGuard::new(vec![], vec![]);
 
         let log = sent_log(vec![0xFF; 7], B256::repeat_byte(1));
-        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard).await;
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard, &mut Default::default()).await;
         assert!(matches!(r, Ok(true)), "processed (skipped), got {r:?}");
 
         let rt = runtime.lock().await;
@@ -947,9 +1065,73 @@ mod tests {
         let guard = scale::ScaleGuard::new(vec![], vec![]);
 
         let log = sent_log(vec![], B256::repeat_byte(1));
-        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard).await;
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard, &mut Default::default()).await;
         assert!(matches!(r, Ok(false)), "got {r:?}");
         assert!(runtime.lock().await.paused());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit round 7, M7-11 (3). A batch that fails on a LATER log (a sig-store
+    /// 429, say) is retried from the top. The retry must not re-POST what is
+    /// already stored — under a rate limit that is how a catch-up livelocks —
+    /// but every check must still run, in order: only the write is skipped.
+    #[tokio::test]
+    async fn a_retried_window_does_not_rewrite_what_it_already_stored() {
+        let dir = scratch("progress");
+        let sigs = dir.join("sigs");
+        let sink = StoreBackend::file(sigs.clone()).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&dir.join("state.json"), 0).unwrap()));
+        let signer = PrivateKeySigner::random();
+        // A destination for chain 2 whose scale (6) is already known, so the
+        // H-2 check agrees and the event reaches the signing step.
+        let guard = scale::ScaleGuard::new(
+            vec![scale::Destination::connected(2, Address::ZERO, vec![], 1)],
+            vec![],
+        );
+        // A store-valid event: its debridgeId must hash its (chain, token).
+        let mut ev = Gate::Sent::decode_log(&sent_log(vec![], B256::ZERO).inner).unwrap().data;
+        ev.debridgeId = bridge_core::debridge_id(U256::from(1u64), ev.token);
+        guard.seed_destination_scale(2, ev.debridgeId, 6).await;
+        ev.submissionId = Submission::from_sent_event(&ev, B256::ZERO).unwrap().compute_id();
+        let id = ev.submissionId;
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: Address::repeat_byte(0x6A), data: ev.encode_log_data() },
+            ..Default::default()
+        };
+        let count = || std::fs::read_dir(&sigs).map(|d| d.count()).unwrap_or(0);
+
+        let mut progress = BatchProgress::default();
+        let snapshot = runtime.lock().await.nonce_snapshot();
+
+        // First attempt: signed and stored, and remembered.
+        let stored = progress.for_window(100);
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard, stored).await;
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(stored.contains(&id));
+        assert_eq!(count(), 1, "premise: the first attempt wrote it");
+
+        // The batch then failed on a later log: nonces roll back, and the store
+        // copy is removed so any second write would show.
+        runtime.lock().await.restore_nonces(snapshot.clone());
+        std::fs::remove_dir_all(&sigs).unwrap();
+        std::fs::create_dir_all(&sigs).unwrap();
+
+        // The retry of the SAME window: processed, nonce re-accepted, no write.
+        let stored = progress.for_window(100);
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard, stored).await;
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert_eq!(count(), 0, "an already-stored upsert must not be re-sent");
+        assert_eq!(runtime.lock().await.last_nonce(1, 2), Some(0), "the nonce is re-accepted on the replay");
+
+        // The checks still run: replaying it without the rollback is still a
+        // DUPLICATED_NONCE stop, skip or no skip.
+        let stored = progress.for_window(100);
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard, stored).await;
+        assert!(matches!(r, Ok(false)), "{r:?}");
+        assert!(runtime.lock().await.paused());
+
+        // A different window starts clean: nothing carried over.
+        assert!(progress.for_window(200).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

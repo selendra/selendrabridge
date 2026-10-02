@@ -127,6 +127,37 @@ test("sends swap() to the pool with the pair, amount, minOut and recipient", asy
   expect(tx.chainId).toBe("0x539");
 });
 
+/**
+ * Audit round 7, M7-7: `quoting` flipped only once the 300 ms debounce fired,
+ * so right after an edit the button still offered "Swap" with the PREVIOUS
+ * amount's quote — and its minOut.
+ */
+test("a quote for the previous amount never enables Swap", async ({ page }) => {
+  await openSwap(page);
+  await payAmount(page).fill("10");
+  await expect(primaryButton(page)).toHaveText("Swap", { timeout: 10_000 });
+
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  await page.route("**/graphql", async (route) => {
+    if (String(route.request().postData()).includes("swapQuote(")) await held;
+    return route.fallback();
+  });
+  await payAmount(page).fill("20");
+  await expect(primaryButton(page)).toHaveText("Fetching quote…");
+  await expect(primaryButton(page)).toBeDisabled();
+  await page.waitForTimeout(600);
+  await expect(primaryButton(page)).toBeDisabled();
+
+  release();
+  await expect(primaryButton(page)).toHaveText("Swap", { timeout: 10_000 });
+  await primaryButton(page).click();
+  await expect(page.locator(".txbar--done")).toContainText(/Swapped/, { timeout: 15_000 });
+  const words = (await sentTransactions(page))[0].data.slice(10).match(/.{64}/g)!;
+  expect(BigInt("0x" + words[2])).toBe(20n * 10n ** 18n);
+  expect(BigInt("0x" + words[3])).toBe((20n * 10n ** 18n * 9950n) / 10000n); // for 20, not 10
+});
+
 test("clears the amount after a successful swap", async ({ page }) => {
   await openSwap(page);
   await payAmount(page).fill("10");

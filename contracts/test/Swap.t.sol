@@ -205,36 +205,45 @@ contract SwapTest is Test {
     // ------------------------------------------------------------- pricing
 
     function test_SetPrice_OracleWithinDeviation() public {
+        // M7-3: a step is capped by the fee as well; open the fee to the 10% cap
+        // so this test exercises the deviation cap and the cooldown alone.
+        pool.setFee(DEVIATION);
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3498e18); // +10%, exactly at the cap
+        pool.setPrice(address(weth), WETH_PRICE, 3498e18); // +10%, exactly at the cap
         (, , uint256 price, ) = _info(address(weth));
         assertEq(price, 3498e18);
     }
 
     function test_SetPrice_RevertsDeviationTooHigh() public {
+        // M7-3: a step is capped by the fee as well; open the fee to the 10% cap
+        // so this test exercises the deviation cap and the cooldown alone.
+        pool.setFee(DEVIATION);
         vm.prank(oracle);
         vm.expectRevert(
             abi.encodeWithSelector(SwapPool.PriceDeviationTooHigh.selector, 3180e18, 3600e18, DEVIATION)
         );
-        pool.setPrice(address(weth), 3600e18); // +13.2% > 10%
+        pool.setPrice(address(weth), WETH_PRICE, 3600e18); // +13.2% > 10%
     }
 
     function test_SetPrice_OnlyOracle() public {
         vm.prank(attacker);
         vm.expectRevert(SwapPool.NotOracle.selector);
-        pool.setPrice(address(weth), 3200e18);
+        pool.setPrice(address(weth), WETH_PRICE, 3200e18);
     }
 
     function test_SetPrice_StableForbidden() public {
         vm.prank(oracle);
         vm.expectRevert(SwapPool.StableRepriceForbidden.selector);
-        pool.setPrice(address(usd), 2e18);
+        pool.setPrice(address(usd), PRICE_ONE, 2e18);
     }
 
     function test_SetPrice_CooldownBoundsRateOfChange() public {
+        // M7-3: a step is capped by the fee as well; open the fee to the 10% cap
+        // so this test exercises the deviation cap and the cooldown alone.
+        pool.setFee(DEVIATION);
         // The first repricing after listing is free.
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3300e18); // +~3.8%, within the 10% cap
+        pool.setPrice(address(weth), WETH_PRICE, 3300e18); // +~3.8%, within the 10% cap
 
         // A second repricing before the cooldown elapses is rejected — so a
         // compromised oracle cannot chain several capped steps in one block and
@@ -244,7 +253,7 @@ contract SwapTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(SwapPool.PriceUpdateTooSoon.selector, address(weth), nextAllowed)
         );
-        pool.setPrice(address(weth), 3400e18);
+        pool.setPrice(address(weth), 3300e18, 3400e18);
 
         // Price is unchanged from the single allowed step.
         (, , uint256 price, ) = _info(address(weth));
@@ -253,7 +262,7 @@ contract SwapTest is Test {
         // After the cooldown, one more capped step is allowed.
         vm.warp(nextAllowed);
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3400e18);
+        pool.setPrice(address(weth), 3300e18, 3400e18);
         (, , price, ) = _info(address(weth));
         assertEq(price, 3400e18);
     }
@@ -382,9 +391,12 @@ contract SwapTest is Test {
     /// stale timestamp surviving into a re-listing would revoke that exemption and
     /// freeze the new token's price behind a cooldown it never earned.
     function test_Delist_ClearsThePriceClock_SoARelistCanPriceFreely() public {
+        // M7-3: a step is capped by the fee as well; open the fee to the 10% cap
+        // so this test exercises the deviation cap and the cooldown alone.
+        pool.setFee(DEVIATION);
         // Reprice once so the clock is set, then fully unwind and delist.
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3200e18);
+        pool.setPrice(address(weth), WETH_PRICE, 3200e18);
         assertGt(pool.lastPriceUpdate(address(weth)), 0, "clock should be set");
 
         pool.withdrawLiquidity(address(weth), 100e18, address(this));
@@ -395,7 +407,7 @@ contract SwapTest is Test {
         // always allowed, and must stay allowed here.
         pool.listToken(address(weth), 3000e18);
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3100e18);
+        pool.setPrice(address(weth), 3000e18, 3100e18);
         (,, uint256 price,) = _info(address(weth));
         assertEq(price, 3100e18, "a re-listed token must be freely pricable");
     }
@@ -534,7 +546,7 @@ contract SwapTest is Test {
         _fund(usd, user, 10_000e6);
         vm.warp(block.timestamp + pool.maxPriceAge() + 1);
         vm.prank(oracle);
-        pool.setPrice(address(weth), 3180e18);
+        pool.setPrice(address(weth), WETH_PRICE, 3180e18);
 
         vm.prank(user);
         pool.swap(address(usd), address(weth), 1_000e6, 0, user);
@@ -549,7 +561,7 @@ contract SwapTest is Test {
         // `tt` is repriced so only the stable's own age is in question.
         vm.warp(block.timestamp + pool.maxPriceAge() * 3);
         vm.prank(oracle);
-        pool.setPrice(address(tt), 1e18);
+        pool.setPrice(address(tt), TT_PRICE, 1e18);
 
         vm.prank(user);
         pool.swap(address(usd), address(tt), 100e6, 0, user);
@@ -589,4 +601,128 @@ contract SwapTest is Test {
         pool.swap(address(usd), address(weth), 1_000e6, 0, user);
     }
 
+    // ------------------------------------------- M7-3: sandwiching an update
+
+    /// The audit PoC, as it used to run: fee 0, 200k mUSD into WETH, the
+    /// oracle's predictable +10% step, WETH back out for ~220k. Now a fee-0 pool
+    /// cannot move its price at all (it can still re-assert it), so the update
+    /// the sandwich needs never happens.
+    function test_M7_3_AFeeZeroPoolCannotMoveItsPrice() public {
+        assertEq(pool.feeBps(), 0);
+        assertEq(pool.priceStepCapBps(), 0);
+        vm.prank(oracle);
+        vm.expectRevert(abi.encodeWithSelector(SwapPool.PriceDeviationTooHigh.selector, WETH_PRICE, 3498e18, uint16(0)));
+        pool.setPrice(address(weth), WETH_PRICE, 3498e18);
+
+        // Re-asserting the same price (the staleness refresh) still works.
+        vm.prank(oracle);
+        pool.setPrice(address(weth), WETH_PRICE, WETH_PRICE);
+    }
+
+    /// With a fee, the step is capped at the fee — and the PoC's round trip at
+    /// the largest allowed step now LOSES money, in both directions.
+    function test_M7_3_ARoundTripAroundTheLargestStepIsUnprofitable() public {
+        pool.setFee(100); // 1%
+        assertEq(pool.priceStepCapBps(), 100, "the step cap is the lesser of fee and deviation");
+
+        // The audit's +10% step is refused outright.
+        vm.prank(oracle);
+        vm.expectRevert(abi.encodeWithSelector(SwapPool.PriceDeviationTooHigh.selector, WETH_PRICE, 3498e18, uint16(100)));
+        pool.setPrice(address(weth), WETH_PRICE, 3498e18);
+
+        // Up: 200k in before a +1% step, everything out after it.
+        uint256 capital = 200_000e6;
+        _fund(usd, attacker, capital);
+        _fund(weth, attacker, 0);
+        uint256 snap = vm.snapshotState();
+        vm.prank(attacker);
+        uint256 wethGot = pool.swap(address(usd), address(weth), capital, 0, attacker);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), WETH_PRICE, 3211_8e17); // +1%, exactly the cap
+        vm.prank(attacker);
+        uint256 usdBack = pool.swap(address(weth), address(usd), wethGot, 0, attacker);
+        assertLt(usdBack, capital, "sandwiching an up-step must lose");
+
+        // Down: sell 50 WETH before a -1% step, buy it back after.
+        vm.revertToState(snap);
+        _fund(weth, attacker, 50e18);
+        vm.prank(attacker);
+        uint256 usdGot = pool.swap(address(weth), address(usd), 50e18, 0, attacker);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), WETH_PRICE, 3148_2e17); // -1%, exactly the cap
+        vm.prank(attacker);
+        uint256 wethBack = pool.swap(address(usd), address(weth), usdGot, 0, attacker);
+        assertLt(wethBack, 50e18, "sandwiching a down-step must lose");
+    }
+
+    /// The invariant itself, over fee, capital and direction: at any step the
+    /// pool accepts, a round trip around it never returns more than it put in.
+    function testFuzz_M7_3_NoRoundTripAroundOneUpdateProfits(uint16 fee, uint256 capital, bool up) public {
+        fee = uint16(bound(fee, 1, 1000));
+        pool.setFee(fee);
+        uint256 step = Math.mulDiv(WETH_PRICE, pool.priceStepCapBps(), 10_000);
+        uint256 newPrice = up ? WETH_PRICE + step : WETH_PRICE - step;
+        if (up) {
+            capital = bound(capital, 1e6, 250_000e6);
+            _fund(usd, attacker, capital);
+            vm.prank(attacker);
+            uint256 got = pool.swap(address(usd), address(weth), capital, 0, attacker);
+            vm.prank(oracle);
+            pool.setPrice(address(weth), WETH_PRICE, newPrice);
+            _fund(weth, attacker, 0);
+            vm.prank(attacker);
+            uint256 back = pool.swap(address(weth), address(usd), got, 0, attacker);
+            assertLe(back, capital);
+        } else {
+            capital = bound(capital, 1e15, 80e18);
+            _fund(weth, attacker, capital);
+            vm.prank(attacker);
+            uint256 got = pool.swap(address(weth), address(usd), capital, 0, attacker);
+            vm.prank(oracle);
+            pool.setPrice(address(weth), WETH_PRICE, newPrice);
+            _fund(usd, attacker, 0);
+            vm.prank(attacker);
+            uint256 back = pool.swap(address(usd), address(weth), got, 0, attacker);
+            assertLe(back, capital);
+        }
+    }
+
+    /// Lowering the fee lowers the step cap with it, live.
+    function test_M7_3_TheStepCapFollowsTheFee() public {
+        pool.setFee(1000);
+        assertEq(pool.priceStepCapBps(), DEVIATION);
+        pool.setMaxPriceDeviation(300);
+        assertEq(pool.priceStepCapBps(), 300, "deviation below the fee wins");
+        pool.setFee(30);
+        assertEq(pool.priceStepCapBps(), 30, "fee below the deviation wins");
+    }
+
+    // ----------------------------------- M7-4: compare-and-set on the price
+
+    /// A price-keeper fed a false on-chain price by its RPC plans its step from
+    /// that figure. The step only lands if the figure is the real one.
+    function test_M7_4_SetPriceRefusesAStepPlannedFromTheWrongPrice() public {
+        pool.setFee(DEVIATION);
+        // The RPC lied: "the price is 3498", so the keeper "steps down" toward a
+        // 3180 target — which on the real 3180 price is a 10% cut AWAY from it.
+        uint256 lied = 3498e18;
+        vm.prank(oracle);
+        vm.expectRevert(abi.encodeWithSelector(SwapPool.PriceChanged.selector, address(weth), lied, WETH_PRICE));
+        pool.setPrice(address(weth), lied, 3148_2e17); // "-10%" from the lie
+
+        (,, uint256 price,) = _info(address(weth));
+        assertEq(price, WETH_PRICE, "nothing moved");
+        assertEq(pool.lastPriceUpdate(address(weth)), 0, "and the cooldown was not spent");
+    }
+
+    /// A step planned before someone else's update is stale, and refused.
+    function test_M7_4_AStepPlannedBeforeAnotherUpdateIsRefused() public {
+        pool.setFee(DEVIATION);
+        vm.prank(oracle);
+        pool.setPrice(address(weth), WETH_PRICE, 3300e18);
+        vm.warp(block.timestamp + pool.minPriceUpdateInterval());
+        vm.prank(oracle);
+        vm.expectRevert(abi.encodeWithSelector(SwapPool.PriceChanged.selector, address(weth), WETH_PRICE, 3300e18));
+        pool.setPrice(address(weth), WETH_PRICE, 3400e18);
+    }
 }

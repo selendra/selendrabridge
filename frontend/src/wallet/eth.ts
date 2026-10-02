@@ -305,6 +305,45 @@ export function bridgeDecimalsFromUnit(localDecimals: number, unit: bigint): num
 }
 
 /**
+ * The amount of the bridged stable the DESTINATION router will swap, given the
+ * source router's stable output in SOURCE-local units (audit round 7, M7-7b).
+ *
+ * Exactly the router's integer path: `swapAndBridge` bridges only whole source
+ * bridge units (`stableOut - stableOut % srcUnit`, the dust goes back), the wire
+ * amount is `stableOut / srcUnit`, and `_settle` swaps
+ * `gate.toLocalAmount(stable, wire) = wire * dstUnit` on the destination. Each
+ * unit is that gate's `bridgeUnit(stable)` = 10^(localDecimals - bridgeDecimals).
+ * Quoting leg 2 with the source-local figure is off by 10^Δ whenever the two
+ * stables' local decimals differ — and so is the `finalMinOut` signed into the id.
+ *
+ * `null` when either unit is missing or non-positive: an unknown scale must
+ * never be guessed as 1.
+ */
+export function stableAtDestination(
+  srcLocal: bigint,
+  srcUnit: bigint | null,
+  dstUnit: bigint | null
+): bigint | null {
+  if (srcUnit == null || dstUnit == null || srcUnit <= 0n || dstUnit <= 0n || srcLocal < 0n) return null;
+  return (srcLocal / srcUnit) * dstUnit;
+}
+
+/**
+ * `quote` less `bps` basis points, or `null` when there is no usable quote.
+ *
+ * M7-7a: a missing quote used to become `0n` here, and a floor of 0 was signed
+ * into the submissionId — a destination swap that can never fail on price, run
+ * by a permissionless `finalize`. A caller gets `null` instead and must refuse.
+ * A floor that rounds to 0 is refused the same way.
+ */
+export function slippageFloor(quote: bigint | null, bps: number): bigint | null {
+  if (quote == null || quote <= 0n) return null;
+  if (!Number.isInteger(bps) || bps < 0 || bps >= 10000) return null;
+  const floor = (quote * BigInt(10000 - bps)) / 10000n;
+  return floor > 0n ? floor : null;
+}
+
+/**
  * The bridge decimals a gate would pay `debridgeId` out in, or `null` when they
  * cannot be established.
  *

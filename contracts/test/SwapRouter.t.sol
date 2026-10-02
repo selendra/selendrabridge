@@ -626,7 +626,7 @@ contract SwapRouterTest is Test {
         // And the delivery still completes once the reserve is back (the pool's
         // price went stale over the four days, so the oracle refreshes it too).
         _seed(poolB, tt, 1_000_000e18);
-        poolB.setPrice(address(tt), TT_PRICE);
+        poolB.setPrice(address(tt), TT_PRICE, TT_PRICE);
         vm.prank(address(0xDEAD));
         routerB.finalize(
             leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
@@ -653,7 +653,7 @@ contract SwapRouterTest is Test {
 
         // The owner mistakes the whole balance for dust.
         routerB.scheduleStableRescue(leg.amount, address(this));
-        (uint256 amt, address to, uint256 readyAt,) = routerB.pendingStableRescue();
+        (uint256 amt, address to, uint256 readyAt,,,) = routerB.pendingStableRescue();
         assertEq(amt, leg.amount);
         assertEq(to, address(this));
         assertEq(readyAt, block.timestamp + 48 hours);
@@ -710,7 +710,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         usdB.mint(address(routerB), 5e6);
         routerB.scheduleStableRescue(5e6, address(this));
-        (,, uint256 readyAt,) = routerB.pendingStableRescue();
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
 
         // A fat transfer is claimed into the router during the delay. Nobody has
         // called `finalize`, so `owedStable` still knows nothing about it — the
@@ -734,7 +734,7 @@ contract SwapRouterTest is Test {
         // impossible for ever. (The pool's price aged past `maxPriceAge` over the
         // two days of delay, so the oracle refreshes it first, exactly as the
         // keeper would.)
-        poolB.setPrice(address(tt), TT_PRICE);
+        poolB.setPrice(address(tt), TT_PRICE, TT_PRICE);
         vm.prank(address(0xDEAD));
         routerB.finalize(
             leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
@@ -746,7 +746,7 @@ contract SwapRouterTest is Test {
         vm.chainId(CHAIN_B);
         usdB.mint(address(routerB), 7e6); // genuine dust
         routerB.scheduleStableRescue(7e6, address(this));
-        (,, uint256 readyAt,) = routerB.pendingStableRescue();
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
 
         vm.warp(readyAt + routerB.STABLE_RESCUE_WINDOW() + 1);
         vm.expectRevert(abi.encodeWithSelector(SwapRouter.StableRescueExpired.selector, readyAt));
@@ -757,7 +757,7 @@ contract SwapRouterTest is Test {
         vm.warp(block.timestamp + routerB.STABLE_RESCUE_DELAY());
         routerB.executeStableRescue();
         assertEq(usdB.balanceOf(address(routerB)), 0, "dust must be swept");
-        (,, uint256 cleared,) = routerB.pendingStableRescue();
+        (,, uint256 cleared,,,) = routerB.pendingStableRescue();
         assertEq(cleared, 0, "schedule must be consumed");
 
         vm.expectRevert(SwapRouter.StableRescueNotScheduled.selector);
@@ -778,7 +778,7 @@ contract SwapRouterTest is Test {
 
         vm.prank(g);
         routerB.cancelStableRescue();
-        (,, uint256 readyAt,) = routerB.pendingStableRescue();
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
         assertEq(readyAt, 0, "cancel must clear the schedule");
 
         vm.expectRevert(SwapRouter.StableRescueNotScheduled.selector);
@@ -1125,5 +1125,141 @@ contract SwapRouterTest is Test {
         assertGt(cheapest, 0, "no gas level deferred");
         emit log_named_uint("cheapest successful finalize (blocked path), gas", cheapest);
         assertGe(cheapest, routerB.MIN_DELIVER_GAS(), "deferred below the floor");
+    }
+
+    // ------------------------------------------------------------------
+    // M7-2: the stable rescue is capped by WHICH funds, not just an amount
+    // ------------------------------------------------------------------
+
+    /// `_sourceLeg` for an arbitrary sender, receiver and source nonce.
+    function _legFor(address sender, address rx, uint256 amountIn, uint256 nonce)
+        internal
+        returns (Leg memory leg)
+    {
+        vm.chainId(CHAIN_A);
+        weth.mint(sender, amountIn);
+        vm.startPrank(sender);
+        weth.approve(address(routerA), amountIn);
+        leg.id = routerA.swapAndBridge(address(weth), amountIn, 0, CHAIN_B, address(tt), rx, 0);
+        vm.stopPrank();
+
+        leg.debridgeId = BridgeHash.getDebridgeId(CHAIN_A, address(usdA));
+        leg.amount = poolA.quote(address(weth), address(usdA), amountIn);
+        leg.nonce = nonce;
+        leg.receiver = abi.encodePacked(address(routerB));
+        leg.nativeSender = abi.encodePacked(address(routerA));
+        leg.autoParams = abi.encode(
+            Gate.AutoParamsTo({
+                executionFee: 0,
+                flags: 0,
+                fallbackAddress: abi.encodePacked(rx),
+                data: abi.encode(address(tt), rx, uint256(0))
+            })
+        );
+        bytes32 rebuilt = gateA.computeSubmissionId(
+            leg.debridgeId, leg.amount, 6, CHAIN_A, CHAIN_B, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender
+        );
+        assertEq(leg.id, rebuilt, "source id mismatch");
+    }
+
+    /// A keeper's plain `Gate.claim` straight into routerB — no finalize.
+    function _keeperClaim(Leg memory leg) internal {
+        vm.chainId(CHAIN_B);
+        gateB.claim(
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, _sign(v1pk, leg.id)
+        );
+    }
+
+    /// THE M7-2 PoC. The owner's own transfer is the bait: claimed into the
+    /// router but not finalized, it reads as free, so a rescue of its size can be
+    /// announced. The owner then finalizes the bait back out to themselves, and a
+    /// victim's delivery is claimed in after the notice. Before the fix the
+    /// matured sweep took the victim's stable (the snapshot was a NUMBER, and the
+    /// balance had been refilled to it); the victim's finalize then deferred for
+    /// ever with the Gate showing the transfer executed.
+    function test_M7_2_BaitedRescueCannotSweepALaterVictim() public {
+        address ownerRx = address(0x0B0B0);
+        address victim = address(0x71C71);
+
+        // 1. Bait: the owner's own swap-and-bridge, claimed, not finalized.
+        Leg memory bait = _legFor(address(this), ownerRx, 1e18, 0);
+        _keeperClaim(bait);
+        assertEq(usdB.balanceOf(address(routerB)), bait.amount);
+
+        // 2. The rescue is announced for exactly the bait.
+        routerB.scheduleStableRescue(bait.amount, address(this));
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
+
+        // 3. The owner takes the bait back out as TT.
+        _finalizeAs(address(this), bait);
+        assertEq(tt.balanceOf(ownerRx), 1590e18, "bait settled to the owner");
+        assertEq(routerB.stableSettledOut(), bait.amount, "the settlement debits the cap");
+
+        // 4. A victim's transfer lands after the notice; the keeper only claims.
+        Leg memory v = _legFor(user, victim, 1e18, 1);
+        _keeperClaim(v);
+        assertEq(usdB.balanceOf(address(routerB)), v.amount, "balance refilled by the victim");
+        assertEq(routerB.owedStable(), 0, "and the victim is invisible to owedStable");
+
+        // 5. The matured sweep finds NOTHING it may take.
+        vm.warp(readyAt);
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.RescueWouldTakeOwedFunds.selector, bait.amount, 0));
+        routerB.executeStableRescue();
+
+        // 6. The victim is still paid in TT (the oracle refreshes the aged price).
+        poolB.setPrice(address(tt), TT_PRICE, TT_PRICE);
+        _finalizeAs(address(0xDEAD), v);
+        assertEq(tt.balanceOf(victim), 1590e18, "victim paid");
+        assertEq(usdB.balanceOf(address(routerB)), 0);
+    }
+
+    /// Any settlement inside the window debits the cap, honest or not: stable
+    /// that counted as free at the notice and has left since can never be
+    /// replaced by a later arrival.
+    function test_M7_2_ARescueIsDebitedByEverySettlementSinceTheNotice() public {
+        usdB.mint(address(routerB), 5e6); // genuine dust
+        Leg memory a = _legFor(user, finalReceiver, 1e18, 0);
+        _keeperClaim(a); // claimed, unfinalized: counted free at the notice
+        vm.chainId(CHAIN_B);
+        routerB.scheduleStableRescue(5e6, address(this));
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
+
+        // Honest settlement of `a` inside the window, then another arrival.
+        _finalizeAs(address(0xDEAD), a);
+        Leg memory b = _legFor(user, finalReceiver, 1e18, 1);
+        _keeperClaim(b);
+
+        vm.warp(readyAt);
+        // freeAtSchedule = 5e6 + a.amount, minus a.amount settled since = 5e6.
+        uint256 before = usdB.balanceOf(address(this));
+        routerB.executeStableRescue();
+        assertEq(usdB.balanceOf(address(this)), before + 5e6, "only the dust");
+        assertEq(usdB.balanceOf(address(routerB)), b.amount, "b untouched");
+    }
+
+    /// The debit is not over-broad: a transfer that was already DEFERRED (owed)
+    /// when the notice was filed was never counted free, so settling it during
+    /// the window does not shrink the dust sweep.
+    function test_M7_2_SettlingADebtOlderThanTheNoticeDoesNotDebit() public {
+        Leg memory leg = _claimedAndBlocked();
+        _finalizeAs(address(0xDEAD), leg); // defers: owed
+        assertEq(routerB.owedStable(), leg.amount);
+
+        usdB.mint(address(routerB), 5e6);
+        vm.warp(block.timestamp + 1);
+        routerB.scheduleStableRescue(5e6, address(this));
+        (,, uint256 readyAt,,,) = routerB.pendingStableRescue();
+
+        // Reserve back; the owed transfer settles inside the window.
+        _seed(poolB, tt, 1_000_000e18);
+        _finalizeAs(address(0xDEAD), leg);
+        assertTrue(routerB.finalized(leg.id));
+        assertEq(routerB.stableSettledOut(), 0, "a pre-notice debt is not a debit");
+
+        vm.warp(readyAt);
+        uint256 before = usdB.balanceOf(address(this));
+        routerB.executeStableRescue();
+        assertEq(usdB.balanceOf(address(this)), before + 5e6, "dust still sweepable");
     }
 }

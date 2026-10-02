@@ -360,21 +360,9 @@ fn agreed_aged_block(found: &[Option<u64>]) -> Option<u64> {
     majority_floor(found).flatten()
 }
 
-/// The largest value that a STRICT MAJORITY of `values` are at or above — the
-/// `(n/2 + 1)`-th largest. `None` only for an empty slice.
-///
-/// Used where a value is safe in one direction only (L7-12): a minority can
-/// neither raise the result above what a majority reported nor drag it down.
-/// For one value it is that value; for two, the smaller (both must vouch); for
-/// three, the median.
-fn majority_floor<T: Ord + Copy>(values: &[T]) -> Option<T> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut v = values.to_vec();
-    v.sort_unstable_by(|a, b| b.cmp(a));
-    Some(v[values.len() / 2])
-}
+// `majority_floor` moved to `provider` (audit round 7, M7-8): the scan loop's
+// head now uses the same rule.
+use crate::provider::majority_floor;
 
 struct DestinationState {
     executed: bool,

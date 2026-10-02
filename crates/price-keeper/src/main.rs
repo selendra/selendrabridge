@@ -10,6 +10,12 @@
 //! * walks the on-chain price toward it in capped steps when the two differ
 //!   (a config change), never breaking the pool's cooldown or step cap.
 //!
+//! Every step is a compare-and-set against the price it was planned from
+//! (`setPrice(token, expectedOld, newPrice)`, audit 2026-10-02 M7-4), so an RPC
+//! endpoint that lies about the on-chain price can make a step revert but never
+//! land somewhere the oracle did not mean. Steps are at most the pool's swap fee
+//! (M7-3), which the pool also enforces: a fee-0 pool is refreshed, never moved.
+//!
 //! It does not discover prices. Re-asserting a static figure defeats the point
 //! of the staleness guard for a token with a real market — run a real feed for
 //! those. The decision itself is `swap_math::refresh::plan`, shared with the
@@ -159,11 +165,21 @@ async fn tick<P: Provider>(
         error!(chain_id, pool_oracle = %oracle, us = %me, "we are not this pool's oracle; nothing can be refreshed");
         return Ok(TickReport::default());
     }
+    // A pool from before M7-3/M7-4 has neither the fee-bounded step nor the
+    // compare-and-set `setPrice` this keeper sends. Say so plainly rather than
+    // fail every send with an opaque revert.
+    if let Err(e) = pool.priceStepCapBps().call().await {
+        anyhow::bail!(
+            "pool has no priceStepCapBps() — it predates the 2026-10-02 M7-3/M7-4 fix and \
+             cannot take a compare-and-set setPrice; redeploy it ({e})"
+        );
+    }
     let pool_state = PoolState {
         stable: pool.stable().call().await?,
         max_age: to_i64(pool.maxPriceAge().call().await?)?,
         min_interval: to_i64(pool.minPriceUpdateInterval().call().await?)?,
         deviation: pool.maxPriceDeviationBps().call().await?,
+        fee: pool.feeBps().call().await?,
         now: provider
             .get_block_by_number(BlockNumberOrTag::Latest)
             .await?
@@ -213,6 +229,7 @@ struct PoolState {
     max_age: i64,
     min_interval: i64,
     deviation: u16,
+    fee: u16,
     now: i64,
 }
 
@@ -248,7 +265,15 @@ async fn refresh_token<P: Provider>(
         max_age: (ps.max_age > 0).then_some(ps.max_age),
         min_update_interval: ps.min_interval,
         max_deviation_bps: ps.deviation,
+        fee_bps: ps.fee,
     };
+    if state.step_cap_bps() == 0 && price != target {
+        warn!(
+            chain_id, %symbol, on_chain = price, target,
+            "pool fee is 0, so the pool refuses any price MOVE (M7-3); only refreshing the \
+             current price — setFee to let it track the target"
+        );
+    }
     match plan(&state, target, margin) {
         Plan::Idle => {
             debug!(chain_id, %symbol, age = now - state.price_set_at, "fresh");
@@ -258,11 +283,12 @@ async fn refresh_token<P: Provider>(
             info!(chain_id, %symbol, wait_secs = until - now, "reprice due but in cooldown");
             Ok(TokenOutcome::Wait { secs: until - now })
         }
-        Plan::Set { price: next, step } => {
+        Plan::Set { from, price: next, step } => {
             if !pending.may_submit(provider, chain_id, symbol, token).await {
                 return Ok(TokenOutcome::InFlight);
             }
-            let sent = pool.setPrice(token, U256::from(next)).send().await?;
+            let (expected_old, new_price) = set_price_args(from, next);
+            let sent = pool.setPrice(token, expected_old, new_price).send().await?;
             let hash = *sent.tx_hash();
             let receipt = match sent.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await {
                 Ok(r) => r,
@@ -287,6 +313,15 @@ async fn refresh_token<P: Provider>(
             Ok(TokenOutcome::Refreshed)
         }
     }
+}
+
+/// `setPrice`'s `(expectedOld, newPrice)` for a planned step.
+///
+/// `expectedOld` is the price the plan was computed FROM — the one this tick
+/// read — never anything re-read or recomputed (M7-4). If the endpoint lied about
+/// it, the pool's compare-and-set refuses the step; that is the whole point.
+fn set_price_args(from: u128, next: u128) -> (U256, U256) {
+    (U256::from(from), U256::from(next))
 }
 
 /// What became of a remembered `setPrice`.
@@ -383,10 +418,12 @@ mod tests {
     /// Queue the pool-wide reads one tick makes, in order.
     fn pool_reads(a: &Asserter, me: Address) {
         a.push_success(&word(me)); // oracle
+        a.push_success(&word(1_000u16)); // priceStepCapBps (the M7 pool probe)
         a.push_success(&word(Address::repeat_byte(0x5)));
         a.push_success(&word(U256::from(86_400))); // maxPriceAge
         a.push_success(&word(U256::from(60))); // minPriceUpdateInterval
         a.push_success(&word(1_000u16)); // maxPriceDeviationBps
+        a.push_success(&word(1_000u16)); // feeBps
         let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
         block.header.inner.timestamp = NOW as u64;
         a.push_success(&block);
@@ -443,6 +480,44 @@ mod tests {
         assert_eq!(report.in_flight, 1, "no second setPrice while the first may still land");
         assert_eq!((report.refreshed, report.failed), (0, 0), "nothing was sent: {report:?}");
         assert!(pending.0.contains_key(&token), "still remembered");
+    }
+
+    /// M7-4, end to end through the keeper's own decision: a tick that READ a
+    /// lied price sends exactly that lie as `expectedOld`, so the pool's
+    /// compare-and-set refuses it. Nothing is re-derived between plan and send.
+    #[test]
+    fn r7_a_lied_on_chain_price_is_sent_as_the_expected_old_price() {
+        let lied: u128 = 3_600 * 10u128.pow(18);
+        let state = PriceState {
+            now: NOW,
+            price: lied,
+            price_set_at: NOW - 90_000,
+            last_price_update: NOW - 90_000,
+            max_age: Some(86_400),
+            min_update_interval: 60,
+            max_deviation_bps: 1_000,
+            fee_bps: 1_000,
+        };
+        let real = U256::from(3_180u128 * 10u128.pow(18));
+        let Plan::Set { from, price, .. } = plan(&state, 3_180 * 10u128.pow(18), 3_600) else { panic!("moves") };
+        let (expected_old, new_price) = set_price_args(from, price);
+        assert_eq!(expected_old, U256::from(lied), "the lie is what the CAS is asked to match");
+        assert_ne!(expected_old, real, "so on the real pool the step reverts PriceChanged");
+        assert_eq!(new_price, U256::from(3_240u128 * 10u128.pow(18)));
+    }
+
+    /// A pool from before M7-3/M7-4 has no `priceStepCapBps`; the tick names
+    /// the problem instead of sending a setPrice it cannot take.
+    #[tokio::test]
+    async fn a_pre_m7_pool_is_refused_with_a_reason() {
+        let me = Address::repeat_byte(0xAA);
+        let a = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+        let pool = SwapPool::new(Address::repeat_byte(0x9), &provider);
+        a.push_success(&word(me)); // oracle
+        a.push_failure_msg("execution reverted"); // priceStepCapBps: no such function
+        let err = tick(1, &provider, &pool, me, &[], 3_600, &mut PendingPrices::default()).await.unwrap_err();
+        assert!(err.to_string().contains("redeploy"), "{err}");
     }
 
     #[test]

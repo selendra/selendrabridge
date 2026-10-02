@@ -163,6 +163,11 @@ impl Token {
     /// closing: `run.sh` never emits `bridge_decimals`, and
     /// `docker/configs/chains.json` omits it, so the registry being silent is
     /// the common case rather than the odd one (shadow run, 2026-09-21).
+    ///
+    /// Priced as a chain read (audit round 7, M7-6): it may be a
+    /// `bridgeDecimalsOf` `eth_call`, and at the default cost of 1 thousands of
+    /// aliases fitted one request.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn bridge_decimals(&self, ctx: &Context<'_>) -> Option<u8> {
         let st = state(ctx);
         let token = self.address.parse::<alloy_primitives::Address>().ok();

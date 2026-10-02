@@ -24,8 +24,8 @@
 #   inbound corridor -> seal()  (gate.seal, default true; irreversible).
 # Anything the deployer cannot send (a gate it no longer owns, a corridor on an
 # already-sealed gate) is written to `governance_calls` in the output file for
-# the owner to execute — including the scheduleGovernance step a sealed gate
-# needs first. Production asserts isSealed and every supportedChain at the end.
+# the owner to execute — including the typed schedule step a sealed gate needs
+# first (scheduleSetLocalToken / scheduleSetBridgeDecimals). Production asserts isSealed and every supportedChain at the end.
 #
 # Writes every address it produced to `output.file`, and (unless
 # --no-config-update) patches gate/token/pool addresses straight into the
@@ -462,10 +462,10 @@ peers_of() {  # chain_id -> every chain id its gate may `send` to
 }
 # setLocalToken is WRITE-ONCE (in-flight claims bind only the debridgeId, so
 # repointing a live corridor would release the wrong asset): an existing mapping
-# is left alone. On a SEALED gate a new corridor needs scheduleGovernance first,
+# is left alone. On a SEALED gate a new corridor needs scheduleSetLocalToken first,
 # so both calls are emitted for the owner, in order.
 register_corridor() {  # chain_id debridgeId localToken note
-  local cid="$1" did="$2" tok="$3" note="$4" cur data aid
+  local cid="$1" did="$2" tok="$3" note="$4" cur data
   cur="$(cast call "${GATE[$cid]}" 'tokenOf(bytes32)(address)' "$did" --rpc-url "${RPC[$cid]}" 2>/dev/null || echo "")"
   if [[ -n "$cur" && ! "$cur" =~ ^0x0{40}$ ]]; then info "chain $cid: $note already registered ($cur)"; return; fi
   data="$(cast calldata 'setLocalToken(bytes32,address)' "$did" "$tok")"
@@ -474,8 +474,9 @@ register_corridor() {  # chain_id debridgeId localToken note
     info "chain $cid: $note  ($did)"
   else
     if gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
-      aid="$(cast call "${GATE[$cid]}" 'setLocalTokenActionId(bytes32,address)(bytes32)' "$did" "$tok" --rpc-url "${RPC[$cid]}")"
-      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleGovernance(bytes32)' "$aid")" "1/2 schedule: $note (sealed gate; wait GOVERNANCE_DELAY, then 2/2 within SCHEDULE_GRACE)"
+      # Typed schedule (M7-1): emits SetLocalTokenScheduled with the debridgeId
+      # and token in clear, so observers can review the corridor for 48 h.
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleSetLocalToken(bytes32,address)' "$did" "$tok")" "1/2 schedule: $note (sealed gate; wait GOVERNANCE_DELAY, then 2/2 within SCHEDULE_GRACE)"
       gov_call "$cid" "${GATE[$cid]}" "$data" "2/2 $note"
     else
       gov_call "$cid" "${GATE[$cid]}" "$data" "$note"
@@ -501,7 +502,7 @@ done
 
 # --- bridge decimals on every gate (write-once; must precede setLocalToken) --
 register_bridge_decimals() {  # chain_id sym
-  local cid="$1" sym="$2" tok="${TOKEN[$2|$1]}" want="${BRIDGE_DEC[$2]}" cur isset curdec data aid
+  local cid="$1" sym="$2" tok="${TOKEN[$2|$1]}" want="${BRIDGE_DEC[$2]}" cur isset curdec data
   cur="$(cast_read "${RPC[$cid]}" "${GATE[$cid]}" 'bridgeDecimalsOf(address)(bool,uint8,uint8)' "$tok" | tr '\n' ' ')" || cur=""
   read -r isset curdec _ <<<"$cur"
   if [[ "$isset" == "true" ]]; then
@@ -514,8 +515,7 @@ register_bridge_decimals() {  # chain_id sym
     info "chain $cid: $sym bridge decimals = $want"
   else
     if gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
-      aid="$(cast call "${GATE[$cid]}" 'setBridgeDecimalsActionId(address,uint8)(bytes32)' "$tok" "$want" --rpc-url "${RPC[$cid]}")"
-      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleGovernance(bytes32)' "$aid")" "1/2 schedule: $sym bridge decimals $want (sealed gate)"
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleSetBridgeDecimals(address,uint8)' "$tok" "$want")" "1/2 schedule: $sym bridge decimals $want (sealed gate; wait GOVERNANCE_DELAY, then 2/2 within SCHEDULE_GRACE)"
       gov_call "$cid" "${GATE[$cid]}" "$data" "2/2 $sym bridge decimals $want — BEFORE its corridors"
     else
       gov_call "$cid" "${GATE[$cid]}" "$data" "$sym bridge decimals $want — BEFORE its corridors"
@@ -542,6 +542,46 @@ for sym in "${SYMS[@]:-}"; do
       did="$(debridge_id "$ocid" "${TOKEN[$sym|$ocid]}")"
       register_corridor "$cid" "$did" "${TOKEN[$sym|$cid]}" "register $sym inbound from chain $ocid"
     done
+  done
+done
+
+# --- minimum send per asset (audit 2026-10-02, M7-12) -----------------------
+#
+# `assets[].min_send` (optional, human units as a string, e.g. "5" or "0.5"):
+# the smallest amount `send` accepts for that asset on EVERY chain, so a 1-unit
+# transfer cannot make the keeper pay a full claim on an expensive destination.
+# The gate stores it in LOCAL units, so it is scaled per chain by that token's
+# own decimals(). Unset leaves the gate's value alone (0 on a new gate = no
+# minimum). setMinSendAmount is instant even on a sealed gate — it only
+# restricts new sends — so a gate we do not own gets a plain governance_calls
+# entry, with no schedule step.
+scaled_dec() {  # "12.5" decimals -> base units; refuses precision below 10^-decimals
+  local v="$1" dec="$2" whole frac out
+  [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "min_send must be a plain decimal number (quote it in JSON): $v"
+  whole="${v%%.*}"; frac=""; [[ "$v" == *.* ]] && frac="${v#*.}"
+  (( ${#frac} <= dec )) || die "min_send $v has more fractional digits than the token's $dec decimals"
+  while (( ${#frac} < dec )); do frac+="0"; done
+  out="$(sed 's/^0*//' <<<"$whole$frac")"; printf '%s\n' "${out:-0}"
+}
+for sym in "${SYMS[@]:-}"; do
+  [[ -z "${sym:-}" ]] && continue
+  min_h="$(jr ".assets[] | select(.symbol == \"$sym\") | .min_send")"
+  [[ -n "$min_h" ]] || continue
+  say "setting $sym minimum send ($min_h)"
+  for cid in ${ASSET_CHAINS[$sym]:-}; do
+    tok="${TOKEN[$sym|$cid]}"
+    d="$(cast_read "${RPC[$cid]}" "$tok" 'decimals()(uint8)' | awk '{print $1}')" || d=""
+    [[ "$d" =~ ^[0-9]+$ ]] || die "$sym on chain $cid: decimals() unreadable at $tok"
+    want="$(scaled_dec "$min_h" "$d")"
+    cur="$(cast_read "${RPC[$cid]}" "${GATE[$cid]}" 'minSendAmount(address)(uint256)' "$tok" | awk '{print $1}')" || cur=""
+    if [[ "$cur" == "$want" ]]; then info "chain $cid: $sym minimum send already $want"; continue; fi
+    if gate_owned_by_us "${GATE[$cid]}" "${RPC[$cid]}"; then
+      csend "${GATE[$cid]}" 'setMinSendAmount(address,uint256)' "$tok" "$want" --rpc-url "${RPC[$cid]}"
+      info "chain $cid: $sym minimum send = $want (local units)"
+    else
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'setMinSendAmount(address,uint256)' "$tok" "$want")" "$sym minimum send $min_h = $want local units (instant)"
+      warn "chain $cid: not the gate owner — setMinSendAmount($sym) written to governance_calls"
+    fi
   done
 done
 
@@ -573,6 +613,14 @@ done
 #            own unrestricted-mint tokens. Local bring-up only.
 SWAP_POOL=""; SWAP_JSON='null'; SWAP_POOLS='[]'
 DEV_BPS="$(jr '.swap.deviation_bps')"; DEV_BPS="${DEV_BPS:-1000}"
+# The pool's swap fee, which is ALSO the largest move one setPrice may make
+# (audit 2026-10-02, M7-3: a step no larger than the fee cannot be sandwiched
+# for profit). A fee of 0 means the oracle can refresh prices but never move
+# them, so the default is non-zero. Size it with the price-keeper's cadence:
+# the pool tracks at most one fee-sized step per minPriceUpdateInterval.
+FEE_BPS="$(jr '.swap.fee_bps')"; FEE_BPS="${FEE_BPS:-30}"
+(( FEE_BPS >= 0 && FEE_BPS <= 1000 )) || die "swap.fee_bps=$FEE_BPS: SwapPool.setFee accepts 0..1000"
+(( FEE_BPS > 0 )) || warn "swap.fee_bps=0: the EVM pools' prices can be refreshed but never moved (M7-3)"
 if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length')" != "0" ]]; then
   say "deploying SwapPools (one per chain, over the bridged assets)"
   for cid in $(j '.swap.pools[].chain_id'); do
@@ -606,11 +654,20 @@ if [[ "$(j '.swap.enabled')" == "true" ]] && [[ "$(j '[.swap.pools[]?] | length'
       from_block="${from_block:-0}"
       [[ "$from_block" == "0" ]] && warn "chain $cid: reused pool $pool has no recorded from_block — set swap.pools[].from_block to its deploy height, or the Swap view scans from genesis"
       info "chain $cid reusing pool $pool (listings from block $from_block)"
+      # A pool from before 2026-10-02 has neither the fee-bounded price step
+      # (M7-3) nor the compare-and-set setPrice (M7-4); the current
+      # price-keeper refuses it. Its fee is the owner's to set, not ours.
+      cast call "$pool" 'priceStepCapBps()(uint16)' --rpc-url "${RPC[$cid]}" >/dev/null 2>&1 \
+        || warn "chain $cid: reused pool $pool predates M7-3/M7-4 (no priceStepCapBps) — redeploy it; the price-keeper will not drive it"
     else
       from_block="${FLOOR[$cid]}"
       pool="$(fc src/SwapPool.sol:SwapPool "${RPC[$cid]}" --constructor-args "$stable_tok" "$DEV_BPS")"
       [[ "$pool" =~ ^0x ]] || die "SwapPool deploy failed on chain $cid"
       info "chain $cid pool=$pool (hub $stable_sym $stable_tok)"
+      if (( FEE_BPS > 0 )); then
+        csend "$pool" 'setFee(uint16)' "$FEE_BPS" --rpc-url "${RPC[$cid]}"
+        info "  fee $FEE_BPS bps (also the per-update price step cap, M7-3)"
+      fi
     fi
 
     listed="$(jq -c -n --arg s "$stable_sym" --arg a "$stable_tok" '[{symbol:$s, address:$a, price:"1"}]')"
@@ -1072,7 +1129,7 @@ fi
 
 # --- seal (H-1) — the LAST wiring step ---------------------------------------
 #
-# Irreversible. Afterwards every NEW corridor is scheduleGovernance + 48h, which
+# Irreversible. Afterwards every NEW corridor is scheduleSetLocalToken + 48h, which
 # is what stops a stolen owner key from registering a worthless token behind a
 # real corridor and draining the pot in one block. Sits after the Solana leg
 # because that leg registers the Solana-native return corridors on the EVM gates.

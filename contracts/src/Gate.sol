@@ -158,7 +158,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         Zero means "not scheduled", and {_consumeGovernance} treats zero as
     ///         a refusal — so a delayed action can never run without first sitting
     ///         out {GOVERNANCE_DELAY} in public view.
-    /// @dev    Keyed by the action ids {addValidatorActionId} /
+    /// @dev    Keyed by the action ids {addValidatorActionId} / {setGuardianActionId} /
     ///         {lowerThresholdActionId} / {setLocalTokenActionId} derive, so a
     ///         schedule authorises exactly one concrete change (this validator,
     ///         that threshold, this corridor) rather than a blanket right.
@@ -210,7 +210,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     // --- corridor registry (appended in the H-1 / M-3 revision) ---
 
     /// @notice One-way flag: once set, registering a NEW corridor via
-    ///         {setLocalToken} goes through {scheduleGovernance} + {GOVERNANCE_DELAY}
+    ///         {setLocalToken} goes through {scheduleSetLocalToken} + {GOVERNANCE_DELAY}
     ///         like every other power-granting owner action.
     ///
     /// @dev    WHY A SETUP PHASE. A gate starts with an empty registry, and an
@@ -225,7 +225,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         between an owner key and the vault (finding H-1): a fake asset on
     ///         chain A, honestly attested by validators, mapped onto this gate's
     ///         USDC, is a full drain in one block. With the delay, observers see
-    ///         `GovernanceScheduled(setLocalTokenActionId(...))` and have
+    ///         {SetLocalTokenScheduled} (debridgeId and token in clear) and have
     ///         {GOVERNANCE_DELAY} to verify the SOURCE asset behind the debridgeId
     ///         — and the guardian can {cancelScheduledGovernance} it. An owner who
     ///         could un-seal would have that delay only nominally.
@@ -322,15 +322,52 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         `__gap` like every field above.
     mapping(address implementation => bytes32 dataHash) public upgradeDataHash;
 
+    /// @notice The smallest LOCAL amount of `token` that {send} accepts. Zero
+    ///         (the default, and what every existing token reads after the
+    ///         upgrade) means no minimum beyond `amount != 0`.
+    ///
+    /// @dev    Audit 2026-10-02, M7-12. Every `send` costs the keeper a full
+    ///         `claim` on the destination (at that chain's gas price, possibly
+    ///         L1) and, towards Solana, non-reclaimable `executed` rent. A 1-unit
+    ///         send from a cheap chain was therefore a way to drain the keeper
+    ///         and relayer gas wallets at almost no cost to the sender.
+    ///
+    ///         LOCAL UNITS, not wire units: it is compared with `send`'s own
+    ///         `amount` argument before any conversion, it is what a user and a
+    ///         frontend reason in, and it is per gate anyway (the same asset's
+    ///         minimum is set separately on every chain, so each chain prices its
+    ///         own outbound dust in its own token's decimals).
+    ///
+    ///         INSTANT (owner-only, see {setMinSendAmount}): it can only ever
+    ///         RESTRICT new locks and grants nobody power over funds — `claim`,
+    ///         `cancel` and `refund` never read it, so in-flight transfers are
+    ///         unaffected. The worst a stolen owner key does with it is refuse new
+    ///         sends of one token, which {setSupportedChain} could already do
+    ///         instantly. Appended from `__gap` like every field above.
+    mapping(address token => uint256 minAmount) public minSendAmount;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
     ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
     ///      `supportedChain` took one each: 49 -> 47. `bridgeDecimalsOf` took
     ///      one: 47 -> 46. `setupDeadline` took one: 46 -> 45. `upgradeCodehash`
-    ///      took one: 45 -> 44. `upgradeDataHash` took one: 44 -> 43. The gap still
-    ///      ends at slot 63.)
-    uint256[43] private __gap;
+    ///      took one: 45 -> 44. `upgradeDataHash` took one: 44 -> 43.
+    ///      `minSendAmount` took one: 43 -> 42. The gap still ends at slot 63.)
+    uint256[42] private __gap;
+
+    /// @notice The longest `autoParams` {send} accepts, in raw bytes.
+    /// @dev    Audit 2026-10-02, M7-12 / H7-2 (on-chain half). Every claim and
+    ///         cancel copies `autoParams` into calldata the keeper pays for, and
+    ///         the off-chain signature store refuses records above
+    ///         `MAX_AUTO_PARAMS_BYTES` (32 KiB of raw bytes, crates/bridge-db) —
+    ///         so an unbounded payload both drained the keeper and produced a
+    ///         `Sent` the store could never accept. 4 KiB is far below that bound
+    ///         (the store always accepts it) and an order of magnitude above the
+    ///         largest real payload: SwapRouter's swap-and-bridge `AutoParamsTo`
+    ///         is about 320 bytes. A constant, so the bound the off-chain side
+    ///         relies on cannot be raised without an upgrade.
+    uint256 public constant MAX_AUTO_PARAMS_LENGTH = 4096;
 
     /// @param amount the WIRE amount, in the asset's bridge decimals (see
     ///        {BridgeDecimals}) — what the submissionId commits to, not the local
@@ -406,10 +443,35 @@ contract Gate is Initializable, UUPSUpgradeable {
         address indexed implementation, uint256 readyAt, bytes32 indexed dataHash, bytes data
     );
     event UpgradeCancelled(address indexed implementation);
-    /// @notice A validator addition or threshold decrease entered the queue.
-    ///         `readyAt` is when it becomes executable — the public warning.
+    /// @notice A delayed governance action entered the queue. `readyAt` is when
+    ///         it becomes executable — the public warning. Always emitted
+    ///         together with exactly one typed event below that carries the
+    ///         action's decoded parameters (audit 2026-10-02, M7-1): the id alone
+    ///         is a one-way hash and told observers nothing about WHICH corridor,
+    ///         token or validator was queued.
     event GovernanceScheduled(bytes32 indexed actionId, uint256 readyAt);
     event GovernanceCancelled(bytes32 indexed actionId);
+    /// @notice {scheduleAddValidator}: `validator` may join the set at `readyAt`.
+    event AddValidatorScheduled(bytes32 indexed actionId, address indexed validator, uint256 readyAt);
+    /// @notice {scheduleLowerThreshold}: the threshold may drop to `threshold`.
+    event LowerThresholdScheduled(bytes32 indexed actionId, uint256 threshold, uint256 readyAt);
+    /// @notice {scheduleSetLocalToken}: claims of `debridgeId` may be paid from
+    ///         this gate's `localToken` balance. Observers must check the SOURCE
+    ///         asset behind `debridgeId` (H-1).
+    event SetLocalTokenScheduled(
+        bytes32 indexed actionId, bytes32 indexed debridgeId, address indexed localToken, uint256 readyAt
+    );
+    /// @notice {scheduleSetBridgeDecimals}: `token` may be registered at wire
+    ///         scale `bridgeDecimals`. `token` had code when this was emitted.
+    event SetBridgeDecimalsScheduled(
+        bytes32 indexed actionId, address indexed token, uint8 bridgeDecimals, uint256 readyAt
+    );
+    /// @notice {scheduleSetGuardian}: the guardian may be replaced by (or, for
+    ///         the zero address, removed in favour of) `newGuardian`.
+    event SetGuardianScheduled(bytes32 indexed actionId, address indexed newGuardian, uint256 readyAt);
+    /// @notice {setMinSendAmount}: `send` of `token` now needs at least `minAmount`
+    ///         (local units).
+    event MinSendAmountSet(address indexed token, uint256 minAmount);
     /// @notice The setup phase ended: from now on every new corridor waits out
     ///         {GOVERNANCE_DELAY}. Irreversible.
     event Sealed();
@@ -491,7 +553,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///      zero is a schedule made before data was pinned: re-schedule it.
     error UpgradeDataMismatch(address implementation, bytes32 scheduled, bytes32 given);
     /// @dev a validator addition / threshold decrease was attempted without first
-    ///      going through {scheduleGovernance}
+    ///      going through a typed `schedule*` entry point (e.g. {scheduleAddValidator})
     error GovernanceNotScheduled(bytes32 actionId);
     /// @dev the scheduled governance action is still inside its {GOVERNANCE_DELAY}
     error GovernanceNotReady(bytes32 actionId, uint256 readyAt);
@@ -501,6 +563,15 @@ contract Gate is Initializable, UUPSUpgradeable {
     error ScheduleExpired(bytes32 key, uint256 readyAt);
     /// @dev {seal} was called on a gate that is already sealed
     error AlreadySealed();
+    /// @dev a corridor / wire-scale registration was scheduled for an address
+    ///      with no code (audit 2026-10-02, M7-1): there is nothing for anyone to
+    ///      review during the delay, and a CREATE2 address can be filled with
+    ///      anything after it.
+    error TokenHasNoCode(address token);
+    /// @dev `send` below the token's {minSendAmount} (M7-12)
+    error BelowMinSendAmount(uint256 amount, uint256 minAmount);
+    /// @dev `send` with `autoParams` longer than {MAX_AUTO_PARAMS_LENGTH} (M7-12)
+    error AutoParamsTooLong(uint256 length, uint256 max);
 
     /// @dev {claim} on a gate whose registry is still open. See {seal} and M-1:
     ///      funds only ever leave a gate whose corridor list is final.
@@ -819,14 +890,22 @@ contract Gate is Initializable, UUPSUpgradeable {
         pendingOwner = address(0);
     }
 
+    /// @dev Every action id is `keccak256(abi.encode(GOVERNANCE_ID_V2, <kind>,
+    ///      <params>))`. The version tag was added with the typed scheduling
+    ///      entry points (audit 2026-10-02, M7-1) so that NO schedule made
+    ///      through the old opaque `scheduleGovernance(bytes32)` survives the
+    ///      upgrade: its parameters were never published, so it must not stay
+    ///      consumable. Fail-closed, exactly like the L7-1 data pin.
+    string private constant GOVERNANCE_ID_V2 = "Gate.governance.v2";
+
     /// @notice The action id for adding `v` to the validator set.
     function addValidatorActionId(address v) public pure returns (bytes32) {
-        return keccak256(abi.encode("addValidator", v));
+        return keccak256(abi.encode(GOVERNANCE_ID_V2, "addValidator", v));
     }
 
     /// @notice The action id for lowering the threshold to `t`.
     function lowerThresholdActionId(uint256 t) public pure returns (bytes32) {
-        return keccak256(abi.encode("lowerThreshold", t));
+        return keccak256(abi.encode(GOVERNANCE_ID_V2, "lowerThreshold", t));
     }
 
     /// @notice The action id for registering `bridgeDecimals` as `token`'s wire
@@ -835,7 +914,7 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         "token Y carries 6 decimals" cannot be spent on another token or
     ///         another scale — a digit off pays every claim a power of ten wrong.
     function setBridgeDecimalsActionId(address token, uint8 bridgeDecimals) public pure returns (bytes32) {
-        return keccak256(abi.encode("setBridgeDecimals", token, bridgeDecimals));
+        return keccak256(abi.encode(GOVERNANCE_ID_V2, "setBridgeDecimals", token, bridgeDecimals));
     }
 
     /// @notice The action id for registering `localToken` as the asset behind
@@ -847,19 +926,96 @@ contract Gate is Initializable, UUPSUpgradeable {
         pure
         returns (bytes32)
     {
-        return keccak256(abi.encode("setLocalToken", debridgeId, localToken));
+        return keccak256(abi.encode(GOVERNANCE_ID_V2, "setLocalToken", debridgeId, localToken));
     }
 
-    /// @notice Queue a validator addition, threshold decrease or (after {seal})
-    ///         corridor registration for execution once {GOVERNANCE_DELAY} has
-    ///         elapsed. Build `actionId` with {addValidatorActionId} /
-    ///         {lowerThresholdActionId} / {setLocalTokenActionId} /
-    ///         {setBridgeDecimalsActionId}.
-    /// @dev    Re-scheduling RESTARTS the delay, for the same reason
-    ///         {scheduleUpgrade} does: otherwise one matured schedule would be an
-    ///         indefinitely re-usable instant-change right against that action.
-    function scheduleGovernance(bytes32 actionId) external onlyOwner {
-        uint256 readyAt = block.timestamp + GOVERNANCE_DELAY;
+    /// @notice The action id for replacing a non-zero guardian with
+    ///         `newGuardian` (the zero address: removing it) — required by
+    ///         {setGuardian} outside the setup phase.
+    function setGuardianActionId(address newGuardian) public pure returns (bytes32) {
+        return keccak256(abi.encode(GOVERNANCE_ID_V2, "setGuardian", newGuardian));
+    }
+
+    // --- typed scheduling (audit 2026-10-02, M7-1) ---------------------------
+    //
+    // There is deliberately NO `scheduleGovernance(bytes32)` any more. It took an
+    // opaque hash, so the only thing the public ever saw of a queued corridor or
+    // wire-scale change was `keccak256(...)` — not invertible, so "observers have
+    // 48 h to inspect the source asset" was true only for observers who already
+    // guessed the parameters. Every action a schedule can authorise has a typed
+    // entry point below that derives the id itself and publishes the decoded
+    // parameters; an id from anywhere else could never be consumed anyway, so a
+    // raw entry point would only ever add opaque, uncheckable noise to the queue.
+    //
+    // Re-scheduling any of them RESTARTS the delay, for the same reason
+    // {scheduleUpgrade} does: otherwise one matured schedule would be an
+    // indefinitely re-usable instant-change right against that action.
+
+    /// @notice Queue adding `v` to the validator set ({setValidator}).
+    function scheduleAddValidator(address v) external onlyOwner returns (bytes32 actionId) {
+        if (v == address(0)) revert ZeroValidator();
+        actionId = addValidatorActionId(v);
+        emit AddValidatorScheduled(actionId, v, _schedule(actionId));
+    }
+
+    /// @notice Queue lowering the threshold to exactly `t` ({setThreshold}).
+    function scheduleLowerThreshold(uint256 t) external onlyOwner returns (bytes32 actionId) {
+        if (t == 0) revert InvalidThreshold(t, validatorCount);
+        actionId = lowerThresholdActionId(t);
+        emit LowerThresholdScheduled(actionId, t, _schedule(actionId));
+    }
+
+    /// @notice Queue registering `localToken` behind `debridgeId` ({setLocalToken}
+    ///         after the setup phase).
+    /// @dev    `localToken` must already be a contract: what observers review
+    ///         during the delay must be what will pay out.
+    function scheduleSetLocalToken(bytes32 debridgeId, address localToken)
+        external
+        onlyOwner
+        returns (bytes32 actionId)
+    {
+        if (localToken == address(0)) revert ZeroAddress();
+        if (localToken.code.length == 0) revert TokenHasNoCode(localToken);
+        address current = tokenOf[debridgeId];
+        if (current != address(0)) revert LocalTokenAlreadySet(debridgeId, current);
+        actionId = setLocalTokenActionId(debridgeId, localToken);
+        emit SetLocalTokenScheduled(actionId, debridgeId, localToken, _schedule(actionId));
+    }
+
+    /// @notice Queue registering `token`'s wire scale ({setBridgeDecimals}
+    ///         after the setup phase).
+    /// @dev    `token` must already be a contract (M7-1): the PoC registered a
+    ///         CREATE2 address with no code, so the token the 48 h were meant to
+    ///         expose did not exist until the block it was used. Its `decimals()`
+    ///         is read here as well, so a scale {setBridgeDecimals} would refuse
+    ///         is refused before anyone waits 48 h for it.
+    function scheduleSetBridgeDecimals(address token, uint8 bridgeDecimals)
+        external
+        onlyOwner
+        returns (bytes32 actionId)
+    {
+        if (token == address(0)) revert ZeroAddress();
+        if (token.code.length == 0) revert TokenHasNoCode(token);
+        if (bridgeDecimalsOf[token].set) revert BridgeDecimalsAlreadySet(token);
+        uint8 localDecimals = IERC20Metadata(token).decimals();
+        if (bridgeDecimals > localDecimals || localDecimals - bridgeDecimals > 77) {
+            revert InvalidBridgeDecimals(token, bridgeDecimals, localDecimals);
+        }
+        actionId = setBridgeDecimalsActionId(token, bridgeDecimals);
+        emit SetBridgeDecimalsScheduled(actionId, token, bridgeDecimals, _schedule(actionId));
+    }
+
+    /// @notice Queue replacing the current guardian with `newGuardian`, or
+    ///         removing it (`address(0)`). See {setGuardian} for when this is
+    ///         needed; the CURRENT guardian can {cancelScheduledGovernance} it.
+    function scheduleSetGuardian(address newGuardian) external onlyOwner returns (bytes32 actionId) {
+        actionId = setGuardianActionId(newGuardian);
+        emit SetGuardianScheduled(actionId, newGuardian, _schedule(actionId));
+    }
+
+    /// @dev Start (or restart) `actionId`'s delay and emit the generic event.
+    function _schedule(bytes32 actionId) private returns (uint256 readyAt) {
+        readyAt = block.timestamp + GOVERNANCE_DELAY;
         governanceReadyAt[actionId] = readyAt;
         emit GovernanceScheduled(actionId, readyAt);
     }
@@ -1090,13 +1246,54 @@ contract Gate is Initializable, UUPSUpgradeable {
         emit SupportedChainSet(chainId, ok);
     }
 
-    /// @notice Appoint (or clear) the guardian who can trip the circuit breaker.
-    /// @dev    The guardian is a low-trust "stop button": it can pause but never
-    ///         un-pause or move funds, so a compromised guardian can only cause a
-    ///         (recoverable) liveness halt, not theft. Pass address(0) to revoke.
+    /// @notice Appoint, replace or clear the guardian — the one party besides the
+    ///         owner who can pause and {cancelScheduledGovernance} /
+    ///         {cancelScheduledUpgrade}. Pass address(0) to revoke.
+    ///
+    /// @dev    The guardian is a low-trust "stop button": it can pause and veto
+    ///         queued changes, but never un-pause, execute anything or move funds.
+    ///
+    ///         TIMELOCKED WHEN IT REMOVES A VETO (audit 2026-10-02, M7-1). Every
+    ///         delayed action exists so that the guardian can cancel it during the
+    ///         delay. When this was instant, a stolen owner key scheduled a drain
+    ///         and called `setGuardian(0)` in the same block, and the delay then
+    ///         protected nothing. So, mirroring {setLocalToken}:
+    ///           * during the setup phase ({inSetupPhase}) — instant: the gate is
+    ///             being wired, holds nothing, and claims are refused until sealed;
+    ///           * when NO guardian is set — instant: appointing one only adds a
+    ///             veto, it removes none;
+    ///           * otherwise (replacing or removing a live guardian) — consumes a
+    ///             matured {scheduleSetGuardian} schedule, which the CURRENT
+    ///             guardian may cancel. Setting the same guardian again is a no-op.
+    ///
+    ///         TRADE-OFF, accepted deliberately: a compromised GUARDIAN key can now
+    ///         keep cancelling its own replacement, and so freeze delayed
+    ///         governance (upgrades, corridor registrations, validator additions)
+    ///         until it cooperates. It still cannot move funds, un-pause, or block
+    ///         any of the instant power-REMOVING actions (validator removal,
+    ///         threshold increase, de-listing a chain, unpause). The opposite
+    ///         choice — a guardian that cannot cancel its own removal — gives a
+    ///         stolen owner key a no-veto drain after one extra delay. Theft beats
+    ///         liveness: keep the guardian key cold and separate from the owner.
     function setGuardian(address newGuardian) external onlyOwner {
+        address current = guardian;
+        if (newGuardian == current) return;
+        if (current != address(0) && !inSetupPhase()) {
+            _consumeGovernance(setGuardianActionId(newGuardian));
+        }
         guardian = newGuardian;
         emit GuardianSet(newGuardian);
+    }
+
+    /// @notice Set the smallest LOCAL amount of `token` that {send} accepts
+    ///         (see {minSendAmount}); 0 removes the minimum.
+    /// @dev    Instant, for the reason {setSupportedChain} is: it only restricts
+    ///         NEW locks. Set it so that the cheapest acceptable send still covers
+    ///         the keeper's claim on the most expensive destination.
+    function setMinSendAmount(address token, uint256 minAmount) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        minSendAmount[token] = minAmount;
+        emit MinSendAmountSet(token, minAmount);
     }
 
     /// @notice Halt `send`/`claim` in an incident. Callable by owner or guardian.
@@ -1147,6 +1344,12 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes calldata autoParams
     ) external whenNotPaused returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
+        // M7-12: dust and oversized payloads cost the keeper a full claim each.
+        uint256 minAmount = minSendAmount[token];
+        if (amount < minAmount) revert BelowMinSendAmount(amount, minAmount);
+        if (autoParams.length > MAX_AUTO_PARAMS_LENGTH) {
+            revert AutoParamsTooLong(autoParams.length, MAX_AUTO_PARAMS_LENGTH);
+        }
         if (!supportedChain[chainIdTo]) revert UnsupportedChain(chainIdTo);
         // Everything below — the id, the width cap, the event — is in the wire
         // amount; only the token transfer uses the local one.

@@ -32,7 +32,7 @@ import {GateDeployer} from "../src/GateDeployer.sol";
 ///   3. `setLocalToken(debridgeId, localToken)` for every inbound corridor
 ///      (instant while unsealed);
 ///   4. `seal()` — irreversible. From then on every NEW corridor needs
-///      `scheduleGovernance(setLocalTokenActionId(...))` plus GOVERNANCE_DELAY,
+///      `scheduleSetLocalToken(...)` plus GOVERNANCE_DELAY,
 ///      which is what stops an owner key from draining the gate through a fake
 ///      corridor (H-1). An unsealed gate that holds funds is that drain waiting.
 ///

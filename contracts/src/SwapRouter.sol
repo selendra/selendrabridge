@@ -111,7 +111,48 @@ contract SwapRouter is ReentrancyGuard {
     ///         (landing in this counter) before {executeStableRescue} computes what
     ///         is free. Every other token sweeps instantly, since only the stable is
     ///         ever held on a user's behalf.
+    ///
+    ///         The window does not stand alone any more (audit 2026-10-02, M7-2):
+    ///         {executeStableRescue} is also held to the free balance at schedule
+    ///         time LESS everything settled out since, see {stableSettledOut}. And
+    ///         the keeper now `finalize`s every claim it delivers into a router, so
+    ///         "every such transfer gets finalized or deferred within the window"
+    ///         is something a process actually does rather than an assumption.
     uint256 public owedStable;
+
+    /// @notice Running total of stable this router has paid out to settle
+    ///         deliveries (swap input, stable intent, fallback) that were NOT
+    ///         already counted in {owedStable} when the pending stable rescue was
+    ///         filed. Monotonic; only its growth across a rescue's delay matters.
+    ///
+    /// @dev    FINDING M7-2. The M-14 cap was an AMOUNT — the free balance when the
+    ///         rescue was announced — not a set of funds, and stable is fungible.
+    ///         So the owner could bait it: deliver a transfer of their own into the
+    ///         router (claimed, not finalized, so it reads as free), schedule a
+    ///         rescue of that size, finalize the bait back out to themselves, and
+    ///         48 h later sweep a VICTIM's stable that was claimed in after the
+    ///         notice. The victim's `finalize` then defers for ever while the Gate
+    ///         shows the transfer executed, so no refund is possible either.
+    ///
+    ///         Debiting the cap by every settlement since the notice closes that:
+    ///         whatever counted as free at schedule time and has left since can no
+    ///         longer be "replaced" by funds that arrived later. The sweep is held
+    ///         to stable that was in the router when the notice went public AND
+    ///         is still there — never to a later arrival, whoever it belongs to.
+    ///
+    ///         What remains is the case the window exists for: a transfer claimed
+    ///         in BEFORE the notice that nobody finalizes for the whole 48 h. Any
+    ///         `finalize` call in the window protects it (it either settles, which
+    ///         debits the cap, or defers, which moves it into {owedStable}); the
+    ///         keeper's finalize loop makes that call, and the guardian can
+    ///         {cancelStableRescue}.
+    ///
+    ///         INVARIANT FOR FUTURE CODE: any new path that moves stable OUT of
+    ///         the router on a user's behalf (e.g. forwarding a refunded
+    ///         swap-and-bridge, H7-4) must add what it pays to this counter, or it
+    ///         reopens the bait: free-at-notice stable leaves, a later arrival
+    ///         refills the amount, and the sweep takes it.
+    uint256 public stableSettledOut;
 
     /// @notice How long a blocked destination swap is retried before the router
     ///         may deliver the carrier stable instead.
@@ -179,6 +220,12 @@ contract SwapRouter is ReentrancyGuard {
         ///      the ceiling the execution is held to. See {executeStableRescue}
         ///      and finding M-14.
         uint256 freeAtSchedule;
+        /// @dev When the notice was filed. A deferred transfer whose debt
+        ///      predates this was never in `freeAtSchedule`, so settling it does
+        ///      not debit the cap (M7-2).
+        uint256 scheduledAt;
+        /// @dev {stableSettledOut} when the notice was filed (M7-2).
+        uint256 settledOutAtSchedule;
     }
 
     StableRescue public pendingStableRescue;
@@ -504,6 +551,14 @@ contract SwapRouter is ReentrancyGuard {
         if (_deliver(submissionId, amount, finalToken, finalReceiver, finalMinOut, mayFallBack)) {
             finalized[submissionId] = true;
             if (owedAlready != 0) owedStable -= amount;
+            // M7-2: every settlement debits a pending rescue's cap, EXCEPT one
+            // whose debt was already in `owedStable` before the notice was filed
+            // — that stable was never counted free, so it cannot have been the
+            // bait. Same-second deferrals are debited (the conservative side).
+            uint256 scheduledAt = pendingStableRescue.scheduledAt;
+            if (owedAlready == 0 || scheduledAt == 0 || owedAlready >= scheduledAt) {
+                stableSettledOut += amount;
+            }
         } else if (owedAlready == 0) {
             owedStable += amount;
         }
@@ -545,8 +600,14 @@ contract SwapRouter is ReentrancyGuard {
         uint256 balance = IERC20(stable).balanceOf(address(this));
         uint256 freeNow = balance > owedStable ? balance - owedStable : 0;
         if (amount > freeNow) revert RescueWouldTakeOwedFunds(amount, freeNow);
-        pendingStableRescue =
-            StableRescue({amount: amount, to: to, readyAt: readyAt, freeAtSchedule: freeNow});
+        pendingStableRescue = StableRescue({
+            amount: amount,
+            to: to,
+            readyAt: readyAt,
+            freeAtSchedule: freeNow,
+            scheduledAt: block.timestamp,
+            settledOutAtSchedule: stableSettledOut
+        });
         emit StableRescueScheduled(amount, to, readyAt);
     }
 
@@ -563,7 +624,8 @@ contract SwapRouter is ReentrancyGuard {
     ///         [readyAt, readyAt + {STABLE_RESCUE_WINDOW}].
     ///
     /// @dev    Pays at most the LESSER of what was free when the sweep was
-    ///         announced and what is free now.
+    ///         announced, less every settlement since (M7-2, see
+    ///         {stableSettledOut}), and what is free now.
     ///
     ///         FINDING M-14. Only the second test existed, and it is evaluated at
     ///         execution time, so everything that arrived during the delay counted
@@ -593,7 +655,13 @@ contract SwapRouter is ReentrancyGuard {
 
         uint256 balance = IERC20(stable).balanceOf(address(this));
         uint256 free = balance > owedStable ? balance - owedStable : 0;
-        if (r.freeAtSchedule < free) free = r.freeAtSchedule;
+        // M7-2: what was free at the notice, minus what has been settled out of
+        // the router since. Without the debit, stable the owner counted as free
+        // (their own claimed-but-unfinalized bait) could leave via `finalize` and
+        // a later victim's delivery would refill the "free" amount.
+        uint256 settledSince = stableSettledOut - r.settledOutAtSchedule;
+        uint256 stillFree = r.freeAtSchedule > settledSince ? r.freeAtSchedule - settledSince : 0;
+        if (stillFree < free) free = stillFree;
         if (r.amount > free) revert RescueWouldTakeOwedFunds(r.amount, free);
 
         IERC20(stable).safeTransfer(r.to, r.amount);

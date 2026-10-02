@@ -51,7 +51,13 @@ services:
       #
       # Do NOT set SIG_STORE_TOKEN here: it is the legacy all-scopes secret and
       # grants read+sign+relay+admin to whoever holds it.
-      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"
+      # One Sign token PER validator machine and per Solana relayer, as
+      # `label:token,label:token,...` (audit round 7, M7-11): each its own
+      # rate-limit bucket and identity, so one holder flooding the store cannot
+      # 429 every validator, and one operator's access can be revoked alone.
+      # (The legacy shared SIG_STORE_VALIDATOR_TOKEN is still accepted, but do
+      # not set it here.)
+      SIG_STORE_VALIDATOR_TOKENS: "${SIG_STORE_VALIDATOR_TOKENS:?set SIG_STORE_VALIDATOR_TOKENS}"
       SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
       SIG_STORE_ADMIN_TOKEN: "${SIG_STORE_ADMIN_TOKEN:?set SIG_STORE_ADMIN_TOKEN}"

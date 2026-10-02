@@ -25,8 +25,9 @@ use crate::upstream::Upstream;
 
 /// One listed token in a pool, flattened for the wire. Numeric fields are
 /// decimal strings (uint256) to avoid JSON precision loss, mirroring how
-/// `Submission.amount` is carried.
-#[derive(Clone, Debug)]
+/// `Submission.amount` is carried. Serde only so a snapshot can sit in the
+/// upstream answer cache (M7-6); it is not the GraphQL shape.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PoolToken {
     /// The pool's vault for this token (Solana only; `None` on EVM, where the
     /// pool contract holds its own balances). Passing a wrong one fails the
@@ -60,7 +61,7 @@ pub struct PoolToken {
 /// A configured pool's address + core stablecoin + its listed tokens. The
 /// `address` is what the UI sends `approve`/`swap` transactions to (the `pools`
 /// token list alone can't be swapped against without it).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PoolInfo {
     /// `0x`-prefixed SwapPool contract address.
     pub address: String,
@@ -518,13 +519,23 @@ impl Swaps {
     /// Full pool snapshot: every listed token with its price, reserve, and
     /// max-swap USD value. `None` when the chain isn't configured or the RPC
     /// read fails (never propagates an error into the GraphQL response).
+    ///
+    /// The same cached snapshot as [`pool_info`](Self::pool_info) (M7-6).
     pub async fn pools(&self, chain_id: u64) -> Option<Vec<PoolToken>> {
-        let (provider, pool_addr, from_block, max_range) = match self.pools.get(&chain_id)? {
-            Backend::Solana(sol) => return self.solana_pools(chain_id, sol).await,
-            Backend::Evm { provider, pool, from_block, max_range } => {
-                (provider, pool, from_block, max_range)
-            }
-        };
+        self.pool_info(chain_id).await.map(|p| p.tokens)
+    }
+
+    /// The EVM token walk behind [`pool_info`](Self::pool_info): `stable()`,
+    /// the listing replay, then `tokens()` + `symbol()` per token. Uncached —
+    /// reach it only through `pool_info`.
+    async fn evm_pool_tokens(
+        &self,
+        chain_id: u64,
+        provider: &DynProvider,
+        pool_addr: &Address,
+        from_block: &u64,
+        max_range: &u64,
+    ) -> Option<Vec<PoolToken>> {
         let pool = SwapPool::new(*pool_addr, provider);
 
         let stable = pool.stable().call().await.ok()?;
@@ -651,22 +662,6 @@ impl Swaps {
         &self.upstream
     }
 
-    /// The Solana view of [`pools`](Self::pools): one `getProgramAccounts` and
-    /// the shared layouts, with no log replay — the pool's state IS its
-    /// accounts, so there is no history to walk and no scan floor to get wrong.
-    async fn solana_pools(
-        &self,
-        chain_id: u64,
-        sol: &crate::solana_pool::SolanaPool,
-    ) -> Option<Vec<PoolToken>> {
-        let snap = sol
-            .snapshot()
-            .await
-            .inspect_err(|e| tracing::warn!(chain_id, error = %e, "solana pool read failed"))
-            .ok()?;
-        Some(Self::solana_tokens(sol, &snap))
-    }
-
     /// Flatten a decoded Solana snapshot into the wire shape, stamping each
     /// token with the program's own freshness verdict at the CLUSTER clock read
     /// with the snapshot (audit L7-15) — stale when that clock is unknown.
@@ -728,11 +723,33 @@ impl Swaps {
     /// Pool metadata (address + stable) alongside the full token snapshot, so a
     /// UI can build swap/approve transactions against a discovered pool. `None`
     /// on the same conditions as [`pools`](Self::pools).
+    ///
+    /// Audit round 7, M7-6: `pools` / `swapPool` were outside the upstream
+    /// meter and cache, so 50 aliases were 50 full pool walks (EVM: `stable()`,
+    /// `eth_blockNumber`, then `tokens()` and `symbol()` per token; Solana: a
+    /// multi-account read) against the operator's keyed RPC. Now one snapshot
+    /// per chain per [`READ_TTL`], deduplicated in flight and metered.
     pub async fn pool_info(&self, chain_id: u64) -> Option<PoolInfo> {
+        // Unconfigured: nothing to ask, nothing to cache.
+        self.pools.get(&chain_id)?;
+        let json = self
+            .upstream
+            .cached(format!("pool:{chain_id}"), |_| READ_TTL, async {
+                serde_json::to_string(&self.pool_info_uncached(chain_id).await?).ok()
+            })
+            .await?;
+        serde_json::from_str(&json).ok()
+    }
+
+    async fn pool_info_uncached(&self, chain_id: u64) -> Option<PoolInfo> {
         // On Solana the "pool address" a UI sends its instruction to is the
         // PROGRAM id; the pool account itself is a PDA the program derives.
         let (address, tokens, max_price_age) = match self.pools.get(&chain_id)? {
-            Backend::Evm { pool, .. } => (format!("{pool:#x}"), self.pools(chain_id).await?, None),
+            Backend::Evm { provider, pool, from_block, max_range } => (
+                format!("{pool:#x}"),
+                self.evm_pool_tokens(chain_id, provider, pool, from_block, max_range).await?,
+                None,
+            ),
             Backend::Solana(sol) => {
                 // One snapshot for both the token list and the pool's bound, so
                 // the two describe the same slot.
@@ -1033,6 +1050,16 @@ mod tests {
         tokens: Vec<swap_math::TokenState>,
         clock: Option<i64>,
     ) -> String {
+        mock_solana_pool_counted(pool, tokens, clock, Default::default()).await
+    }
+
+    /// [`mock_solana_pool`], counting requests into `calls`.
+    async fn mock_solana_pool_counted(
+        pool: swap_math::PoolState,
+        tokens: Vec<swap_math::TokenState>,
+        clock: Option<i64>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
         use axum::{routing::post, Json, Router};
         use base64::Engine;
         let program = crate::solana_pool::from_b58(SOL_PROGRAM).unwrap();
@@ -1058,7 +1085,9 @@ mod tests {
             "/",
             post(move |Json(req): Json<serde_json::Value>| {
                 let accounts = accounts.clone();
+                let calls = calls.clone();
                 async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     assert_eq!(req["method"], "getMultipleAccounts");
                     let value: Vec<serde_json::Value> = req["params"][0]
                         .as_array()
@@ -1129,5 +1158,55 @@ mod tests {
         let toks = swaps.pools(9).await.unwrap();
         assert_eq!(alt_fresh(&toks), Some(false));
         assert_eq!(toks.iter().find(|t| t.token == hub58).unwrap().price_fresh, Some(true));
+    }
+
+    /// Audit round 7, M7-6: `swapPool` / `pools` were outside the meter and the
+    /// cache, so each alias was its own full pool read against the keyed RPC.
+    /// 50 aliases of each now cost ONE upstream call between them.
+    #[tokio::test]
+    async fn aliased_pool_snapshots_share_one_upstream_call() {
+        let (hub, alt) = ([1u8; 32], [2u8; 32]);
+        let pool = swap_math::PoolState { hub_mint: hub, max_price_age: 100, ..Default::default() };
+        let tokens = vec![
+            swap_math::TokenState {
+                mint: hub, decimals: 6, price: swap_math::PRICE_ONE, listed: true, ..Default::default()
+            },
+            swap_math::TokenState {
+                mint: alt, decimals: 9, price: 2 * swap_math::PRICE_ONE, listed: true,
+                price_set_at: 1_000_000, ..Default::default()
+            },
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_solana_pool_counted(pool, tokens, Some(1_000_050), calls.clone()).await;
+        let mut swaps = Swaps::new();
+        swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
+        // Known mints => the one-call `getMultipleAccounts` path.
+        swaps.set_symbols(9, BTreeMap::from([
+            (crate::solana_pool::b58(&hub), "USD".into()),
+            (crate::solana_pool::b58(&alt), "ALT".into()),
+        ]));
+        let schema = schema_over(swaps);
+
+        let body: String = (0..50)
+            .map(|i| format!("s{i}: swapPool(chainId: 9) {{ address stable tokens {{ token decimals priceFresh }} }} "))
+            .collect();
+        let res = schema.execute(format!("{{ {body} }}")).await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let json = res.data.into_json().unwrap();
+        assert_eq!(json["s49"]["address"], SOL_PROGRAM);
+        assert_eq!(json["s49"]["tokens"].as_array().unwrap().len(), 2);
+        assert_eq!(json["s0"], json["s49"], "every alias sees the same snapshot");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "50 aliased swapPool, one RPC call");
+
+        // `pools` reads the same cached snapshot within its TTL.
+        let body: String = (0..50).map(|i| format!("p{i}: pools(chainId: 9) {{ token }} ")).collect();
+        let res = schema.execute(format!("{{ {body} }}")).await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "pools shares swapPool's snapshot");
+
+        // An unconfigured chain never reaches the RPC.
+        let res = schema.execute("{ swapPool(chainId: 10) { address } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

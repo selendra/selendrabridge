@@ -36,6 +36,8 @@ import {
   sendBridge,
   sendFinalize,
   sendSwapAndBridge,
+  slippageFloor,
+  stableAtDestination,
   waitReceipt,
   waitReceiptFull,
 } from "../wallet/eth";
@@ -469,56 +471,132 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   const srcPool = srcPoolQ.data;
   const dstPool = dstPoolQ.data;
 
+  // --- the stable's scale at each end (audit round 7, M7-7b) ---------------
+  //
+  // The source router bridges `stableOut / srcUnit` wire units and the
+  // destination router swaps `wire * dstUnit` of ITS stable — destination-local
+  // units. Leg 2 has to be quoted in those, or a 6-decimal source stable against
+  // an 18-decimal destination one signs a `finalMinOut` 10^12 too small. Both
+  // reads are keyed like `readFor`: a value read for another router/stable/chain
+  // is never used, and unknown fails closed.
+  const srcStable = srcPool?.stable ?? "";
+  const dstStable = dstPool?.stable ?? "";
+  const srcUnitKey = `${fromChainId ?? "?"}:${router.toLowerCase()}:${srcStable.toLowerCase()}`;
+  const dstUnitKey = `${toChainId ?? "?"}:${destGate.toLowerCase()}:${dstStable.toLowerCase()}:${destRpcUrl}`;
+  const [srcUnitRead, setSrcUnitRead] = useState<{ key: string; unit: bigint | null } | null>(null);
+  const [dstUnitRead, setDstUnitRead] = useState<{ key: string; unit: bigint | null } | null>(null);
+
+  useEffect(() => {
+    if (!crossSwap || !routerOk || !isAddress(srcStable)) {
+      setSrcUnitRead(null);
+      return;
+    }
+    let alive = true;
+    // The router bridges through its OWN immutable gate, so that gate's unit is
+    // the one that rounds the stable — not whatever the Gate field says.
+    readRouterGate(wallet.request, router)
+      .then((g) => readBridgeUnit(wallet.request, g, srcStable))
+      .catch(() => null)
+      .then((unit) => alive && setSrcUnitRead({ key: srcUnitKey, unit }));
+    return () => {
+      alive = false;
+    };
+  }, [crossSwap, routerOk, router, srcStable, wallet.request, srcUnitKey]);
+
+  useEffect(() => {
+    if (!crossSwap || destIsNonEvm || !isAddress(destGate) || !destRpcUrl || !isAddress(dstStable)) {
+      setDstUnitRead(null);
+      return;
+    }
+    let alive = true;
+    // `toLocalAmount(stable, wire) = wire * bridgeUnit(stable)` on the
+    // destination gate, read over the registry RPC (the wallet is on the source).
+    readBridgeUnit(rpcRequest(destRpcUrl), destGate, dstStable)
+      .catch(() => null)
+      .then((unit) => alive && setDstUnitRead({ key: dstUnitKey, unit }));
+    return () => {
+      alive = false;
+    };
+  }, [crossSwap, destIsNonEvm, destGate, destRpcUrl, dstStable, dstUnitKey]);
+
+  const srcUnitPending = srcUnitRead?.key !== srcUnitKey;
+  const dstUnitPending = dstUnitRead?.key !== dstUnitKey;
+  const srcStableUnit = srcUnitPending ? null : srcUnitRead!.unit;
+  const dstStableUnit = dstUnitPending ? null : dstUnitRead!.unit;
+
+  // --- quotes, keyed to exactly what they were asked for (M7-7a) ------------
+  //
+  // A quote is only usable for the amount/token/chain it was fetched FOR. The
+  // debounce used to let a submit through with the previous amount's quote, and
+  // a null quote (stale price, 429) became a floor of 0 signed into the id —
+  // with `finalize` permissionless, a destination swap that never blocks on
+  // price. Each leg now carries its key; the button and the submit both demand
+  // a fresh, non-null quote for the CURRENT inputs.
+  type Quote = { key: string; value: string | null };
   const debouncedAmt = useDebounced(amountBase.toString(), 300);
-  const [stableQuote, setStableQuote] = useState<string | null>(null);
-  const [finalQuote, setFinalQuote] = useState<string | null>(null);
+  const leg1KeyFor = (amt: string) =>
+    `${fromChainId ?? "?"}:${token.toLowerCase()}:${srcStable.toLowerCase()}:${amt}`;
+  const [leg1, setLeg1] = useState<Quote | null>(null);
+  const [leg2, setLeg2] = useState<Quote | null>(null);
 
   // Leg 1: tokenIn -> source stable (skipped, 1:1, if tokenIn already IS the stable).
   useEffect(() => {
     if (!crossSwap || !srcPool || fromChainId == null || !tokenOk || BigInt(debouncedAmt || "0") <= 0n) {
-      setStableQuote(null);
+      setLeg1(null);
       return;
     }
+    const key = `${fromChainId}:${token.toLowerCase()}:${srcPool.stable.toLowerCase()}:${debouncedAmt}`;
     if (eqAddr(token, srcPool.stable)) {
-      setStableQuote(debouncedAmt);
+      setLeg1({ key, value: debouncedAmt });
       return;
     }
     let alive = true;
     fetchSwapQuote(fromChainId, token, srcPool.stable, debouncedAmt)
-      .then((q) => alive && setStableQuote(q))
-      .catch(() => alive && setStableQuote(null));
+      .then((q) => alive && setLeg1({ key, value: q }))
+      .catch(() => alive && setLeg1({ key, value: null }));
     return () => {
       alive = false;
     };
   }, [crossSwap, srcPool, fromChainId, token, tokenOk, debouncedAmt]);
 
+  const leg1Fresh = leg1 != null && leg1.key === leg1KeyFor(amountBase.toString());
+  const stableQuoteBase = leg1Fresh && leg1.value ? BigInt(leg1.value) : null;
+  // What the destination router will actually swap, in ITS stable's units.
+  const stableAtDest =
+    stableQuoteBase != null ? stableAtDestination(stableQuoteBase, srcStableUnit, dstStableUnit) : null;
+  const stableAtDestStr = stableAtDest != null ? stableAtDest.toString() : "";
+  const leg2Key = `${toChainId ?? "?"}:${dstStable.toLowerCase()}:${finalToken.toLowerCase()}:${stableAtDestStr}`;
+
   // Leg 2: destination stable -> finalToken (skipped, 1:1, if finalToken IS the dest stable).
   useEffect(() => {
-    if (!crossSwap || !dstPool || toChainId == null || !finalTokenOk || !stableQuote || BigInt(stableQuote) <= 0n) {
-      setFinalQuote(null);
+    if (!crossSwap || !dstPool || toChainId == null || !finalTokenOk || !stableAtDestStr || BigInt(stableAtDestStr) <= 0n) {
+      setLeg2(null);
       return;
     }
+    const key = `${toChainId}:${dstPool.stable.toLowerCase()}:${finalToken.toLowerCase()}:${stableAtDestStr}`;
     if (eqAddr(finalToken, dstPool.stable)) {
-      setFinalQuote(stableQuote);
+      setLeg2({ key, value: stableAtDestStr });
       return;
     }
     let alive = true;
-    fetchSwapQuote(toChainId, dstPool.stable, finalToken, stableQuote)
-      .then((q) => alive && setFinalQuote(q))
-      .catch(() => alive && setFinalQuote(null));
+    fetchSwapQuote(toChainId, dstPool.stable, finalToken, stableAtDestStr)
+      .then((q) => alive && setLeg2({ key, value: q }))
+      .catch(() => alive && setLeg2({ key, value: null }));
     return () => {
       alive = false;
     };
-  }, [crossSwap, dstPool, toChainId, finalToken, finalTokenOk, stableQuote]);
+  }, [crossSwap, dstPool, toChainId, finalToken, finalTokenOk, stableAtDestStr]);
 
-  const stableQuoteBase = stableQuote ? BigInt(stableQuote) : 0n;
-  const minStableOut = (stableQuoteBase * BigInt(10000 - slippageBps)) / 10000n;
-  const finalQuoteBase = finalQuote ? BigInt(finalQuote) : 0n;
-  const finalMinOut = (finalQuoteBase * BigInt(10000 - slippageBps)) / 10000n;
+  const leg2Fresh = leg2 != null && stableAtDestStr !== "" && leg2.key === leg2Key;
+  const finalQuoteBase = leg2Fresh && leg2.value ? BigInt(leg2.value) : null;
+  const minStableOut = slippageFloor(stableQuoteBase, slippageBps);
+  const finalMinOut = slippageFloor(finalQuoteBase, slippageBps);
+  // Every number the router will be held to, present and for these inputs.
+  const quotesReady = crossSwap && minStableOut != null && finalMinOut != null && stableAtDest != null && stableAtDest > 0n;
   const srcStableInfo = srcPool?.tokens.find((t) => t.isStable);
   const finalTokenInfo = dstPool?.tokens.find((t) => eqAddr(t.token, finalToken));
   const destReserve = finalTokenInfo ? BigInt(finalTokenInfo.reserve) : 0n;
-  const destExceedsLock = crossSwap && !!finalTokenInfo && finalQuoteBase > destReserve;
+  const destExceedsLock = crossSwap && !!finalTokenInfo && finalQuoteBase != null && finalQuoteBase > destReserve;
 
   // Corridor check: is the destination router registered on the source router?
   const [remoteRouterHex, setRemoteRouterHex] = useState<string | null>(null);
@@ -603,6 +681,12 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
 
   const doSwapAndBridge = async () => {
     if (!wallet.address || toChainId == null || fromChainId == null || !remoteRouterHex || !corridorOk) return;
+    // M7-7: the button already demands this; the submit re-checks, so no path
+    // signs a floor of 0 or one quoted for another amount.
+    if (!quotesReady || minStableOut == null || finalMinOut == null) {
+      setTx({ kind: "error", message: "No current price quote — refusing to send without a slippage floor." });
+      return;
+    }
     setTx({ kind: "pending", label: "Swapping + bridging…" });
     try {
       const hash = await sendSwapAndBridge(
@@ -783,6 +867,18 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     button = { label: "Destination router mismatch — refusing to send", disabled: true };
   else if (crossSwap && destExceedsLock) button = { label: "Exceeds destination pool lock", disabled: true };
   else if (needsApprove) button = { label: crossSwap ? "Approve for router" : "Approve token", onClick: doApprove };
+  // M7-7: no Swap & Bridge without the stable's scale at both ends and a fresh,
+  // non-zero quote for BOTH legs at exactly this amount. Fails closed.
+  else if (crossSwap && (srcUnitPending || dstUnitPending))
+    button = { label: "Checking the stable's bridge scale…", disabled: true };
+  else if (crossSwap && (srcStableUnit == null || dstStableUnit == null))
+    button = { label: "Can't read the stable's bridge scale", disabled: true };
+  else if (crossSwap && !leg1Fresh) button = { label: "Updating quote…", disabled: true };
+  else if (crossSwap && stableQuoteBase != null && stableAtDest === 0n)
+    button = { label: "Amount too small to bridge", disabled: true };
+  else if (crossSwap && stableQuoteBase != null && !leg2Fresh) button = { label: "Updating quote…", disabled: true };
+  else if (crossSwap && !quotesReady)
+    button = { label: "No price quote — refusing to send without a slippage floor", disabled: true };
   else button = { label: crossSwap ? "Swap & Bridge" : "Bridge", onClick: crossSwap ? doSwapAndBridge : doSend };
   if (busy) button = { label: tx.label, disabled: true };
 
@@ -988,7 +1084,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
                 Bridges as <Help size={14} />
               </dt>
               <dd>
-                {srcStableInfo && stableQuoteBase > 0n
+                {srcStableInfo && stableQuoteBase != null && stableQuoteBase > 0n
                   ? `${formatUnits(stableQuoteBase, srcStableInfo.decimals)} ${srcStableInfo.symbol || "stable"}`
                   : "—"}
               </dd>
@@ -998,7 +1094,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
                 Arrives as (min., after slippage) <Help size={14} />
               </dt>
               <dd>
-                {finalTokenInfo && finalQuoteBase > 0n
+                {finalTokenInfo && finalMinOut != null
                   ? `${formatUnits(finalMinOut, finalTokenInfo.decimals)} ${finalTokenInfo.symbol || "token"}`
                   : "—"}
               </dd>
@@ -1052,7 +1148,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
       )}
       {stage === "idle" && crossSwap && destExceedsLock && finalTokenInfo && (
         <div className="notice notice--warn">
-          Output ({formatUnits(finalQuoteBase, finalTokenInfo.decimals)} {finalTokenInfo.symbol}) exceeds the
+          Output ({formatUnits(finalQuoteBase ?? 0n, finalTokenInfo.decimals)} {finalTokenInfo.symbol}) exceeds the
           destination pool's locked reserve. Reduce the amount.
         </div>
       )}

@@ -269,7 +269,7 @@ contract DecimalsTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
         gate18.setBridgeDecimals(address(t), 6);
 
-        gate18.scheduleGovernance(action);
+        gate18.scheduleSetBridgeDecimals(address(t), 6);
         vm.warp(block.timestamp + gate18.GOVERNANCE_DELAY());
         bytes32 other = gate18.setBridgeDecimalsActionId(address(t), 2);
         vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, other));

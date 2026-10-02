@@ -188,7 +188,12 @@ sol! {
 
         // --- oracle surface (used by price-keeper) ---
         function oracle() external view returns (address);
-        function setPrice(address token, uint256 newPrice) external;
+        /// Compare-and-set (audit 2026-10-02, M7-4): reverts `PriceChanged`
+        /// unless the on-chain price is `expectedOld`.
+        function setPrice(address token, uint256 expectedOld, uint256 newPrice) external;
+        function feeBps() external view returns (uint16);
+        /// min(maxPriceDeviationBps, feeBps) — the largest step one setPrice may make (M7-3).
+        function priceStepCapBps() external view returns (uint16);
         function priceSetAt(address token) external view returns (uint256);
         function lastPriceUpdate(address token) external view returns (uint256);
         function maxPriceAge() external view returns (uint256);
@@ -220,6 +225,22 @@ sol! {
             bool swapped
         );
         event FinalizeFallback(bytes32 indexed submissionId, address indexed finalReceiver, uint256 stableAmount);
+
+        // --- destination leg (used by the keeper's finalize loop, M7-2) ---
+        function finalize(
+            bytes32 debridgeId,
+            uint256 amount,
+            uint8 bridgeDecimals,
+            uint256 chainIdFrom,
+            uint256 nonce,
+            bytes receiver,
+            bytes autoParams,
+            bytes nativeSender
+        ) external returns (bytes32 submissionId);
+        function finalized(bytes32 submissionId) external view returns (bool);
+        function deferredSince(bytes32 submissionId) external view returns (uint256);
+        function owner() external view returns (address);
+        function guardian() external view returns (address);
         /// The destination swap is blocked but still inside its grace window, so
         /// nothing settled. Indexed so a stalled delivery is visible rather than
         /// looking like a transfer nobody bothered to finalize.

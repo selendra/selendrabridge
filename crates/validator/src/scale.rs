@@ -207,6 +207,12 @@ impl ScaleGuard {
         self.peers.is_empty()
     }
 
+    /// Pretend a destination read already returned `decimals` (tests).
+    #[cfg(test)]
+    pub async fn seed_destination_scale(&self, chain_id_to: u64, debridge_id: B256, decimals: u8) {
+        self.dest_cache.lock().await.insert((chain_id_to, debridge_id), decimals);
+    }
+
     /// Do the two ends agree about `debridge_id`'s scale?
     ///
     /// `source_provider` is the endpoint this scanner is already reading logs

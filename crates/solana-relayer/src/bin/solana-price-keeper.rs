@@ -263,7 +263,19 @@ fn tick(
             max_age: Some(pool.effective_max_price_age()),
             min_update_interval: pool.min_price_update_interval,
             max_deviation_bps: pool.max_price_deviation_bps,
+            // M7-3: the keeper holds its steps to the swap fee. The program
+            // itself only enforces the deviation cap (unlike SwapPool.sol), so
+            // this is voluntary here, and a zero-fee pool is refreshed but
+            // never moved.
+            fee_bps: pool.fee_bps,
         };
+        if state.step_cap_bps() == 0 && rec.price != t.target {
+            warn!(
+                symbol = %t.symbol, on_chain = rec.price, target = t.target,
+                "pool fee is 0, so this keeper will not MOVE the price (M7-3: a step larger than \
+                 the fee is sandwichable); only refreshing it. SetFee to let it track the target"
+            );
+        }
         match plan(&state, t.target, margin) {
             Plan::Idle => {
                 debug!(symbol = %t.symbol, age = now - rec.price_set_at, "fresh");
@@ -276,7 +288,13 @@ fn tick(
                 info!(symbol = %t.symbol, wait_secs = until - now, "reprice due but in cooldown");
                 soonest = Some(soonest.map_or(until - now, |s| s.min(until - now)));
             }
-            Plan::Set { price, step } => {
+            // KNOWN GAP (audit 2026-10-02, M7-4): the Solana program's SetPrice
+            // has no compare-and-set, so `from` cannot be bound into the
+            // instruction the way SwapPool.setPrice binds `expectedOld`. A lying
+            // RPC can still steer one capped step per interval here. The EVM
+            // side is closed; closing this one needs a new program instruction
+            // (SetPriceFrom { expected, price }) and a program upgrade.
+            Plan::Set { from: _, price, step } => {
                 let ix = Instruction {
                     program_id: program,
                     accounts: vec![

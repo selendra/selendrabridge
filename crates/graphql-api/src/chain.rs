@@ -473,7 +473,19 @@ pub struct Chains {
     /// serves every later request; `None` is cached too, so a token without the
     /// function (or on a chain with no provider) is not re-asked per row.
     token_decimals: TokenDecimalsCache,
+    /// Dedupe + short-TTL cache for the `bridgeDecimalsOf` reads that `scales`
+    /// does not keep: an unregistered or unreadable answer. Without it every
+    /// `Token.bridgeDecimals` alias was one uncached `eth_call` (audit round 7,
+    /// M7-6). Its own meter, so a flood degrades to `Unknown`.
+    scale_reads: crate::upstream::Upstream,
 }
+
+/// How long an `Unregistered` answer is kept. Short: a registration may land
+/// any block, and a stale `Unregistered` only shows `null` for a few seconds.
+const SCALE_UNREGISTERED_TTL: Duration = Duration::from_secs(10);
+/// How long an `Unknown` (transport failure) is kept — just long enough that an
+/// aliased flood against a dead endpoint costs one request, not one per alias.
+const SCALE_UNKNOWN_TTL: Duration = Duration::from_secs(3);
 
 impl Chains {
     pub fn new() -> Self {
@@ -598,17 +610,42 @@ impl Chains {
             return GateScale::Registered(d);
         }
         let Some((provider, gate)) = self.gates.get(&chain_id) else { return GateScale::Unknown };
-        match Gate::new(*gate, provider).bridgeDecimalsOf(token).call().await {
-            Ok(r) if r.set => {
-                self.scales.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token), r.bridgeDecimals);
-                GateScale::Registered(r.bridgeDecimals)
-            }
-            Ok(_) => GateScale::Unregistered,
-            Err(e) if gate_answered(&e) => GateScale::Unregistered,
-            Err(e) => {
-                tracing::debug!(chain_id, %token, error = %e, "bridgeDecimalsOf unreadable");
-                GateScale::Unknown
-            }
+        // M7-6: identical concurrent questions share one read, and the answers
+        // `scales` will not keep (unregistered / unreadable) are kept briefly.
+        // `None` from the meter = no slot in time: unknown, not asked.
+        let read = async {
+            let scale = match Gate::new(*gate, provider).bridgeDecimalsOf(token).call().await {
+                Ok(r) if r.set => GateScale::Registered(r.bridgeDecimals),
+                Ok(_) => GateScale::Unregistered,
+                Err(e) if gate_answered(&e) => GateScale::Unregistered,
+                Err(e) => {
+                    tracing::debug!(chain_id, %token, error = %e, "bridgeDecimalsOf unreadable");
+                    GateScale::Unknown
+                }
+            };
+            Some(match scale {
+                GateScale::Registered(d) => format!("r{d}"),
+                GateScale::Unregistered => "u".to_owned(),
+                GateScale::Unknown => "x".to_owned(),
+            })
+        };
+        let ttl = |a: &str| match a {
+            "u" => SCALE_UNREGISTERED_TTL,
+            "x" => SCALE_UNKNOWN_TTL,
+            // Registered lives in `scales` for good; nothing to keep here.
+            _ => SCALE_UNKNOWN_TTL,
+        };
+        let answer = self.scale_reads.cached(format!("scale:{chain_id}:{token:#x}"), ttl, read).await;
+        match answer.as_deref() {
+            Some("u") => GateScale::Unregistered,
+            Some(r) if r.starts_with('r') => match r[1..].parse::<u8>() {
+                Ok(d) => {
+                    self.scales.lock().unwrap_or_else(|e| e.into_inner()).insert((chain_id, token), d);
+                    GateScale::Registered(d)
+                }
+                Err(_) => GateScale::Unknown,
+            },
+            _ => GateScale::Unknown,
         }
     }
 
@@ -842,6 +879,72 @@ mod tests {
     }
 
     const SUB_ID: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A mock EVM JSON-RPC whose every `eth_call` returns `ret` (hex, no 0x),
+    /// counting the calls. Returns its URL.
+    async fn mock_evm_rpc(ret: &'static str, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let calls = calls.clone();
+                async move {
+                    assert_eq!(req["method"], "eth_call");
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({"jsonrpc":"2.0","id":req["id"].clone(),"result":format!("0x{ret}")}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Audit round 7, M7-6: an UNREGISTERED scale was never kept, so every
+    /// `Token.bridgeDecimals` alias was its own `eth_call`. Concurrent identical
+    /// questions now share one read, and the negative answer is kept briefly.
+    #[tokio::test]
+    async fn an_unregistered_scale_is_deduplicated_and_briefly_cached() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // (set = false, bridgeDecimals = 0, localDecimals = 0)
+        let url = mock_evm_rpc("0".repeat(192).leak(), calls.clone()).await;
+        let mut chains = Chains::new();
+        chains.add(1, &url, "0x00000000000000000000000000000000000000aa").unwrap();
+        let token: Address = "0x00000000000000000000000000000000000000bb".parse().unwrap();
+
+        let all = futures_join(&chains, token, 50).await;
+        assert!(all.iter().all(|s| *s == GateScale::Unregistered), "{all:?}");
+        assert_eq!(chains.gate_bridge_decimals(1, token).await, GateScale::Unregistered);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "51 asks, one eth_call");
+
+        // A registered answer is still read and kept for good.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = mock_evm_rpc(
+            "0000000000000000000000000000000000000000000000000000000000000001\
+             0000000000000000000000000000000000000000000000000000000000000006\
+             0000000000000000000000000000000000000000000000000000000000000012",
+            calls.clone(),
+        )
+        .await;
+        let mut chains = Chains::new();
+        chains.add(1, &url, "0x00000000000000000000000000000000000000aa").unwrap();
+        assert!(futures_join(&chains, token, 20).await.iter().all(|s| *s == GateScale::Registered(6)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    async fn futures_join(chains: &Chains, token: Address, n: usize) -> Vec<GateScale> {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let c = chains.clone();
+            set.spawn(async move { c.gate_bridge_decimals(1, token).await });
+        }
+        let mut out = Vec::new();
+        while let Some(r) = set.join_next().await {
+            out.push(r.unwrap());
+        }
+        out
+    }
 
     /// THE explorer half of the fix: a Solana destination answers `executed` /
     /// `cancelled` from the gate's `["executed", id]` marker, so a delivered

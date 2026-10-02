@@ -91,13 +91,43 @@ impl Scope {
 #[derive(Clone, Default)]
 pub struct Auth {
     tokens: Arc<HashMap<String, HashSet<Scope>>>,
+    /// token -> the identity it was issued to (audit round 7, M7-11). Set for
+    /// the per-validator Sign tokens, so each holder is its own rate-limit
+    /// bucket AND a nameable principal; the hook H7-3's validator-set check
+    /// needs to map a credential to a validator address.
+    identities: Arc<HashMap<String, String>>,
     enforced: bool,
 }
 
 impl Auth {
     /// Unauthenticated: every request passes. Dev only.
     pub fn disabled() -> Auth {
-        Auth { tokens: Arc::new(HashMap::new()), enforced: false }
+        Auth { tokens: Arc::new(HashMap::new()), identities: Arc::new(HashMap::new()), enforced: false }
+    }
+
+    /// Attach an identity to each listed token (see [`Auth::identity`]).
+    /// Tokens not configured with any scope are ignored.
+    pub fn with_identities(mut self, ids: impl IntoIterator<Item = (String, String)>) -> Auth {
+        let mut map = (*self.identities).clone();
+        for (token, id) in ids {
+            if !token.is_empty() && self.tokens.contains_key(&token) {
+                map.insert(token, id);
+            }
+        }
+        self.identities = Arc::new(map);
+        self
+    }
+
+    /// The identity `presented` was issued to, if it was given one. Compared in
+    /// constant time against every labelled token, like [`Auth::grants`].
+    pub fn identity(&self, presented: &str) -> Option<String> {
+        let mut found = None;
+        for (token, id) in self.identities.iter() {
+            if ct_eq(presented.as_bytes(), token.as_bytes()) {
+                found = Some(id.clone());
+            }
+        }
+        found
     }
 
     /// Build from (token, scopes) pairs. Empty tokens are ignored so an unset
@@ -114,7 +144,7 @@ impl Auth {
             tokens.entry(token).or_default().extend(scopes);
         }
         let enforced = !tokens.is_empty();
-        Auth { tokens: Arc::new(tokens), enforced }
+        Auth { tokens: Arc::new(tokens), identities: Arc::new(HashMap::new()), enforced }
     }
 
     pub fn is_enforced(&self) -> bool {

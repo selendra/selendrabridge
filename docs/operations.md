@@ -84,7 +84,7 @@ Override the shared sig-store secret, which defaults to `dev-local-bridge-token`
 SIG_STORE_TOKEN=$(openssl rand -hex 32) docker compose up -d
 ```
 
-`SIG_STORE_TOKEN` is the legacy all-scopes secret: whoever holds it can read, sign, relay, report observed lifecycle and edit the allowlist, and the service logs a warning when it is set. It is fine for a throwaway local stack. For anything else, give each service the narrowest one instead — `SIG_STORE_VALIDATOR_TOKEN`, `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN`, `SIG_STORE_ADMIN_TOKEN`, `SIG_STORE_INDEXER_TOKEN` — so a leak from one component cannot write on behalf of the others. `scripts/bridge-from-json.sh` generates the five separately when `sig_store.tokens.generate_if_unset` is set.
+`SIG_STORE_TOKEN` is the legacy all-scopes secret: whoever holds it can read, sign, relay, report observed lifecycle and edit the allowlist, and the service logs a warning when it is set. It is fine for a throwaway local stack. For anything else, give each service the narrowest one instead — `SIG_STORE_VALIDATOR_TOKENS` (one per validator, §5.3), `SIG_STORE_KEEPER_TOKEN`, `SIG_STORE_READER_TOKEN`, `SIG_STORE_ADMIN_TOKEN`, `SIG_STORE_INDEXER_TOKEN` — so a leak from one component cannot write on behalf of the others. `scripts/bridge-from-json.sh` generates them separately when `sig_store.tokens.generate_if_unset` is set.
 
 ### the Solana marker observer (`SIG_STORE_INDEXER_TOKEN`)
 
@@ -374,11 +374,13 @@ HTTPS works without a code change — the workspace `reqwest` keeps its default 
 
 **Clock skew does not matter, and should not.** The refund loop derives transfer age from block timestamps read off the chain, never from the host's wall clock (`validator/src/refund.rs:117`). Do not add a wall-clock-based timeout on top of it.
 
-### 5.3 The credential gap to close first
+### 5.3 One Sign credential per validator
 
-`crates/sig-store/src/main.rs` exposes a single `--validator-token` / `SIG_STORE_VALIDATOR_TOKEN`, so today every validator shares one sign credential. `Auth` itself is a `HashMap<String, HashSet<Scope>>` and already supports many tokens per scope — making the flag repeatable gives each operator a credential you can revoke individually.
+The sig-store takes `SIG_STORE_VALIDATOR_TOKENS`: one `label:token` entry per validator machine and per Solana relayer (comma-, space- or newline-separated). Each token carries the validator scopes (`Read` + `Sign`) and is its own rate-limit bucket and its own identity, so one holder flooding the store cannot 429 every validator's upserts (audit round 7, M7-11), and one operator's access can be revoked by removing their entry. Each validator still reads its own token as `SIG_STORE_VALIDATOR_TOKEN`. The store refuses to start on a repeated token or label. The label is logged, the token never; H7-3's validator-set check is meant to map it to the validator's address.
 
-Until that lands, understand what one leaked token does and does not buy an attacker. It does **not** let them forge signatures: `Db::upsert_signature` ecrecovers every signature and `Gate._verifySignatures` counts only keys in the on-chain validator set. It does let them write to the store unattributably and spam it, and it means revoking one operator's access means rotating the token for everyone.
+The legacy shared `SIG_STORE_VALIDATOR_TOKEN` is still accepted on the store, with a warning, for compatibility. `scripts/bridge-from-json.sh` no longer issues it: `--compose` writes one `SIG_STORE_VALIDATOR_TOKEN_<NAME>` / `SIG_STORE_SOLANA_RELAYER_TOKEN_<NAME>` per holder into `.env` (kept across regenerations) and passes each container only its own.
+
+What one leaked token does and does not buy an attacker: it does **not** let them forge signatures (`Db::upsert_signature` ecrecovers every signature and `Gate._verifySignatures` counts only keys in the on-chain validator set). It does let them write to the store and spam it within that token's own budget.
 
 ### 5.4 Checking that a remote validator is actually working
 
@@ -443,7 +445,7 @@ The pattern is still the one to break before a real key goes anywhere near it.
 
 ### 6.1 The governance key is not a service key (audit T-5)
 
-The EVM gate/pool `owner()` holds governance — `scheduleUpgrade`, `scheduleGovernance`, `transferOwnership`, `seal` — and the Solana gate's owner is whoever signed `init`, permanently. Neither key belongs in a running container. The deploy scripts leave the deployer as owner **and** as each pool's oracle, so a stack that runs its price keeper with the deployer key has put governance on a long-lived service. Check with:
+The EVM gate/pool `owner()` holds governance — `scheduleUpgrade`, the typed `schedule*` calls (`scheduleSetLocalToken`, `scheduleAddValidator`, …), `transferOwnership`, `seal` — and the Solana gate's owner is whoever signed `init`, permanently. Neither key belongs in a running container. The deploy scripts leave the deployer as owner **and** as each pool's oracle, so a stack that runs its price keeper with the deployer key has put governance on a long-lived service. Check with:
 
 ```bash
 bash scripts/rotate-keys.sh docker/<stack>/configs/chains.json status
@@ -461,6 +463,8 @@ Every `owner`, `oracle` and `guardian` column printed there must be a different 
 4. `status` again.
 
 **Set a guardian.** `cancelScheduledUpgrade` and `cancelScheduledGovernance` accept only the owner or the guardian. With no guardian, the 48 h timelock can be cancelled only by the key it is meant to protect against: a stolen owner key schedules an upgrade, and nobody else can stop it.
+
+**Replacing or removing a guardian is itself timelocked (audit M7-1).** Once a gate is past its setup phase (sealed, or 7 days after `initialize`), `setGuardian` on a gate that already has a guardian needs `scheduleSetGuardian(new)` first, 48 h, then `setGuardian(new)` within 7 days — and the **current** guardian can cancel it. Otherwise a stolen owner key could queue a drain and remove the only party able to cancel it in the same block. Appointing a guardian where none is set stays instant. `handover` does this for you: on a gate that already has a different guardian it sends `scheduleSetGuardian` and prints the `setGuardian` the new owner must send after the delay. The flip side: a stolen **guardian** key can keep cancelling its own replacement and so freeze delayed governance (upgrades, new corridors, validator additions) — it still cannot move funds or unpause. Keep the guardian key separate from the owner and from every service key.
 
 On Solana the gate has no ownership transfer, so the owner keypair must never be a service key. Move the swap pool's oracle off it with `swap-admin set-oracle --oracle <pubkey>` and point `price_keeper.solana_oracle_keypair` at the new keypair. The compose generator mounts each service's **own** keyfile (`./keys/<file>`), not the whole `keys/` directory. Before that change, every Solana relayer could read the price keeper's key, so on a stack where that key was the owner, every relayer held governance too. Regenerate a stack to pick up the change.
 
@@ -493,7 +497,7 @@ This is the checklist those scripts encode. Every line is an assertion to make *
 7. `tokenOf[debridgeId]` is set for every asset the gate must pay out, and the gate holds liquidity in each.
    A transfer to an unregistered asset cannot be claimed.
 8. **`isSealed()` is true**, and it became true *before* the gate was funded.
-   Sealing ends the setup phase: from then on a new corridor needs `scheduleGovernance(setLocalTokenActionId(debridgeId, token))`, the 48 h `GOVERNANCE_DELAY`, and execution within the 7-day `SCHEDULE_GRACE`. That delay is what stops a stolen owner key from pointing a real corridor at a worthless token and draining the pot in one block (H-1). An unsealed gate holding funds is that drain waiting.
+   Sealing ends the setup phase: from then on a new corridor needs `scheduleSetLocalToken(debridgeId, token)`, the 48 h `GOVERNANCE_DELAY`, and execution within the 7-day `SCHEDULE_GRACE`. That delay is what stops a stolen owner key from pointing a real corridor at a worthless token and draining the pot in one block (H-1). An unsealed gate holding funds is that drain waiting.
 
 **SwapPool, per chain, if deployed**
 
@@ -580,14 +584,29 @@ Changing the data means re-scheduling, which restarts the delay. A schedule made
 Adding a validator and lowering the threshold both grant signing power, so both wait out `GOVERNANCE_DELAY`. Removing one and raising the threshold both take power away, so both are immediate — that asymmetry is what keeps incident response fast.
 
 ```bash
-# 1. queue it (emits GovernanceScheduled with the readyAt timestamp)
-cast send $GATE "scheduleGovernance(bytes32)" \
-  $(cast call $GATE "addValidatorActionId(address)(bytes32)" $NEW_VALIDATOR)
+# 1. queue it (emits GovernanceScheduled + AddValidatorScheduled(actionId, validator, readyAt))
+cast send $GATE "scheduleAddValidator(address)" $NEW_VALIDATOR
 # 2. wait 48h, then
 cast send $GATE "setValidator(address,bool)" $NEW_VALIDATOR true
 ```
 
-`cancelScheduledGovernance(bytes32)` drops a queued action, and the guardian may call it as well as the owner.
+`cancelScheduledGovernance(bytes32)` drops a queued action, and the guardian may call it as well as the owner. The id to cancel is in the schedule event, or from the matching `*ActionId` view.
+
+**Every delayed action has a typed schedule call (audit M7-1).** The opaque `scheduleGovernance(bytes32)` is gone: it let the owner queue a bare hash, so observers could not tell which corridor or token was coming. Each call below derives the id itself and emits `GovernanceScheduled(actionId, readyAt)` plus a typed event carrying the decoded parameters — watch for these:
+
+| Schedule | Executes | Typed event |
+|---|---|---|
+| `scheduleAddValidator(v)` | `setValidator(v, true)` | `AddValidatorScheduled(actionId, validator, readyAt)` |
+| `scheduleLowerThreshold(t)` | `setThreshold(t)` | `LowerThresholdScheduled(actionId, threshold, readyAt)` |
+| `scheduleSetLocalToken(debridgeId, token)` | `setLocalToken(...)` | `SetLocalTokenScheduled(actionId, debridgeId, localToken, readyAt)` |
+| `scheduleSetBridgeDecimals(token, d)` | `setBridgeDecimals(...)` | `SetBridgeDecimalsScheduled(actionId, token, bridgeDecimals, readyAt)` |
+| `scheduleSetGuardian(g)` | `setGuardian(g)` | `SetGuardianScheduled(actionId, newGuardian, readyAt)` |
+
+`scheduleSetLocalToken` and `scheduleSetBridgeDecimals` refuse a token with no code (`TokenHasNoCode`), so the token that sits out the delay is the token that will be used — not a CREATE2 address filled in afterwards. They also refuse what execution would refuse (already registered, invalid scale). Action ids carry a version tag since this change, so a schedule queued through the old `scheduleGovernance` before the upgrade can never be consumed: re-schedule it with the typed call.
+
+### 9.1a Minimum send and `autoParams` cap (audit M7-12)
+
+Each `send` costs the keeper a full `claim` on the destination, so dust sends from a cheap chain drain the keeper's gas wallet. `setMinSendAmount(token, min)` (owner, instant, `MinSendAmountSet`) sets the smallest **local** amount `send` accepts for that token on this gate; 0 — the default — means no minimum. Size it so the smallest accepted send still covers a claim on the most expensive destination. It is instant because it only restricts new sends; in-flight transfers are unaffected. `deploy-from-json.sh` sets it from `assets[].min_send` (human units, scaled by each chain's decimals). `send` also refuses `autoParams` longer than `MAX_AUTO_PARAMS_LENGTH` (4096 bytes), well inside the signature store's 32 KiB bound.
 
 **The one case that needs planning.** A removal cannot drop `validatorCount` below `threshold`. So evicting a validator from a set where `validatorCount == threshold` (a 3-of-3, say) means lowering the threshold first, which does wait out the delay. Size the set with headroom — a 2-of-3 can evict immediately — and use `pause()` if you want everything stopped in the meantime. A minority validator cannot move funds on its own, so the wait costs safety nothing.
 
@@ -608,8 +627,7 @@ cast send $GATE "seal()"                                                  # last
 `scripts/run.sh` and `scripts/deploy-from-json.sh` do all three (`SEAL_GATES` / `gate.seal`, default `true`; `EXTRA_SUPPORTED_CHAINS` / `gate.extra_supported_chains` for peers outside the config, e.g. the Solana chain id) and assert the result. After `seal()`, adding a corridor is a governance action:
 
 ```bash
-AID=$(cast call $GATE "setLocalTokenActionId(bytes32,address)(bytes32)" $DEBRIDGE_ID $LOCAL_TOKEN)
-cast send $GATE "scheduleGovernance(bytes32)" $AID
+cast send $GATE "scheduleSetLocalToken(bytes32,address)" $DEBRIDGE_ID $LOCAL_TOKEN  # token must have code
 # 48h later, within 7 days:
 cast send $GATE "setLocalToken(bytes32,address)" $DEBRIDGE_ID $LOCAL_TOKEN
 ```

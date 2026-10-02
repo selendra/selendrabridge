@@ -18,7 +18,7 @@
 #
 # T-5: the price-keeper signed with the key that is owner() of every gate and
 # pool, so that one container held governance (scheduleUpgrade,
-# scheduleGovernance, transferOwnership, seal, ...). And no gate had a guardian,
+# scheduleSetLocalToken / scheduleAddValidator / ..., transferOwnership, seal, ...). And no gate had a guardian,
 # so nobody but that same key could cancel a scheduled upgrade: the 48 h timelock
 # was defended only by the key it is meant to defend against.
 #
@@ -26,7 +26,11 @@
 #   1. handover (signed by the CURRENT owner)
 #        pool.setOracle(new-oracle)      the price-keeper's only role
 #        gate/pool/router.setGuardian(guardian)  optional, but see above; do it
-#                                        here, while the hot key can still send it
+#                                        here, while the hot key can still send it.
+#                                        A gate that ALREADY has a different
+#                                        guardian gets scheduleSetGuardian instead
+#                                        (M7-1: replacing a live guardian waits
+#                                        48 h); the new owner executes it later.
 #        gate/pool/router.transferOwnership(new-owner)  step 1 of 2; nothing moves yet
 #   2. put the NEW ORACLE key in price-keeper.toml and restart price-keeper.
 #      Between 1 and 2 the keeper logs "we are not this pool's oracle" — prices
@@ -142,6 +146,29 @@ status() {
   done
 }
 
+# Gate guardian (audit 2026-10-02, M7-1). Since the M7-1 implementation,
+# REPLACING a live guardian on a gate past its setup phase is a timelocked
+# action the current guardian can cancel; appointing one where none is set is
+# still instant. A gate still on the pre-M7-1 implementation (no
+# setGuardianActionId) keeps the old instant setter.
+gate_guardian_handover() {  # rpc gate
+  local rpc="$1" gate="$2" cur
+  cur="$(lc "$(call "$rpc" "$gate" 'guardian()(address)')")"
+  if [[ "$cur" == "$(lc "$GUARDIAN")" ]]; then
+    echo "  $gate guardian already $GUARDIAN"
+  elif [[ "$cur" =~ ^0x0{40}$ ]] \
+    || [[ "$(call "$rpc" "$gate" 'setGuardianActionId(address)(bytes32)' "$GUARDIAN")" == "?" ]] \
+    || [[ "$(call "$rpc" "$gate" 'inSetupPhase()(bool)')" == "true" ]]; then
+    send "$rpc" "$gate" 'setGuardian(address)' "$GUARDIAN"
+  else
+    send "$rpc" "$gate" 'scheduleSetGuardian(address)' "$GUARDIAN"
+    echo "  NOTE: the gate already has guardian $cur, so its replacement is QUEUED (M7-1)."
+    echo "        After GOVERNANCE_DELAY (48 h) and within SCHEDULE_GRACE (7 days) the gate"
+    echo "        owner — by then $NEW_OWNER — must send: $gate setGuardian(address) $GUARDIAN"
+    echo "        The current guardian can cancel it meanwhile (cancelScheduledGovernance)."
+  fi
+}
+
 handover() {
   is_addr "$NEW_ORACLE" || die "--new-oracle must be a non-zero address"
   is_addr "$NEW_OWNER"  || die "--new-owner must be a non-zero address"
@@ -172,7 +199,8 @@ handover() {
     echo "== chain $cid"
     [[ -n "$pool" ]] && send "$rpc" "$pool" 'setOracle(address)' "$NEW_ORACLE"
     if [[ -n "$GUARDIAN" ]]; then
-      for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
+      gate_guardian_handover "$rpc" "$gate"
+      for c in ${pool:+"$pool"} ${router:+"$router"}; do
         send "$rpc" "$c" 'setGuardian(address)' "$GUARDIAN"
       done
     fi

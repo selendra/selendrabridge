@@ -75,7 +75,7 @@ much as getting it right.
 | --- | --- | --- |
 | 1 store | Postgres password, all four scoped tokens | any chain signing key |
 | 1 indexer | Postgres password | any token, any signing key |
-| 2..4 validator | its own **signing key**, `SIG_STORE_VALIDATOR_TOKEN` | Postgres, keeper key, admin token |
+| 2..4 validator | its own **signing key**, its OWN `SIG_STORE_VALIDATOR_TOKEN` (one entry of the store's `SIG_STORE_VALIDATOR_TOKENS`) | Postgres, keeper key, admin token |
 | 5 keeper | its own **funded gas key**, `SIG_STORE_KEEPER_TOKEN` | Postgres, any validator key, sign scope |
 | 2..4 solana-relayer | the **same secp256k1 key** as the EVM validator beside it, `SIG_STORE_VALIDATOR_TOKEN` | Postgres, a Solana payer keypair |
 | 5 solana-relayer | a **funded Solana payer keypair**, a validator key, `SIG_STORE_VALIDATOR_TOKEN` | Postgres, admin token |
@@ -135,10 +135,14 @@ ssh machine1
 cd ~/bridge-store
 cp .env.example .env
 # generate five independent secrets
-for v in POSTGRES_PASSWORD SIG_STORE_VALIDATOR_TOKEN SIG_STORE_KEEPER_TOKEN \
-         SIG_STORE_READER_TOKEN SIG_STORE_ADMIN_TOKEN; do
+for v in POSTGRES_PASSWORD SIG_STORE_KEEPER_TOKEN \
+         SIG_STORE_READER_TOKEN SIG_STORE_ADMIN_TOKEN SIG_STORE_INDEXER_TOKEN; do
   echo "$v=$(openssl rand -hex 32)"
-done   # paste into .env, then set SIG_STORE_DOMAIN / ACME_EMAIL / OPERATOR_CIDRS
+done
+# ONE Sign token per validator machine / Solana relayer (audit M7-11); hand
+# each operator only their own, as SIG_STORE_VALIDATOR_TOKEN in their .env.
+echo "SIG_STORE_VALIDATOR_TOKENS=$(for op in op-a op-b op-c; do
+  printf '%s:%s,' "$op" "$(openssl rand -hex 32)"; done | sed 's/,$//')"   # paste into .env, then set SIG_STORE_DOMAIN / ACME_EMAIL / OPERATOR_CIDRS
 chmod 600 .env
 docker compose up -d
 curl -fsS https://sig-store.example.com/health    # from an allowlisted IP

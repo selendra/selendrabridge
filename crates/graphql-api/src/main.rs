@@ -31,6 +31,7 @@
 //! optional, so it cannot be reintroduced by a config.
 
 mod chain;
+mod client_ip;
 mod solana_pool;
 mod schema;
 mod swap;
@@ -47,11 +48,12 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post_service};
 use axum::Router;
 use bridge_core::backend::StoreBackend;
-use bridge_core::ratelimit::{enforce_by_peer as rate_limit, RateLimit};
+use bridge_core::ratelimit::RateLimit;
 use clap::Parser;
 use tracing::{info, warn};
 
 use chain::Chains;
+use client_ip::{enforce_by_client, ClientLimit, TrustedProxies};
 use schema::{ApiState, Mutation, Query};
 use swap::Swaps;
 
@@ -113,6 +115,15 @@ struct Args {
     /// How many requests may arrive back to back before the limit bites.
     #[arg(long, env = "GRAPHQL_RATE_BURST", default_value_t = 100)]
     rate_burst: u32,
+    /// Reverse proxies (CIDR or bare IP; repeatable, or comma-separated in the
+    /// env var) whose `X-Forwarded-For` / `X-Real-IP` is believed for the rate
+    /// limit key (audit round 7, M7-5). Default: none — the limit keys on the
+    /// TCP peer, which behind nginx is ONE bucket for every user. Set it to the
+    /// address range of the proxy in front (production: the `bridge-api`
+    /// network's pinned subnet). Never list a range a client can connect from
+    /// directly: a peer in it may claim to be anyone.
+    #[arg(long = "trusted-proxy", env = "GRAPHQL_TRUSTED_PROXIES", value_delimiter = ',', value_name = "CIDR")]
+    trusted_proxies: Vec<String>,
     /// Largest accepted request body, in bytes.
     #[arg(long, env = "GRAPHQL_MAX_BODY_BYTES", default_value_t = 128 * 1024)]
     max_body_bytes: usize,
@@ -143,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
         (None, None) => anyhow::bail!("need a store: pass --dir <path> or --store-url <url>"),
     };
     let described = backend.describe();
+
+    let trusted = TrustedProxies::parse(&args.trusted_proxies)?;
 
     let mut chains = Chains::new();
     for spec in &args.gates {
@@ -273,15 +286,33 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Bound what one caller can cost us. Keyed on the PEER ADDRESS, not on the
+    // Bound what one caller can cost us. Keyed on the CLIENT ADDRESS, not on the
     // bearer token the sig-store keys on: this service mounts no authentication,
     // so a token here is a string the caller invents. Keying on it let anyone
     // send a fresh random bearer per request, land on a brand-new full bucket
     // every time and never be limited at all (audit 2026-09-16, H-7).
+    //
+    // The client address is the TCP peer unless that peer is a declared
+    // `--trusted-proxy`; then it is the rightmost untrusted `X-Forwarded-For`
+    // hop. Without that, every user behind nginx shared one bucket (M7-5).
     if args.rate_per_second > 0.0 {
-        let limit = RateLimit::new(args.rate_burst, args.rate_per_second);
-        info!(burst = args.rate_burst, per_second = args.rate_per_second, "rate limit active");
-        router = router.route_layer(middleware::from_fn_with_state(limit, rate_limit));
+        let limit = ClientLimit {
+            limit: RateLimit::new(args.rate_burst, args.rate_per_second),
+            trusted: trusted.clone(),
+        };
+        info!(
+            burst = args.rate_burst,
+            per_second = args.rate_per_second,
+            trusted_proxies = ?args.trusted_proxies,
+            "rate limit active"
+        );
+        if trusted.is_empty() {
+            warn!(
+                "no --trusted-proxy: the rate limit keys on the TCP peer; behind a reverse \
+                 proxy that is ONE bucket shared by every user"
+            );
+        }
+        router = router.route_layer(middleware::from_fn_with_state(limit, enforce_by_client));
     }
 
     let app = router
@@ -303,7 +334,7 @@ async fn main() -> anyhow::Result<()> {
         history = args.store_url.is_some(),
         "graphql-api listening (GraphiQL at /)"
     );
-    // `enforce_by_peer` reads `ConnectInfo<SocketAddr>`; without this the
+    // `enforce_by_client` reads `ConnectInfo<SocketAddr>`; without this the
     // extension is absent and every peer shares one bucket.
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;

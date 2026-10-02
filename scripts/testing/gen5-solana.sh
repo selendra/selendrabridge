@@ -145,9 +145,8 @@ configure)
       # H-1: on a sealed gate this is a governance action, not an instant call.
       sealed=$(cast call "$CHAIN_11155111_GATE" "isSealed()(bool)" --rpc-url "$(rpc 11155111)" 2>/dev/null || echo false)
       if [ "$sealed" = "true" ]; then
-        aid=$(cast call "$CHAIN_11155111_GATE" "setLocalTokenActionId(bytes32,address)(bytes32)" "'"$DID"'" "$TOKEN_TST_11155111" --rpc-url "$(rpc 11155111)")
         echo "  !! Sepolia gate is SEALED — register the return path through governance:"
-        echo "     cast send $CHAIN_11155111_GATE '"'"'scheduleGovernance(bytes32)'"'"' $aid --rpc-url <sepolia> --private-key <owner>"
+        echo "     cast send $CHAIN_11155111_GATE '"'"'scheduleSetLocalToken(bytes32,address)'"'"' '"$DID"' $TOKEN_TST_11155111 --rpc-url <sepolia> --private-key <owner>"
         echo "     # after 48h (within 7d):"
         echo "     cast send $CHAIN_11155111_GATE '"'"'setLocalToken(bytes32,address)'"'"' '"$DID"' $TOKEN_TST_11155111 --rpc-url <sepolia> --private-key <owner>"
         echo "     (or add \"11155111|'"$DID"'|$TOKEN_TST_11155111\" to EXTRA_LOCAL_TOKENS before the next run.sh deploy)"

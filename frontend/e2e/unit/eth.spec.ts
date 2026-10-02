@@ -24,6 +24,8 @@ import {
   sendFinalize,
   sendSwap,
   sendSwapAndBridge,
+  slippageFloor,
+  stableAtDestination,
   waitReceipt,
   waitReceiptFull,
   rpcRequest,
@@ -481,6 +483,54 @@ test.describe("bridgeDecimalsFromUnit", () => {
     expect(bridgeDecimalsFromUnit(18, 0n)).toBeNull();
     expect(bridgeDecimalsFromUnit(18, 10n ** 19n)).toBeNull(); // more zeros than decimals
     expect(bridgeDecimalsFromUnit(Number.NaN, 1n)).toBeNull();
+  });
+});
+
+/**
+ * Audit round 7, M7-7b. The destination router swaps `wire * dstUnit` of ITS
+ * stable, where `wire = stableOut / srcUnit` — so leg 2 must be quoted in
+ * destination-local units, or the signed `finalMinOut` is off by 10^Δ.
+ */
+test.describe("stableAtDestination", () => {
+  test("is the identity when both stables share a scale", () => {
+    expect(stableAtDestination(5n * 10n ** 18n, 1n, 1n)).toBe(5n * 10n ** 18n);
+  });
+
+  test("rescales a 6-decimal source stable to an 18-decimal destination one", () => {
+    // Both bridge at 6: source unit 1, destination unit 10^12.
+    expect(stableAtDestination(5_000_000n, 1n, 10n ** 12n)).toBe(5n * 10n ** 18n);
+  });
+
+  test("rescales an 18-decimal source stable to a 6-decimal destination one, dropping the dust", () => {
+    // 5.0000001234… : the sub-unit tail is returned on the source, never bridged.
+    expect(stableAtDestination(5n * 10n ** 18n + 123_456_789n, 10n ** 12n, 1n)).toBe(5_000_000n);
+  });
+
+  test("an unknown or nonsensical unit is null, never a guessed 1", () => {
+    expect(stableAtDestination(1n, null, 1n)).toBeNull();
+    expect(stableAtDestination(1n, 1n, null)).toBeNull();
+    expect(stableAtDestination(1n, 0n, 1n)).toBeNull();
+    expect(stableAtDestination(-1n, 1n, 1n)).toBeNull();
+  });
+});
+
+/** Audit round 7, M7-7a: a missing quote is no floor at all, not a floor of 0. */
+test.describe("slippageFloor", () => {
+  test("takes the slippage off the quote, rounding down", () => {
+    expect(slippageFloor(10_000n, 50)).toBe(9_950n);
+    expect(slippageFloor(5n * 10n ** 30n, 50)).toBe(4975n * 10n ** 27n);
+  });
+
+  test("a missing, zero or vanishing quote is null, never 0", () => {
+    expect(slippageFloor(null, 50)).toBeNull();
+    expect(slippageFloor(0n, 50)).toBeNull();
+    expect(slippageFloor(1n, 50)).toBeNull(); // 0.995 rounds to 0
+  });
+
+  test("refuses a nonsensical slippage", () => {
+    expect(slippageFloor(100n, 10_000)).toBeNull();
+    expect(slippageFloor(100n, -1)).toBeNull();
+    expect(slippageFloor(100n, 0.5)).toBeNull();
   });
 });
 

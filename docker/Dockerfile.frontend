@@ -26,5 +26,9 @@ COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
 # narrower list. An UNSET variable would envsubst to an empty directive and
 # break every request, so it is set here rather than left to the operator.
 ENV BRIDGE_CSP_CONNECT_SRC="'self' https: wss: http://127.0.0.1:* http://localhost:*"
+# Whose X-Forwarded-For nginx believes (M7-5). Loopback = nobody: right where
+# nginx is the edge. Behind Caddy, set it to the proxy network's subnet
+# (docker/production/api pins one). One CIDR; unset would break the config.
+ENV BRIDGE_REAL_IP_FROM="127.0.0.1/32"
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 8080

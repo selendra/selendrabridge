@@ -42,6 +42,9 @@ url = "https://sig-store.example.com"
 # component it guards against. Opting in turns that into a refusal: the node
 # skips the tick (logging why) rather than acting on a list it cannot trust.
 #
+# Under `require` (or any pin) BOTH lists must be non-empty: a store serving
+# chain pairs with no tokens would otherwise switch the token check off (M7-10).
+#
 # `require = true` alone is enough. Pinning names entries that MUST be present,
 # which also catches a partial truncation; pinning implies `require`.
 #

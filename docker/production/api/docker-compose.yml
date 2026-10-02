@@ -54,6 +54,12 @@ services:
       BRIDGE_THRESHOLD: "${BRIDGE_THRESHOLD:?set BRIDGE_THRESHOLD}"
       GRAPHQL_GATES: "${GRAPHQL_GATES:-}"
       GRAPHQL_SWAPS: "${GRAPHQL_SWAPS:-}"
+      # M7-5 (`--trusted-proxy`, read from this env var): believe X-Forwarded-For
+      # only from nginx, i.e. from this stack's pinned private network (below).
+      # graphql-api is never published, so nothing outside the network can
+      # claim to be a proxy. Without it every user shares ONE rate-limit bucket
+      # (the peer is always nginx).
+      GRAPHQL_TRUSTED_PROXIES: "${BRIDGE_API_SUBNET:-172.30.88.0/24}"
       # Read scope only. This is the most exposed component in the system.
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"
       # Caps the span of a single eth_getLogs the API issues for pool reads.
@@ -83,6 +89,10 @@ services:
     # same-origin and no CORS config is needed. graphql-api is never published.
     depends_on:
       graphql-api: { condition: service_healthy }
+    environment:
+      # M7-5: nginx takes the client address from Caddy's X-Forwarded-For, and
+      # only from a peer on this network. Must equal the subnet below.
+      BRIDGE_REAL_IP_FROM: "${BRIDGE_API_SUBNET:-172.30.88.0/24}"
     networks: [bridge-api]
 
   caddy:
@@ -106,4 +116,10 @@ volumes:
   caddy-config:
 
 networks:
+  # Pinned (M7-5) so the trusted-proxy ranges above name exactly this network:
+  # caddy -> frontend -> graphql-api. Pick a free range if it collides with one
+  # on the host; changing it needs `docker compose down && up -d`.
   bridge-api:
+    ipam:
+      config:
+        - subnet: "${BRIDGE_API_SUBNET:-172.30.88.0/24}"

@@ -112,6 +112,6 @@ set_bridge_decimals() {  # rpc key gate token [decimals] — defaults to token.d
     || { echo "set_bridge_decimals: setBridgeDecimals($token,$dec) failed on $gate ($rpc)" >&2; return 1; }
 }
 
-seal_gate() {  # rpc key gate — irreversible; setLocalToken then needs scheduleGovernance + 48h
+seal_gate() {  # rpc key gate — irreversible; setLocalToken then needs scheduleSetLocalToken + 48h
   cast send "$3" "seal()" --rpc-url "$1" --private-key "$2" >/dev/null
 }

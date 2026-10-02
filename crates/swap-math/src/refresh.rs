@@ -11,12 +11,17 @@
 //! * **cooldown** — after the first reprice, another must wait
 //!   `min_update_interval` seconds from `last_price_update`;
 //! * **step cap** — every update may move the price by at most
-//!   `max_deviation_bps` of the current price;
+//!   `max_deviation_bps` of the current price — and, since audit 2026-10-02
+//!   M7-3, by at most the pool's swap fee too (see [`PriceState::step_cap_bps`]);
 //! * **staleness** — swaps refuse a price older than `max_age`.
 //!
 //! A call that breaks a guard reverts and still costs gas, so the planner never
 //! proposes one: it waits out a cooldown and walks a distant target in capped
 //! steps instead.
+//!
+//! Every [`Plan::Set`] carries the price it was planned FROM (M7-4). On EVM that
+//! is the `expectedOld` of `SwapPool.setPrice`'s compare-and-set, so a step
+//! planned from a price an RPC endpoint lied about reverts instead of landing.
 
 use crate::{mul_div_floor, BPS_DENOM, PRICE_ONE};
 
@@ -35,6 +40,25 @@ pub struct PriceState {
     pub max_age: Option<i64>,
     pub min_update_interval: i64,
     pub max_deviation_bps: u16,
+    /// The pool's swap fee in bps.
+    pub fee_bps: u16,
+}
+
+impl PriceState {
+    /// The largest step one update may make: the LESSER of the deviation cap and
+    /// the swap fee (audit 2026-10-02, M7-3).
+    ///
+    /// Swaps fill at exactly the oracle price, and a keeper's steps are
+    /// predictable, so a trader can buy just before an update and sell just
+    /// after. A round trip pays the fee twice; with a step no larger than one
+    /// fee it can never come out ahead (`SwapPool.priceStepCapBps` has the
+    /// arithmetic). `SwapPool.sol` enforces exactly this on chain; the Solana
+    /// program enforces only the deviation cap, so there the keeper holds itself
+    /// to the tighter bound voluntarily. A pool with a zero fee can therefore be
+    /// refreshed but never moved.
+    pub fn step_cap_bps(&self) -> u16 {
+        self.max_deviation_bps.min(self.fee_bps)
+    }
 }
 
 /// What to do about one token.
@@ -44,9 +68,11 @@ pub enum Plan {
     Idle,
     /// Something needs doing, but the cooldown forbids it until `until`.
     Wait { until: i64 },
-    /// Send `setPrice(price)`. `step` is true when this is a capped step toward a
-    /// target further away than one update may move.
-    Set { price: u128, step: bool },
+    /// Send `setPrice(from -> price)`. `from` is the on-chain price this was
+    /// planned from — the compare-and-set's expected value (M7-4); send it
+    /// verbatim. `step` is true when this is a capped step toward a target
+    /// further away than one update may move.
+    Set { from: u128, price: u128, step: bool },
 }
 
 /// Decide what to send for a token whose price should be `target`.
@@ -68,7 +94,7 @@ pub fn plan(s: &PriceState, target: u128, margin: i64) -> Plan {
             return Plan::Wait { until };
         }
     }
-    let cap = mul_div_floor(s.price, s.max_deviation_bps as u128, BPS_DENOM as u128).unwrap_or(0);
+    let cap = mul_div_floor(s.price, s.step_cap_bps() as u128, BPS_DENOM as u128).unwrap_or(0);
     let (next, step) = if s.price.abs_diff(target) <= cap {
         (target, false)
     } else if target > s.price {
@@ -81,7 +107,7 @@ pub fn plan(s: &PriceState, target: u128, margin: i64) -> Plan {
     if next == s.price && !due {
         return Plan::Idle;
     }
-    Plan::Set { price: next, step }
+    Plan::Set { from: s.price, price: next, step }
 }
 
 /// Seconds until [`plan`] would call this price due for a refresh (0 = now),
@@ -134,6 +160,7 @@ mod tests {
             max_age: Some(DAY),
             min_update_interval: HOUR,
             max_deviation_bps: 1_000,
+            fee_bps: 1_000,
         }
     }
 
@@ -147,7 +174,7 @@ mod tests {
         let mut s = state(3180);
         s.price_set_at = s.now - (DAY - 6 * HOUR); // exactly at the margin
         s.last_price_update = s.price_set_at;
-        assert_eq!(plan(&s, 3180, 6 * HOUR), Plan::Set { price: 3180, step: false });
+        assert_eq!(plan(&s, 3180, 6 * HOUR), Plan::Set { from: 3180, price: 3180, step: false });
         s.price_set_at += 1;
         assert_eq!(plan(&s, 3180, 6 * HOUR), Plan::Idle, "one second earlier is not due");
     }
@@ -158,7 +185,7 @@ mod tests {
         let mut s = state(3180);
         s.price_set_at = s.now - 4 * DAY;
         s.last_price_update = s.price_set_at;
-        assert_eq!(plan(&s, 3180, 6 * HOUR), Plan::Set { price: 3180, step: false });
+        assert_eq!(plan(&s, 3180, 6 * HOUR), Plan::Set { from: 3180, price: 3180, step: false });
     }
 
     #[test]
@@ -180,10 +207,11 @@ mod tests {
     #[test]
     fn a_distant_target_is_walked_in_capped_steps() {
         let s = state(1000 * PRICE_ONE);
-        assert_eq!(plan(&s, 2000 * PRICE_ONE, 0), Plan::Set { price: 1100 * PRICE_ONE, step: true });
-        assert_eq!(plan(&s, 500 * PRICE_ONE, 0), Plan::Set { price: 900 * PRICE_ONE, step: true });
+        let from = 1000 * PRICE_ONE;
+        assert_eq!(plan(&s, 2000 * PRICE_ONE, 0), Plan::Set { from, price: 1100 * PRICE_ONE, step: true });
+        assert_eq!(plan(&s, 500 * PRICE_ONE, 0), Plan::Set { from, price: 900 * PRICE_ONE, step: true });
         // Within one step: land exactly on target.
-        assert_eq!(plan(&s, 1050 * PRICE_ONE, 0), Plan::Set { price: 1050 * PRICE_ONE, step: false });
+        assert_eq!(plan(&s, 1050 * PRICE_ONE, 0), Plan::Set { from, price: 1050 * PRICE_ONE, step: false });
     }
 
     #[test]
@@ -195,6 +223,63 @@ mod tests {
                 assert!(next.abs_diff(price) <= cap, "{price} -> {next} breaks cap {cap}");
             }
         }
+    }
+
+    /// M7-3: the step is the lesser of the deviation cap and the fee, so a
+    /// round trip around one update always pays more in fees than it gains.
+    #[test]
+    fn m7_3_the_step_never_exceeds_the_fee() {
+        let mut s = state(1000 * PRICE_ONE);
+        s.fee_bps = 30;
+        assert_eq!(s.step_cap_bps(), 30);
+        let from = 1000 * PRICE_ONE;
+        assert_eq!(plan(&s, 2000 * PRICE_ONE, 0), Plan::Set { from, price: 1003 * PRICE_ONE, step: true });
+        assert_eq!(plan(&s, 500 * PRICE_ONE, 0), Plan::Set { from, price: 997 * PRICE_ONE, step: true });
+        // A fee above the deviation cap leaves the deviation cap in charge.
+        s.fee_bps = 1_000;
+        s.max_deviation_bps = 50;
+        assert_eq!(plan(&s, 2000 * PRICE_ONE, 0), Plan::Set { from, price: 1005 * PRICE_ONE, step: true });
+    }
+
+    /// M7-3: a zero-fee pool is refreshed (re-asserted) but never moved.
+    #[test]
+    fn m7_3_a_zero_fee_pool_is_refreshed_but_not_moved() {
+        let mut s = state(3180 * PRICE_ONE);
+        s.fee_bps = 0;
+        assert_eq!(plan(&s, 3500 * PRICE_ONE, 6 * HOUR), Plan::Idle, "cannot move, not due");
+        s.price_set_at = s.now - 2 * DAY;
+        s.last_price_update = s.price_set_at;
+        let p = 3180 * PRICE_ONE;
+        assert_eq!(plan(&s, 3500 * PRICE_ONE, 6 * HOUR), Plan::Set { from: p, price: p, step: true });
+    }
+
+    /// M7-4, the audit's `r7` scenario: an RPC endpoint reports a false on-chain
+    /// price, and the keeper plans a "step toward target" from it — which, on
+    /// the real price, is a capped move AWAY from the target.
+    ///
+    /// The plan still trusts the read (it has nothing else); what changed is
+    /// that the plan now names the price it was computed from, and the keeper
+    /// sends exactly that as the compare-and-set's `expectedOld`. The pool holds
+    /// the real price, so the lie reverts `PriceChanged` instead of landing.
+    #[test]
+    fn r7_a_lied_on_chain_price_fails_safe_through_the_compare_and_set() {
+        let real = 3180 * PRICE_ONE;
+        let target = 3180 * PRICE_ONE;
+        let mut lied = state(3600 * PRICE_ONE); // the endpoint says +13%
+        lied.price_set_at = lied.now - 2 * DAY;
+        lied.last_price_update = lied.price_set_at;
+        let Plan::Set { from, price, .. } = plan(&lied, target, 6 * HOUR) else { panic!("a move is planned") };
+        // Real == target, so ANY move the plan makes is a move away from it.
+        assert_eq!(price, 3240 * PRICE_ONE, "a capped step down from the lie, landing above target");
+        // The on-chain compare-and-set, as SwapPool.setPrice runs it.
+        let cas = |on_chain: u128, expected: u128| on_chain == expected;
+        assert_eq!(from, 3600 * PRICE_ONE, "the plan names the price it was computed from");
+        assert!(!cas(real, from), "so on the real price the step is refused, not applied");
+        // An honest read plans from the real price, and lands.
+        let mut honest = lied;
+        honest.price = real;
+        let Plan::Set { from, .. } = plan(&honest, target, 6 * HOUR) else { panic!() };
+        assert!(cas(real, from));
     }
 
     #[test]
@@ -212,7 +297,7 @@ mod tests {
         assert_eq!(plan(&s, 9, 6 * HOUR), Plan::Idle, "cannot move, not due");
         s.price_set_at = s.now - 2 * DAY;
         s.last_price_update = s.price_set_at;
-        assert_eq!(plan(&s, 9, 6 * HOUR), Plan::Set { price: 5, step: true });
+        assert_eq!(plan(&s, 9, 6 * HOUR), Plan::Set { from: 5, price: 5, step: true });
     }
 
     #[test]

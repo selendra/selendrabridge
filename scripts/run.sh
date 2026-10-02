@@ -153,7 +153,7 @@ public_rpc_for() {  # $1 chain_id, $2 private rpc -> echoes the public url or no
 [[ -n "${EXTRA_SUPPORTED_CHAINS+x}" ]] || EXTRA_SUPPORTED_CHAINS=()
 
 # seal() after wiring (H-1). Irreversible: from then on a NEW corridor needs
-# scheduleGovernance + 48h, which is what stops an owner key from draining the
+# scheduleSetLocalToken + 48h, which is what stops an owner key from draining the
 # gate through a fake corridor. `false` keeps the setup phase open — for a
 # throwaway anvil mesh you keep adding assets to, never for a gate that holds
 # anyone else's funds.
@@ -403,7 +403,7 @@ ensure_bridge_decimals() {  # gate rpc token bridgeDecimals label
     return
   fi
   gate_sealed "$gate" "$rpc" && die "$label: gate $gate is SEALED — bridge decimals now need governance:
-    cast send $gate 'scheduleGovernance(bytes32)' \$(cast call $gate 'setBridgeDecimalsActionId(address,uint8)(bytes32)' $tok $want --rpc-url $rpc) --rpc-url $rpc --private-key <owner>
+    cast send $gate 'scheduleSetBridgeDecimals(address,uint8)' $tok $want --rpc-url $rpc --private-key <owner>
     # wait GOVERNANCE_DELAY, then: cast send $gate 'setBridgeDecimals(address,uint8)' $tok $want ..."
   csend "$gate" "setBridgeDecimals(address,uint8)" "$tok" "$want" --rpc-url "$rpc" --private-key "$DEPLOYER_KEY"
   info "$label: bridge decimals $want"
@@ -415,13 +415,12 @@ ensure_bridge_decimals() {  # gate rpc token bridgeDecimals label
 # skipped, not re-sent. On a SEALED gate the owner can no longer register
 # instantly; print exactly what governance must do instead of a bare revert.
 register_corridor() {  # gate rpc debridgeId localToken label
-  local gate="$1" rpc="$2" did="$3" tok="$4" label="$5" cur aid
+  local gate="$1" rpc="$2" did="$3" tok="$4" label="$5" cur
   cur=$(cast call "$gate" "tokenOf(bytes32)(address)" "$did" --rpc-url "$rpc" 2>/dev/null || echo "")
   if [[ -n "${cur:-}" && ! "${cur:-}" =~ ^0x0{40}$ ]]; then info "$label already registered ($cur)"; return; fi
   if gate_sealed "$gate" "$rpc"; then
-    aid=$(cast call "$gate" "setLocalTokenActionId(bytes32,address)(bytes32)" "$did" "$tok" --rpc-url "$rpc")
     die "$label: gate $gate is SEALED — a new corridor needs governance (H-1):
-    cast send $gate 'scheduleGovernance(bytes32)' $aid --rpc-url $rpc --private-key <owner>
+    cast send $gate 'scheduleSetLocalToken(bytes32,address)' $did $tok --rpc-url $rpc --private-key <owner>
     # wait GOVERNANCE_DELAY (48h), then within SCHEDULE_GRACE (7d):
     cast send $gate 'setLocalToken(bytes32,address)' $did $tok --rpc-url $rpc --private-key <owner>
   (or SEAL_GATES=false on a throwaway mesh, and redeploy)"
@@ -519,7 +518,7 @@ fi
 
 # --- 4b-iii. seal (H-1) — the LAST wiring step, before anything is funded ---
 #
-# From here on every new corridor is scheduleGovernance + 48h. That is the
+# From here on every new corridor is scheduleSetLocalToken + 48h. That is the
 # property that stops a stolen owner key from registering a worthless token as
 # the asset behind a real corridor and draining the pot in one block.
 if [[ "$SEAL_GATES" == "true" ]]; then

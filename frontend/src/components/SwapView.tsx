@@ -11,7 +11,7 @@ import {
   fetchSwapQuote,
 } from "../api/client";
 import { usePoll, useDebounced } from "../api/hooks";
-import { errMsg, readAllowance, readBalance, sendApprove, sendSwap, waitReceipt } from "../wallet/eth";
+import { errMsg, readAllowance, readBalance, sendApprove, sendSwap, slippageFloor, waitReceipt } from "../wallet/eth";
 import type { Chain, PoolToken, SwapPoolInfo } from "../api/types";
 import type { WalletState } from "../wallet/useWallet";
 import type { SolanaWalletState } from "../wallet/useSolanaWallet";
@@ -78,28 +78,36 @@ export function SwapView({ chains, wallet, solana }: Props) {
   const amountBase = tin ? parseUnits(amount, tin.decimals) : 0n;
 
   // --- live quote (debounced) -------------------------------------------
+  //
+  // Keyed to exactly what it was asked for (audit round 7, M7-7): `quoting`
+  // used to flip only once the 300 ms debounce fired, so for that window the
+  // button offered "Swap" with the PREVIOUS amount's quote and its floor. A
+  // quote now counts only when its key matches the live chain/pair/amount.
   const debouncedAmt = useDebounced(amountBase.toString(), 300);
-  const [quote, setQuote] = useState<string | null>(null);
-  const [quoting, setQuoting] = useState(false);
+  const quoteKeyFor = (amt: string) => `${chainId ?? "?"}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}:${amt}`;
+  const [quoteRead, setQuoteRead] = useState<{ key: string; value: string | null } | null>(null);
   useEffect(() => {
     if (chainId == null || !tin || !tout || eq(tokenIn, tokenOut) || BigInt(debouncedAmt) <= 0n) {
-      setQuote(null);
-      setQuoting(false);
+      setQuoteRead(null);
       return;
     }
     let alive = true;
-    setQuoting(true);
+    const key = `${chainId}:${tokenIn.toLowerCase()}:${tokenOut.toLowerCase()}:${debouncedAmt}`;
     fetchSwapQuote(chainId, tokenIn, tokenOut, debouncedAmt)
-      .then((q) => alive && setQuote(q))
-      .catch(() => alive && setQuote(null))
-      .finally(() => alive && setQuoting(false));
+      .then((q) => alive && setQuoteRead({ key, value: q }))
+      .catch(() => alive && setQuoteRead({ key, value: null }));
     return () => {
       alive = false;
     };
   }, [chainId, tokenIn, tokenOut, debouncedAmt, tin, tout]);
 
+  const quoteFresh = quoteRead != null && quoteRead.key === quoteKeyFor(amountBase.toString());
+  const quote = quoteFresh ? quoteRead.value : null;
+  const quoting = amountBase > 0n && !quoteFresh;
   const quoteBase = quote ? BigInt(quote) : 0n;
-  const minOut = (quoteBase * BigInt(10000 - slippageBps)) / 10000n;
+  // Never a floor of 0 from a missing quote: `null` blocks the swap.
+  const minOutOrNull = slippageFloor(quote ? quoteBase : null, slippageBps);
+  const minOut = minOutOrNull ?? 0n;
   const reserveOut = tout ? BigInt(tout.reserve) : 0n;
   const exceedsLock = quoteBase > reserveOut;
 
@@ -183,6 +191,10 @@ export function SwapView({ chains, wallet, solana }: Props) {
 
   const doSwap = async () => {
     if (!pool || !tin || !tout || !wallet.address || chainId == null) return;
+    if (minOutOrNull == null) {
+      setTx({ kind: "error", message: "No current quote — refusing to swap without a slippage floor." });
+      return;
+    }
     setTx({ kind: "pending", label: "Swapping…" });
     try {
       const hash = await sendSwap(
@@ -201,7 +213,7 @@ export function SwapView({ chains, wallet, solana }: Props) {
       if (!r.success) throw new Error("Swap reverted on-chain");
       setTx({ kind: "done", label: `Swapped for ${formatUnits(quoteBase, tout.decimals)} ${tout.symbol}`, hash });
       setAmount("");
-      setQuote(null);
+      setQuoteRead(null);
       await Promise.all([refreshOnchain(), poolQ.refetch()]);
     } catch (e) {
       setTx({ kind: "error", message: errMsg(e) });
@@ -219,6 +231,10 @@ export function SwapView({ chains, wallet, solana }: Props) {
     if (!pool || !tin || !tout || !solana.address || chainId == null) return;
     if (!tin.vault || !tout.vault) {
       setTx({ kind: "error", message: "Pool vaults unavailable — try again in a moment" });
+      return;
+    }
+    if (minOutOrNull == null) {
+      setTx({ kind: "error", message: "No current quote — refusing to swap without a slippage floor." });
       return;
     }
     setTx({ kind: "pending", label: "Building transaction…" });
@@ -267,7 +283,7 @@ export function SwapView({ chains, wallet, solana }: Props) {
         hash: signature,
       });
       setAmount("");
-      setQuote(null);
+      setQuoteRead(null);
       await Promise.all([refreshOnchain(), poolQ.refetch()]);
     } catch (e) {
       setTx({ kind: "error", message: errMsg(e) });
@@ -278,7 +294,7 @@ export function SwapView({ chains, wallet, solana }: Props) {
     setTokenIn(tokenOut);
     setTokenOut(tokenIn);
     setAmount("");
-    setQuote(null);
+    setQuoteRead(null);
     setTx({ kind: "idle" });
   };
 
@@ -297,7 +313,7 @@ export function SwapView({ chains, wallet, solana }: Props) {
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
   else if (insufficient) button = { label: `Insufficient ${tin?.symbol ?? "balance"}`, disabled: true };
   else if (quoting) button = { label: "Fetching quote…", disabled: true };
-  else if (!quote || quoteBase <= 0n) button = { label: "No quote available", disabled: true };
+  else if (!quote || quoteBase <= 0n || minOutOrNull == null) button = { label: "No quote available", disabled: true };
   else if (exceedsLock) button = { label: "Exceeds pool lock", disabled: true };
   else if (needsApprove) button = { label: `Approve ${tin?.symbol ?? "token"}`, onClick: doApprove };
   else button = { label: "Swap", onClick: solanaMode ? doSwapSolana : doSwap };
@@ -330,7 +346,7 @@ export function SwapView({ chains, wallet, solana }: Props) {
             onChange={(v) => {
               setChainId(Number(v));
               setAmount("");
-              setQuote(null);
+              setQuoteRead(null);
               setTx({ kind: "idle" });
             }}
           />

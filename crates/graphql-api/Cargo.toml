@@ -39,3 +39,5 @@ async-graphql-axum = "7"
 # Tests encode pool/token accounts the way the program writes them, to serve
 # from a mock RPC. Same major the swap-math layouts derive with.
 borsh = "1"
+# Drive the rate-limited router in-process via `oneshot` (M7-5 tests).
+tower = { version = "0.5", features = ["util"] }

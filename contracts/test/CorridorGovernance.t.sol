@@ -100,7 +100,7 @@ contract CorridorGovernanceTest is Test {
         gate.seal();
         bytes32 action = gate.setLocalTokenActionId(debridgeId, address(usdc));
 
-        gate.scheduleGovernance(action);
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
         uint256 readyAt = gate.governanceReadyAt(action);
         assertEq(readyAt, block.timestamp + gate.GOVERNANCE_DELAY());
 
@@ -119,7 +119,7 @@ contract CorridorGovernanceTest is Test {
     function test_SetLocalToken_ScheduleIsBoundToBothDebridgeIdAndToken() public {
         gate.seal();
         TestToken other = new TestToken("Other", "OTH");
-        gate.scheduleGovernance(gate.setLocalTokenActionId(debridgeId, address(usdc)));
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
 
         vm.expectRevert(
@@ -146,7 +146,7 @@ contract CorridorGovernanceTest is Test {
     function test_SetLocalToken_GuardianCanCancelAScheduledRegistration() public {
         gate.seal();
         bytes32 action = gate.setLocalTokenActionId(debridgeId, address(usdc));
-        gate.scheduleGovernance(action);
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
 
         vm.prank(guardian);
         gate.cancelScheduledGovernance(action);
@@ -159,12 +159,16 @@ contract CorridorGovernanceTest is Test {
     }
 
     /// Sealing does not touch the write-once rule: an existing corridor still
-    /// cannot be repointed even with a matured schedule for the new mapping.
+    /// cannot be repointed — the repoint cannot even be scheduled (M7-1 checks
+    /// write-once at schedule time), let alone executed.
     function test_SetLocalToken_AfterSeal_StillWriteOnce() public {
         gate.setLocalToken(debridgeId, address(usdc));
         gate.seal();
         TestToken other = new TestToken("Other", "OTH");
-        gate.scheduleGovernance(gate.setLocalTokenActionId(debridgeId, address(other)));
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.LocalTokenAlreadySet.selector, debridgeId, address(usdc))
+        );
+        gate.scheduleSetLocalToken(debridgeId, address(other));
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
 
         vm.expectRevert(
@@ -209,7 +213,7 @@ contract CorridorGovernanceTest is Test {
         // Even the honest route takes the full public delay first — the window
         // in which observers verify the source asset and the guardian cancels.
         bytes32 action = gate.setLocalTokenActionId(debridgeId, address(usdc));
-        gate.scheduleGovernance(action);
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
         vm.expectRevert(
             abi.encodeWithSelector(
                 Gate.GovernanceNotReady.selector, action, gate.governanceReadyAt(action)
@@ -262,7 +266,7 @@ contract CorridorGovernanceTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Gate.GovernanceNotScheduled.selector, action));
         gate.setLocalToken(debridgeId, address(usdc));
 
-        gate.scheduleGovernance(action);
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
         vm.warp(block.timestamp + gate.GOVERNANCE_DELAY());
         gate.setLocalToken(debridgeId, address(usdc));
         assertEq(gate.tokenOf(debridgeId), address(usdc), "honest route still works");
@@ -355,7 +359,7 @@ contract CorridorGovernanceTest is Test {
     function test_Governance_ScheduleExpiresAfterTheGrace() public {
         address newV = vm.addr(0xB0B);
         bytes32 action = gate.addValidatorActionId(newV);
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         uint256 readyAt = gate.governanceReadyAt(action);
 
         // Void one second past the grace window. The PoC in the audit executed
@@ -370,7 +374,7 @@ contract CorridorGovernanceTest is Test {
         gate.setValidator(newV, true);
 
         // Re-scheduling restarts the delay in public view, as intended.
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         assertEq(gate.governanceReadyAt(action), block.timestamp + gate.GOVERNANCE_DELAY());
     }
 
@@ -379,7 +383,7 @@ contract CorridorGovernanceTest is Test {
     function test_Governance_ScheduleIsStillGoodOnTheLastSecondOfTheGrace() public {
         address newV = vm.addr(0xB0B);
         bytes32 action = gate.addValidatorActionId(newV);
-        gate.scheduleGovernance(action);
+        gate.scheduleAddValidator(newV);
         vm.warp(gate.governanceReadyAt(action) + gate.SCHEDULE_GRACE());
         gate.setValidator(newV, true);
         assertTrue(gate.isValidator(newV));
@@ -388,7 +392,7 @@ contract CorridorGovernanceTest is Test {
     function test_Governance_ExpiryAppliesToCorridorRegistrationsToo() public {
         gate.seal();
         bytes32 action = gate.setLocalTokenActionId(debridgeId, address(usdc));
-        gate.scheduleGovernance(action);
+        gate.scheduleSetLocalToken(debridgeId, address(usdc));
         uint256 readyAt = gate.governanceReadyAt(action);
 
         vm.warp(readyAt + gate.SCHEDULE_GRACE() + 1);

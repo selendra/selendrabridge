@@ -3,11 +3,34 @@
 # A TEMPLATE, not a plain conf: the nginx entrypoint runs envsubst over
 # /etc/nginx/templates/*.template at startup, which is how `connect-src` below
 # can be set per deployment without rebuilding the image.
+
+# --- per-client limit, in front of graphql-api (audit round 7, M7-5) ---------
+#
+# Defence in depth for the API's own per-client bucket. Keyed on
+# $binary_remote_addr, which is the CLIENT only because of the real_ip block
+# below; without that it would be the TCP peer — in production Caddy, i.e. one
+# bucket for everyone again. Looser than the API's 25 rps / 100 burst so a
+# legitimate page load never trips it first. This file is included inside
+# `http {}`, which is where a zone has to be declared.
+limit_req_zone $binary_remote_addr zone=bridge_api:10m rate=30r/s;
+
 server {
     listen 8080;
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
+
+    # --- who the client is (M7-5) ---------------------------------------------
+    #
+    # Believe X-Forwarded-For ONLY from the proxy in front of us (production:
+    # Caddy, on the pinned `bridge-api` subnet). From any other peer the header
+    # is client-supplied and ignored, and $remote_addr stays the TCP peer. The
+    # image default (127.0.0.1/32) trusts nobody, which is right wherever nginx
+    # itself is the edge. `real_ip_recursive` takes the rightmost hop that is not
+    # itself trusted, so a value the client prepended is never the one used.
+    set_real_ip_from ${BRIDGE_REAL_IP_FROM};
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
 
     # --- security headers (audit 2026-09-16, M-16) ---------------------------
     #
@@ -58,10 +81,17 @@ server {
     resolver 127.0.0.11 valid=10s ipv6=off;
 
     location /graphql {
+        limit_req zone=bridge_api burst=120 nodelay;
+        limit_req_status 429;
         set $api http://graphql-api:8088;
         proxy_pass $api/graphql;
         proxy_set_header Host $host;
         proxy_http_version 1.1;
+        # OVERWRITE, never append ($proxy_add_x_forwarded_for would carry
+        # whatever the client sent): graphql-api trusts these from this hop
+        # (`--trusted-proxy`) and keys its rate limit on them.
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
     }
     location /health {
         set $api_health http://graphql-api:8088;

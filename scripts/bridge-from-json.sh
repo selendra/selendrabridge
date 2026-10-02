@@ -203,6 +203,11 @@ fi
 # validate
 # ---------------------------------------------------------------------------
 rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+# Audit round 7, M7-11: one sig-store Sign token PER holder, not one shared by
+# every validator — a shared token is one rate-limit bucket, so any holder
+# flooding the store 429s them all. The env var that carries a holder's token:
+#   $1 kind (VALIDATOR | SOLANA_RELAYER), $2 name -> SIG_STORE_<kind>_TOKEN_<NAME>
+sign_tok_var() { printf 'SIG_STORE_%s_TOKEN_%s' "$1" "$(tr 'a-z' 'A-Z' <<<"$2" | tr -c 'A-Z0-9\n' '_')"; }
 
 say "validating $CONFIG"
 problems="$(config_problems)" || die "could not read $CONFIG as JSON"
@@ -528,6 +533,19 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
       echo "rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"
       echo "gate = $(tstr "$(cf "$cid" gate)")"
       echo "poll_interval_ms = $poll"
+      # M7-2: finalize every swap-and-bridge delivered into this chain's
+      # SwapRouter, so the router's 48 h stable-rescue notice always sees it
+      # settled or booked as owed. The keeper key must not be the router's
+      # owner or guardian (the keeper refuses to finalize through it if so).
+      router="$(jr ".chains[] | select(.chain_id == $cid) | .router")"
+      [[ -n "$router" ]] && echo "routers = [$(tstr "$router")]"
+      # M7-12 (optional, default off): per-asset claim floor in WHOLE tokens,
+      # keepers[].min_claim."<chain_id>" = { "<debridge_id>": "0.5", ... }.
+      mc="$(jq -c "($kjson).min_claim[\"$cid\"] // empty" "$CONFIG")"
+      if [[ -n "$mc" && "$mc" != "{}" ]]; then
+        echo "[targets.min_claim]"
+        jq -r 'to_entries[] | "\"\(.key)\" = \"\(.value)\""' <<<"$mc"
+      fi
       echo
     done
     echo "[keeper]"
@@ -661,6 +679,15 @@ if [[ "$SOLANA_ON" == "true" ]]; then
     info "solana relayer $rname -> $cfg"
   done
 fi
+
+# M7-11: every Sign-token holder — label (what the sig-store logs it as, and
+# what H7-3 will map to a validator address) and the env var carrying its own
+# token. Two names that sanitise to one variable would share a token again.
+SIGN_LABELS=() SIGN_VARS=()
+for n in "${VAL_NAMES[@]}"; do SIGN_LABELS+=("validator-$n"); SIGN_VARS+=("$(sign_tok_var VALIDATOR "$n")"); done
+for n in "${SOL_NAMES[@]}"; do SIGN_LABELS+=("solana-relayer-$n"); SIGN_VARS+=("$(sign_tok_var SOLANA_RELAYER "$n")"); done
+dup_var="$(printf '%s\n' "${SIGN_VARS[@]}" | sort | uniq -d | head -1)"
+[[ -z "$dup_var" ]] || die "two validators/relayers map to one sig-store token variable ($dup_var) — rename one"
 
 IDX_CFG=""
 if [[ "$(j '.indexer.enabled')" == "true" ]]; then
@@ -927,7 +954,14 @@ if [[ "$MODE" == "compose" ]]; then
     printf '  sig-store:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
     printf '    command: ["sig-store", "--bind", "0.0.0.0:8080"]\n    environment:\n'
     printf '      DATABASE_URL: "%s"\n' "$DATABASE_URL"
-    for role in VALIDATOR KEEPER READER ADMIN INDEXER; do
+    # M7-11: one Sign token per validator / solana relayer, `label:token`,
+    # each its own rate-limit bucket and identity. No shared validator token.
+    sign_list=""
+    for i in "${!SIGN_VARS[@]}"; do
+      sign_list+="${sign_list:+,}${SIGN_LABELS[$i]}:\${${SIGN_VARS[$i]}:?set ${SIGN_VARS[$i]}}"
+    done
+    printf '      SIG_STORE_VALIDATOR_TOKENS: "%s"\n' "$sign_list"
+    for role in KEEPER READER ADMIN INDEXER; do
       printf '      SIG_STORE_%s_TOKEN: "${SIG_STORE_%s_TOKEN:?set SIG_STORE_%s_TOKEN}"\n' "$role" "$role" "$role"
     done
     printf '    depends_on:\n      postgres: { condition: service_healthy }\n'
@@ -938,7 +972,9 @@ if [[ "$MODE" == "compose" ]]; then
     for n in "${VAL_NAMES[@]}"; do
       printf '  validator-%s:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["validator", "/configs/validator-%s.toml"]\n' "$n"
-      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      # Its OWN Sign token (M7-11), under the name the validator reads.
+      tv="$(sign_tok_var VALIDATOR "$n")"
+      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${%s:?set %s}"\n' "$tv" "$tv"
       svc_env "validator-$n"
       # Its own volume: the cursor file is per validator, and sharing one would
       # make each resume from the other's position.
@@ -989,7 +1025,8 @@ if [[ "$MODE" == "compose" ]]; then
       n="${SOL_NAMES[$i]}"
       printf '  solana-relayer-%s:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["solana-relayer", "/configs/solana-relayer-%s.toml"]\n' "$n"
-      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      tv="$(sign_tok_var SOLANA_RELAYER "$n")"
+      printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${%s:?set %s}"\n' "$tv" "$tv"
       # NOT the Indexer token (audit 2026-10-02, L7-14): Sign + Indexer in one
       # container can pre-poison future submissionIds. A delivering relayer's
       # marker observer is its own service, solana-observer-<name>, below.
@@ -1045,6 +1082,9 @@ if [[ "$MODE" == "compose" ]]; then
     # internet, so it holds nothing that can write and no database URL at all.
     printf '    environment:\n      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"\n'
     printf '      GRAPHQL_MAX_BLOCK_RANGE: "%s"\n' "$(j '.defaults.max_block_range')"
+    # M7-5: the API is unpublished here, so only compose-network peers (nginx)
+    # reach it; believe their X-Forwarded-For, or every user shares one bucket.
+    printf '      GRAPHQL_TRUSTED_PROXIES: "${GRAPHQL_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"\n'
     # The registry only: this container faces the internet, and it used to
     # mount every validator's key along with it (H7-1).
     printf '    volumes:\n'
@@ -1082,7 +1122,9 @@ if [[ "$MODE" == "compose" ]]; then
     echo "# One token per role, so a leak from one component cannot act as another."
     echo "# INDEXER is the Solana relayer's marker-observer credential (authoritative lifecycle reports)."
     echo "POSTGRES_PASSWORD="
-    for role in VALIDATOR KEEPER READER ADMIN INDEXER; do echo "SIG_STORE_${role}_TOKEN="; done
+    for role in KEEPER READER ADMIN INDEXER; do echo "SIG_STORE_${role}_TOKEN="; done
+    echo "# One Sign token PER validator / solana relayer (audit M7-11), each a distinct random value"
+    for v in "${SIGN_VARS[@]}"; do echo "$v="; done
     echo "# EVM RPC endpoints for the relayers' [[refund.evm]] readers (rpc_env); may carry provider keys"
     for cid in "${CHAIN_IDS[@]}"; do echo "RPC_$cid="; done
     if [[ -n "$SIGNER_ENVS" ]]; then
@@ -1098,7 +1140,10 @@ if [[ "$MODE" == "compose" ]]; then
   {
     echo "# Generated by $(basename "$0") — gitignored, do not commit."
     echo "# Secrets are kept across regenerations; RPC lines follow the config."
-    for k in POSTGRES_PASSWORD SIG_STORE_VALIDATOR_TOKEN SIG_STORE_KEEPER_TOKEN SIG_STORE_READER_TOKEN SIG_STORE_ADMIN_TOKEN SIG_STORE_INDEXER_TOKEN; do
+    # The per-holder Sign tokens (M7-11) are kept like every other secret. The
+    # old shared SIG_STORE_VALIDATOR_TOKEN is no longer written: nothing in the
+    # generated compose reads it, and the store no longer accepts it.
+    for k in POSTGRES_PASSWORD SIG_STORE_KEEPER_TOKEN SIG_STORE_READER_TOKEN SIG_STORE_ADMIN_TOKEN SIG_STORE_INDEXER_TOKEN "${SIGN_VARS[@]}"; do
       v="$(env_prev "$k")"; [[ -n "$v" ]] || v="$(rand_token)"
       echo "$k=$v"
     done
@@ -1215,7 +1260,12 @@ fi
 # claimed/cancelled/refunded on it (authoritative), so it is handed to nothing
 # else — see docs/operations.md.
 gen_if_unset="$(j '.sig_store.tokens.generate_if_unset')"
-for role in VALIDATOR KEEPER READER ADMIN INDEXER; do
+# The shared VALIDATOR token is kept only when the config names one (legacy,
+# e.g. for validators run elsewhere), and then only the sig-store sees it:
+# every validator / relayer launched here gets its OWN token below (M7-11),
+# generated per run like the role tokens.
+LEGACY_VALIDATOR_TOKEN="$(jr ".sig_store.tokens.validator")"
+for role in KEEPER READER ADMIN INDEXER; do
   lower="$(tr 'A-Z' 'a-z' <<<"$role")"
   val="$(jr ".sig_store.tokens.$lower")"
   if [[ -z "$val" ]]; then
@@ -1227,9 +1277,21 @@ for role in VALIDATOR KEEPER READER ADMIN INDEXER; do
   fi
   export "SIG_STORE_${role}_TOKEN=$val"
 done
-{ for role in VALIDATOR KEEPER READER ADMIN INDEXER; do
+unset SIG_STORE_VALIDATOR_TOKEN
+# M7-11: one Sign token per holder, each its own rate-limit bucket. Not
+# exported: each is handed to its own process (and the list to the sig-store)
+# at spawn time only.
+declare -A SIGN_TOK=()
+SIGN_LIST=""
+for i in "${!SIGN_VARS[@]}"; do
+  SIGN_TOK[${SIGN_VARS[$i]}]="$(rand_token)"
+  SIGN_LIST+="${SIGN_LIST:+,}${SIGN_LABELS[$i]}:${SIGN_TOK[${SIGN_VARS[$i]}]}"
+done
+{ for role in KEEPER READER ADMIN INDEXER; do
     v="SIG_STORE_${role}_TOKEN"; echo "$v=${!v}"
   done
+  for v in "${SIGN_VARS[@]}"; do echo "$v=${SIGN_TOK[$v]}"; done
+  [[ -n "$LEGACY_VALIDATOR_TOKEN" ]] && echo "SIG_STORE_VALIDATOR_TOKEN=$LEGACY_VALIDATOR_TOKEN"
   [[ -n "$PG_PASSWORD" ]] && echo "PG_PASSWORD=$PG_PASSWORD"
 } > "$TOKENS_ENV"
 chmod 600 "$TOKENS_ENV"
@@ -1240,7 +1302,12 @@ if [[ "$(j '.sig_store.enabled')" == "true" ]]; then
   # THIS stack: the stop fallback matches on it, and a second stack on another
   # port is left alone. Tokens stay in the environment — a command line is
   # world-readable in /proc.
-  spawn sig-store.log sig-store "sig-store --bind $STORE_BIND" -- "$BIN_DIR/sig-store" --bind "$STORE_BIND"
+  # The Sign tokens reach the sig-store alone, through a subshell (M7-11).
+  (
+    export SIG_STORE_VALIDATOR_TOKENS="$SIGN_LIST"
+    [[ -n "$LEGACY_VALIDATOR_TOKEN" ]] && export SIG_STORE_VALIDATOR_TOKEN="$LEGACY_VALIDATOR_TOKEN"
+    spawn sig-store.log sig-store "sig-store --bind $STORE_BIND" -- "$BIN_DIR/sig-store" --bind "$STORE_BIND"
+  )
   ok=false
   for _ in $(seq 1 80); do curl -s "$STORE_URL/health" 2>/dev/null | grep -q ok && { ok=true; break; }; sleep 0.25; done
   $ok || die "sig-store did not come up (see $RUN_DIR/sig-store.log)"
@@ -1249,7 +1316,11 @@ fi
 
 say "starting ${#VAL_FILES[@]} validator(s)"
 for i in "${!VAL_FILES[@]}"; do
-  spawn "validator-${VAL_NAMES[$i]}.log" "validator-${VAL_NAMES[$i]}" "${VAL_FILES[$i]}" -- "$BIN_DIR/validator" "${VAL_FILES[$i]}"
+  # Its OWN Sign token (M7-11), in the environment of this process only.
+  (
+    export SIG_STORE_VALIDATOR_TOKEN="${SIGN_TOK[$(sign_tok_var VALIDATOR "${VAL_NAMES[$i]}")]}"
+    spawn "validator-${VAL_NAMES[$i]}.log" "validator-${VAL_NAMES[$i]}" "${VAL_FILES[$i]}" -- "$BIN_DIR/validator" "${VAL_FILES[$i]}"
+  )
   info "${VAL_NAMES[$i]}"
 done
 
@@ -1277,8 +1348,11 @@ if (( ${#SOL_FILES[@]} )); then
     # L7-14: the signing relayer must not see the Indexer token (it refuses to
     # start if it does); a delivering relayer's marker observer runs as its own
     # `--observer-only` process that sees the Indexer token and not the Sign one.
-    spawn "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- \
-      env -u SIG_STORE_INDEXER_TOKEN "$SOL_BIN" "${SOL_FILES[$i]}"
+    (
+      export SIG_STORE_VALIDATOR_TOKEN="${SIGN_TOK[$(sign_tok_var SOLANA_RELAYER "${SOL_NAMES[$i]}")]}"
+      spawn "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- \
+        env -u SIG_STORE_INDEXER_TOKEN "$SOL_BIN" "${SOL_FILES[$i]}"
+    )
     info "${SOL_NAMES[$i]}"
     if [[ "$(jq -r ".solana.relayers[] | select(.name == \"${SOL_NAMES[$i]}\") | .deliver // false" "$CONFIG")" == "true" ]]; then
       spawn "solana-observer-${SOL_NAMES[$i]}.log" "solana-observer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- \

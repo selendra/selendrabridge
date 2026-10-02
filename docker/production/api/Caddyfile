@@ -16,7 +16,15 @@
 		-Server
 	}
 
-	reverse_proxy frontend:8080
+	# The client's address, for the per-client rate limits behind us (audit
+	# round 7, M7-5). Caddy is the edge, so it trusts no incoming forwarding
+	# header (no `trusted_proxies`): both are OVERWRITTEN with the TCP peer,
+	# never appended to, so a client cannot pick its own bucket. nginx believes
+	# them only from this network's subnet (BRIDGE_REAL_IP_FROM).
+	reverse_proxy frontend:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+	}
 
 	log {
 		output stdout

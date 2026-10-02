@@ -15,8 +15,14 @@
 //! The keeper decides nothing here — it only relays quorums the validators
 //! formed after checking both chains themselves. It holds no authority the
 //! signatures don't already carry.
+//!
+//! On a target with `routers = [...]` it also `finalize`s every swap-and-bridge
+//! delivered into one of those SwapRouters (audit 2026-10-02, M7-2; see the
+//! `finalize` module), and with `[targets.min_claim]` it leaves transfers below a
+//! per-asset floor unclaimed (M7-12).
 
 mod config;
+mod finalize;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -387,6 +393,20 @@ async fn run_target(
     let mut stranded = StrandedLog::default();
     // Claims/cancels whose receipt timed out and may still be in the mempool.
     let mut pending = PendingTxs::default();
+    // M7-2: deliveries into a configured SwapRouter, finalized after the claim.
+    let routers: HashSet<Address> = target.router_addresses().into_iter().collect();
+    let mut finalizer = finalize::FinalizeQueue::default();
+    if routers.is_empty() {
+        info!(
+            chain_id = target.chain_id,
+            "no `routers` configured: swap-and-bridge deliveries on this chain are claimed but \
+             left for someone else to finalize"
+        );
+    } else {
+        info!(chain_id = target.chain_id, routers = ?routers, "finalizing swap-and-bridge deliveries into these routers");
+    }
+    // M7-12: transfers already reported as below `min_claim`, so each is logged once.
+    let mut below_min = StrandedLog::default();
 
     loop {
         view.refresh_if_stale(&gate).await;
@@ -499,6 +519,24 @@ async fn run_target(
                 continue;
             }
 
+            // M7-12: a transfer below this target's configured floor costs more
+            // to claim than it is worth (a 1-unit send from a cheap chain, paid
+            // for at this chain's gas price). Leave it to its sender, who can
+            // claim it themselves, or to the cancel/refund path above. Checked
+            // before the signature reads so dust costs no RPC either.
+            if let Some((amount, floor)) = finalize::below_min_claim(&target, &rec) {
+                if below_min.should_report(&rec.submission_id) {
+                    info!(
+                        chain_id = target.chain_id,
+                        submission_id = %rec.submission_id,
+                        debridge_id = %rec.debridge_id,
+                        amount, min_claim = floor,
+                        "below this target's min_claim; NOT claiming (the sender can claim it themselves)"
+                    );
+                }
+                continue;
+            }
+
             let claim_sigs = view
                 .member_signatures(&gate, &rec.submission_id, SigKind::Transfer, &rec.signatures)
                 .await;
@@ -526,6 +564,9 @@ async fn run_target(
             match try_claim(&gate, &rec, &claim_sigs, bridge_domain, &submitter).await {
                 Ok(ClaimOutcome::Submitted(tx)) => {
                     stranded.clear(&rec.submission_id);
+                    if let Some(router) = finalize::router_of(&rec.receiver, &routers) {
+                        finalizer.enqueue(&rec, router, Instant::now());
+                    }
                     if let Err(e) = source.mark_claimed(&rec.submission_id, &tx).await {
                         warn!(
                             chain_id = target.chain_id,
@@ -537,6 +578,12 @@ async fn run_target(
                 }
                 Ok(ClaimOutcome::AlreadyExecuted) => {
                     stranded.clear(&rec.submission_id);
+                    // Claimed by someone else (or by us before a restart): the
+                    // finalize may still be outstanding. The queue dedupes, and
+                    // its first step is a `finalized` read.
+                    if let Some(router) = finalize::router_of(&rec.receiver, &routers) {
+                        finalizer.enqueue(&rec, router, Instant::now());
+                    }
                 }
                 // A transfer this gate can never pay out. Reported ONCE per
                 // submission, at WARN.
@@ -582,6 +629,14 @@ async fn run_target(
         // entry would live for the life of the process.
         stranded.retain_seen(&seen);
         pending.retain_seen(&seen);
+        below_min.retain_seen(&seen);
+        if !routers.is_empty() {
+            let now = Instant::now();
+            if finalizer.seed_due(now) {
+                finalizer.seed(&source, target.chain_id, &routers, &target, now).await;
+            }
+            finalizer.run(&provider, &gate, &submitter, target.chain_id).await;
+        }
         submitter.unwedge_head(&provider, target.chain_id, pending.nonces()).await;
         tokio::time::sleep(Duration::from_millis(target.poll_interval_ms)).await;
     }
