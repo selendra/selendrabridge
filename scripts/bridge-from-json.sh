@@ -599,8 +599,11 @@ if [[ "$SOLANA_ON" == "true" ]]; then
         # line names a variable that resolves. Without it a delivered
         # EVM->Solana transfer stays `signed` in the store, gets flagged stuck by
         # the indexer's sweep, and never leaves the claim/refund queues. Only
-        # the delivering relayer(s) carry it: one observer per gate is enough
+        # the delivering relayer(s) name it: one observer per gate is enough
         # (reports are idempotent), and the token must be handed out narrowly.
+        # Since L7-14 it is resolved ONLY by the separate `--observer-only`
+        # process that shares this file; the signing relayer refuses to start
+        # if the variable is in its environment.
         echo "indexer_token_env = \"SIG_STORE_INDEXER_TOKEN\""
       fi
       # H-2 (audit 2026-09-16): the peer gates the SCANNER cross-checks for
@@ -987,12 +990,9 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  solana-relayer-%s:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["solana-relayer", "/configs/solana-relayer-%s.toml"]\n' "$n"
       printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
-      # The delivering relayer(s) also run the marker observer, whose reports
-      # are authoritative — so only they get the Indexer-scoped token (it is
-      # what the generated toml's `indexer_token_env` names).
-      if [[ "$(jq -r ".solana.relayers[] | select(.name == \"$n\") | .deliver // false" "$CONFIG")" == "true" ]]; then
-        printf '      SIG_STORE_INDEXER_TOKEN: "${SIG_STORE_INDEXER_TOKEN:?set SIG_STORE_INDEXER_TOKEN}"\n'
-      fi
+      # NOT the Indexer token (audit 2026-10-02, L7-14): Sign + Indexer in one
+      # container can pre-poison future submissionIds. A delivering relayer's
+      # marker observer is its own service, solana-observer-<name>, below.
       # the [[refund.evm]] readers resolve their urls from RPC_<chain> (rpc_env)
       for cid in "${CHAIN_IDS[@]}"; do
         printf '      RPC_%s: "${RPC_%s:?set RPC_%s in .env}"\n' "$cid" "$cid" "$cid"
@@ -1005,6 +1005,17 @@ if [[ "$MODE" == "compose" ]]; then
       [[ -n "${SOL_KEYS[$i]}" ]] && printf '      - ./keys/%s:/keys/%s:ro\n' "${SOL_KEYS[$i]}" "${SOL_KEYS[$i]}"
       printf '      - solana-%s-state:/data\n' "$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
+      # The marker observer for a delivering relayer (L7-14): same image and
+      # config file, `--observer-only`, holding the Indexer token and nothing
+      # else — no signer env, no key mount, no state volume.
+      if [[ "$(jq -r ".solana.relayers[] | select(.name == \"$n\") | .deliver // false" "$CONFIG")" == "true" ]]; then
+        printf '  solana-observer-%s:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$n" "$CTX"
+        printf '    command: ["solana-relayer", "--observer-only", "/configs/solana-relayer-%s.toml"]\n' "$n"
+        printf '    environment:\n      SIG_STORE_INDEXER_TOKEN: "${SIG_STORE_INDEXER_TOKEN:?set SIG_STORE_INDEXER_TOKEN}"\n'
+        printf '    volumes:\n'
+        own_cfg "solana-relayer-$n.toml"
+        printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
+      fi
     done
 
     # --- indexer ---
@@ -1263,8 +1274,17 @@ if (( ${#SOL_FILES[@]} )); then
     export "RPC_$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
   done
   for i in "${!SOL_FILES[@]}"; do
-    spawn "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- "$SOL_BIN" "${SOL_FILES[$i]}"
+    # L7-14: the signing relayer must not see the Indexer token (it refuses to
+    # start if it does); a delivering relayer's marker observer runs as its own
+    # `--observer-only` process that sees the Indexer token and not the Sign one.
+    spawn "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- \
+      env -u SIG_STORE_INDEXER_TOKEN "$SOL_BIN" "${SOL_FILES[$i]}"
     info "${SOL_NAMES[$i]}"
+    if [[ "$(jq -r ".solana.relayers[] | select(.name == \"${SOL_NAMES[$i]}\") | .deliver // false" "$CONFIG")" == "true" ]]; then
+      spawn "solana-observer-${SOL_NAMES[$i]}.log" "solana-observer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}" -- \
+        env -u SIG_STORE_VALIDATOR_TOKEN -u SIG_STORE_TOKEN "$SOL_BIN" --observer-only "${SOL_FILES[$i]}"
+      info "${SOL_NAMES[$i]} (marker observer)"
+    fi
   done
 fi
 

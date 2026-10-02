@@ -1,4 +1,5 @@
-# Overlay: adds the EVM->Solana delivery (keeper) role to the relayer.
+# Overlay: adds the EVM->Solana delivery (keeper) role to the relayer, and the
+# Solana marker observer as its own service.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.deliver.yml up -d
 #
@@ -13,11 +14,34 @@ services:
     environment:
       # Only used by the delivery loop; harmless when unset in sign-only mode.
       RUST_LOG: "${RUST_LOG:-info}"
-      # The marker observer's credential (Indexer scope). The delivering relayer
-      # reads the gate's ["executed"|"refunded", id] markers and reports observed
-      # claimed/cancelled/refunded to the store — the Solana gate's stand-in for
-      # the EVM indexer. Named by `[store] indexer_token_env` in the config.
+      # NOT SIG_STORE_INDEXER_TOKEN (audit 2026-10-02, L7-14). This container
+      # holds the Sign token and a validator key; with the Indexer token too it
+      # could create a row for a future submissionId and then mark it observed,
+      # retiring the real transfer from every queue on arrival. The relayer
+      # refuses to start if it can see both.
+
+  # The marker observer: the Solana gate's stand-in for the EVM indexer. Same
+  # image and config file, `--observer-only` mode. It reads the gate's
+  # ["executed"|"refunded", id] markers and reports observed
+  # claimed/cancelled/refunded to the store. It holds the Indexer token and
+  # NOTHING else — no validator key, no Sign token, no payer — and refuses to
+  # start if the Sign token is in its environment. The config's
+  # `[store] indexer_token_env` names the variable below.
+  solana-observer:
+    image: "${RELAYER_IMAGE:-selendra/bridge-relayer:local}"
+    # Same image as solana-relayer (same tag, so it is built once).
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile.relayer
+    pull_policy: "${BRIDGE_PULL_POLICY:-missing}"
+    restart: unless-stopped
+    command: ["solana-relayer", "--observer-only", "/configs/solana-relayer.toml"]
+    environment:
       SIG_STORE_INDEXER_TOKEN: "${SIG_STORE_INDEXER_TOKEN:?set SIG_STORE_INDEXER_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./configs/solana-relayer.toml:/configs/solana-relayer.toml:ro
+    # No state volume (the observer keeps no cursor), no secrets, no ports.
 
 secrets:
   # The Solana keypair that pays fees and rent for claim transactions. It holds

@@ -21,8 +21,14 @@ async fn main() -> anyhow::Result<()> {
     // keyed endpoint that is the provider key (see `log_scrub`).
     log_scrub::init("solana_relayer=info");
 
-    let path = std::env::args().nth(1).unwrap_or_else(|| "solana-relayer.toml".into());
+    let (mode, path) = config::parse_args(std::env::args().skip(1))?;
     let cfg = config::Config::load(&path)?;
+    // L7-14 (audit 2026-10-02): the Sign and Indexer credentials never share a
+    // process. See `config::check_credentials`.
+    config::check_credentials(mode, cfg.store.token().is_some(), cfg.store.indexer_token().is_some())?;
+    if mode == config::Mode::ObserverOnly {
+        return run_observer_only(cfg).await;
+    }
     let key = cfg.signer.resolve()?;
 
     if cfg.store.token().is_none() {
@@ -57,36 +63,13 @@ async fn main() -> anyhow::Result<()> {
     let attester =
         refund::Attester::new(&cfg.source, cfg.refund.as_ref(), key, signer_address, sig_store()?)?;
 
-    // The marker observer: the Solana gate's stand-in for the EVM indexer. It
-    // reports observed claimed/cancelled/refunded markers to the store on the
-    // Indexer-scoped token, and ONLY on that token — its reports are
-    // authoritative, so it runs iff that credential resolves. Without it a
-    // delivered EVM->Solana transfer stays `signed` in the store forever and is
-    // flagged stuck by the indexer's sweep.
-    let observer = match cfg.store.indexer_token() {
-        Some(token) => {
-            info!(
-                token = %cfg.store.indexer_token_source(),
-                poll_ms = cfg.observer.poll_interval_ms,
-                commitment = %cfg.observer.commitment,
-                "observer ACTIVE: Solana terminal markers will be reported to the store"
-            );
-            Some(observer::Observer::new(
-                &cfg.source,
-                &cfg.observer,
-                store::Store::new(&cfg.store.url, Some(token))?,
-            )?)
-        }
-        None => {
-            info!(
-                token = %cfg.store.indexer_token_source(),
-                "observer INACTIVE: no indexer token resolves — Solana claims/cancels/refunds \
-                 will not reach the store's lifecycle from this process (set [store] \
-                 indexer_token_env = \"SIG_STORE_INDEXER_TOKEN\" on the relayer that delivers)"
-            );
-            None
-        }
-    };
+    // The marker observer no longer runs in this process (L7-14): it is the
+    // `--observer-only` mode of this same binary, in its own process/container
+    // holding the Indexer token and nothing else.
+    info!(
+        "marker observer is not part of the signing process; run `solana-relayer --observer-only \
+         <config>` separately with only SIG_STORE_INDEXER_TOKEN (audit 2026-10-02, L7-14)"
+    );
 
     // H-2: the scanner cross-checks each EVM destination's bridge decimals before
     // signing, so it needs the same gate readers the refund attester uses. A peer
@@ -108,21 +91,45 @@ async fn main() -> anyhow::Result<()> {
     let scanner = source::Scanner::new(cfg.source, key, sig_store()?, evm_gates)?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");
 
-    // Each loop is isolated: a dead submitter, attester or observer must never
-    // stop this node signing transfers, which is its one irreplaceable job.
-    // Every optional loop is spawned as a task that never returns when absent,
-    // so one `select!` covers every combination.
+    // Each loop is isolated: a dead submitter or attester must never stop this
+    // node signing transfers, which is its one irreplaceable job. The optional
+    // loop is spawned as a task that never returns when absent, so one
+    // `select!` covers every combination.
     let scan = tokio::spawn(scanner.run());
     let refunds = tokio::spawn(attester.run());
     let submit = spawn_optional(submitter.map(|s| s.run()));
-    let observe = spawn_optional(observer.map(|o| o.run()));
     tokio::select! {
         r = scan => r??,
         r = submit => r??,
         r = refunds => r??,
-        r = observe => r??,
     }
     Ok(())
+}
+
+/// `--observer-only`: the marker observer, the Solana gate's stand-in for the
+/// EVM indexer. It reports observed claimed/cancelled/refunded markers to the
+/// store on the Indexer-scoped token, and ONLY on that token — its reports are
+/// authoritative. Without it a delivered EVM->Solana transfer stays `signed`
+/// in the store forever and is flagged stuck by the indexer's sweep.
+///
+/// Runs ALONE (audit 2026-10-02, L7-14). It used to run inside the delivering
+/// relayer, which therefore held both the Sign token (create a row) and the
+/// Indexer token (mark it observed) — the two halves of round-4 M-4's
+/// "pre-poison a future submissionId", recombined in one container. This mode
+/// never resolves the signing key and refuses to start with the Sign token in
+/// its environment ([`config::check_credentials`]).
+async fn run_observer_only(cfg: config::Config) -> anyhow::Result<()> {
+    let token = cfg.store.indexer_token().expect("check_credentials requires the indexer token here");
+    info!(
+        token = %cfg.store.indexer_token_source(),
+        poll_ms = cfg.observer.poll_interval_ms,
+        commitment = %cfg.observer.commitment,
+        "observer-only mode: Solana terminal markers will be reported to the store; this process \
+         holds no signing key and no Sign credential"
+    );
+    observer::Observer::new(&cfg.source, &cfg.observer, store::Store::new(&cfg.store.url, Some(token))?)?
+        .run()
+        .await
 }
 
 /// Spawn an optional loop; an absent one becomes a task that pends forever, so

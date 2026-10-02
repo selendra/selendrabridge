@@ -170,6 +170,82 @@ pub fn solana_source_record(account: Option<(bool, &[u8])>) -> SolanaSourceRecor
     SolanaSourceRecord { state: SourceState { sent: true, refunded: false }, locked_at: rec.locked_at }
 }
 
+/// The submissionId a candidate's OWN params hash to, or an error if the store
+/// paired them with a different id (audit 2026-10-02, L7-7 — the port of the
+/// validator's round-5 `bound_submission_id`).
+///
+/// Every routing decision in [`Attester::tick`] — is Solana the destination or
+/// the source, and which EVM gate is the far end — comes from
+/// `chain_id_to`/`chain_id_from`, while every read and the signature itself are
+/// keyed on `submission_id`. Nothing tied the two together here, so a record
+/// naming a real id with a different corridor sent the `executed`/`cancelled`
+/// reads to a gate that has never heard of the transfer, and the attester
+/// decided it from what THAT gate said (a never-seen id reads "untouched" — the
+/// cancel leg's precondition). The sig-store enforces the binding on write; this
+/// process no longer takes that on trust.
+///
+/// The recompute is the store's `canonical_submission_id` rule over the
+/// record's OWN `bridge_domain` (the gate-domain check belongs to the
+/// submitters): the plain hash for an empty `auto_params`, otherwise the
+/// with-auto hash over the decoded `abi.encode(AutoParamsTo)` blob and
+/// `native_sender`. Anything that does not decode is refused, never folded to
+/// "no auto" — the two are different ids.
+pub fn bound_submission_id(rec: &SubmissionRecord) -> anyhow::Result<[u8; 32]> {
+    use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
+    use bridge_solana::relayer::{decode_evm_auto_params, wire_to_auto};
+    use crate::gate::hex_bytes;
+
+    let claimed = hex32(&rec.submission_id).map_err(|_| anyhow::anyhow!("bad submission_id"))?;
+    let domain = hex32(&rec.bridge_domain).map_err(|_| anyhow::anyhow!("bad bridge_domain"))?;
+    let debridge_id = hex32(&rec.debridge_id).map_err(|_| anyhow::anyhow!("bad debridge_id"))?;
+    // A Solana leg moves a u64; a u128 covers every amount that can name one.
+    let amount: u128 =
+        rec.amount.parse().map_err(|_| anyhow::anyhow!("amount does not fit a Solana-leg transfer"))?;
+    let decimals = rec.bridge_decimals.ok_or_else(|| anyhow::anyhow!("record has no bridge_decimals"))?;
+    let receiver = hex_bytes(&rec.receiver).map_err(|_| anyhow::anyhow!("bad receiver"))?;
+    let native_sender = hex_bytes(&rec.native_sender).map_err(|_| anyhow::anyhow!("bad native_sender"))?;
+    let blob = hex_bytes(&rec.auto_params).map_err(|_| anyhow::anyhow!("bad auto_params"))?;
+    let auto = decode_evm_auto_params(&blob).map_err(|e| anyhow::anyhow!("auto_params: {e}"))?;
+
+    let word = amount_word(amount);
+    let computed = match &auto {
+        None => submission_id(
+            &domain, &debridge_id, decimals, &word, rec.chain_id_from, rec.chain_id_to, rec.nonce,
+            &receiver,
+        ),
+        Some(w) => submission_id_with_auto(
+            &domain, &debridge_id, decimals, &word, rec.chain_id_from, rec.chain_id_to, rec.nonce,
+            &receiver, &wire_to_auto(w, &native_sender),
+        ),
+    };
+    anyhow::ensure!(
+        computed == claimed,
+        "candidate 0x{} carries params that hash to 0x{}; refusing to route reads by them",
+        hex::encode(claimed),
+        hex::encode(computed)
+    );
+    Ok(claimed)
+}
+
+/// Does `sigs` hold a genuine attestation by `me` over `digest_input` (the
+/// pre-EIP-191 domain digest, e.g. `domain_id(CANCEL_PREFIX, id)`)?
+///
+/// Decided by RECOVERING each signature, never by the store's `signer` label
+/// (audit 2026-10-02, L7-7 — the validator's round-5 fix). A store that puts
+/// our address on a junk signature used to make this attester believe it had
+/// already voted, so it never attested that transfer again and the quorum was
+/// one short for good. Recovery is what the gate does with the bytes, so it is
+/// the only meaningful answer to "have we voted".
+pub fn attested_by(sigs: &[SignerSig], digest_input: &[u8; 32], me: &[u8; 20]) -> bool {
+    let digest = bridge_solana::verify::eth_signed_digest(digest_input);
+    sigs.iter().any(|s| {
+        crate::gate::hex_bytes(&s.signature)
+            .ok()
+            .and_then(|b| crate::gate::recovered_address(&digest, &b))
+            .is_some_and(|a| &a == me)
+    })
+}
+
 /// Read the Solana destination marker for a submission.
 async fn solana_destination_state(
     rpc: &RpcClient,
@@ -219,6 +295,8 @@ pub struct Attester {
     chain_id: u64,
     secret: libsecp256k1::SecretKey,
     signer_address: String,
+    /// The address `secret` signs as — what our own attestations recover to.
+    me: [u8; 20],
     poll: Duration,
     store: Store,
     /// `None` => no `[refund]` block: refunds only, never cancels.
@@ -243,6 +321,9 @@ impl Attester {
                 evm.insert(e.chain_id, GateReader::new(e)?);
             }
         }
+        let secret = libsecp256k1::SecretKey::parse(&secret_key)
+            .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?;
+        let me = crate::gate::address_of(&libsecp256k1::PublicKey::from_secret_key(&secret));
         Ok(Attester {
             // Refund decisions release real funds, so read them at the same
             // commitment the scanner signs at — a rolled-back "not executed"
@@ -251,8 +332,8 @@ impl Attester {
             program_id: Pubkey::from_str(&cfg.program_id)
                 .map_err(|_| anyhow::anyhow!("program_id is not a valid pubkey"))?,
             chain_id: cfg.chain_id,
-            secret: libsecp256k1::SecretKey::parse(&secret_key)
-                .map_err(|_| anyhow::anyhow!("signer key is not a valid secp256k1 scalar"))?,
+            secret,
+            me,
             signer_address,
             poll: Duration::from_millis(cfg.poll_interval_ms.max(1000)),
             store,
@@ -306,7 +387,15 @@ impl Attester {
         }
 
         for rec in candidates {
-            let Ok(id) = hex32(&rec.submission_id) else { continue };
+            // L7-7: the corridor below routes every read, so it must be the one
+            // the id actually commits to.
+            let id = match bound_submission_id(&rec) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(submission_id = %rec.submission_id, error = %e, "refund candidate refused");
+                    continue;
+                }
+            };
 
             let facts = if rec.chain_id_to == self.chain_id {
                 self.evm_to_solana_facts(&rec.submission_id, &id, rec.chain_id_from).await
@@ -326,15 +415,12 @@ impl Attester {
                 continue;
             };
 
-            let mine = |sigs: &[SignerSig]| {
-                sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&self.signer_address))
-            };
             let decision = decide(
                 src.as_ref(),
                 &dst,
                 aged_out,
-                mine(&rec.cancel_signatures),
-                mine(&rec.refund_signatures),
+                attested_by(&rec.cancel_signatures, &domain_id(CANCEL_PREFIX, &id), &self.me),
+                attested_by(&rec.refund_signatures, &domain_id(REFUND_PREFIX, &id), &self.me),
             );
 
             let (kind, prefix) = match decision {
@@ -566,6 +652,126 @@ mod tests {
         let foreign = DestinationState::default();
         assert!(!foreign.executed, "a non-program-owned account is not state");
         assert_eq!(decide(Some(&live_source()), &foreign, AGED, false, false), Decision::AttestCancel);
+    }
+
+    // --- L7-7: id binding and recovered-address dedupe ----------------------
+
+    fn word(v: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    /// `abi.encode(AutoParamsTo{fee, flags, fallback, data})`, by hand.
+    fn auto_blob(fee: u64, flags: u64, fallback: &[u8], data: &[u8]) -> Vec<u8> {
+        let padded = |b: &[u8]| b.len().div_ceil(32) * 32;
+        let mut out = Vec::new();
+        out.extend_from_slice(&word(0x20));
+        out.extend_from_slice(&word(fee));
+        out.extend_from_slice(&word(flags));
+        out.extend_from_slice(&word(0x80));
+        out.extend_from_slice(&word(0x80 + 32 + padded(fallback) as u64));
+        for b in [fallback, data] {
+            out.extend_from_slice(&word(b.len() as u64));
+            let mut p = b.to_vec();
+            p.resize(padded(b), 0);
+            out.extend_from_slice(&p);
+        }
+        out
+    }
+
+    /// A record whose id really is the hash of its own params, EVM -> Solana.
+    fn bound_record(auto_params: &[u8]) -> SubmissionRecord {
+        use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
+        let domain = [0xd0u8; 32];
+        let debridge = [0x0du8; 32];
+        let receiver = [0x5au8; 32];
+        let native_sender = [0x77u8; 20];
+        let (from, to, nonce, amount, dec) = (11155111u64, 7_565_164u64, 42u64, 1_000_000u64, 6u8);
+        let id = match bridge_solana::relayer::decode_evm_auto_params(auto_params).unwrap() {
+            None => submission_id(&domain, &debridge, dec, &amount_word(amount as u128), from, to, nonce, &receiver),
+            Some(w) => submission_id_with_auto(
+                &domain, &debridge, dec, &amount_word(amount as u128), from, to, nonce, &receiver,
+                &bridge_solana::relayer::wire_to_auto(&w, &native_sender),
+            ),
+        };
+        SubmissionRecord {
+            submission_id: format!("0x{}", hex::encode(id)),
+            bridge_domain: format!("0x{}", hex::encode(domain)),
+            debridge_id: format!("0x{}", hex::encode(debridge)),
+            amount: amount.to_string(),
+            bridge_decimals: Some(dec),
+            chain_id_from: from,
+            chain_id_to: to,
+            nonce,
+            receiver: format!("0x{}", hex::encode(receiver)),
+            auto_params: format!("0x{}", hex::encode(auto_params)),
+            native_sender: format!("0x{}", hex::encode(native_sender)),
+            token: String::new(),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    /// L7-7. A record's corridor routes every read, so it must be the corridor
+    /// its id commits to. A real id re-paired with another destination or source
+    /// (the reads would go to a gate that never heard of it and read
+    /// "untouched") is refused, as is anything that does not hash at all.
+    #[test]
+    fn a_candidate_whose_params_do_not_hash_to_its_id_is_refused() {
+        for blob in [Vec::new(), auto_blob(5, 1, &[0xfa; 20], b"payload")] {
+            let good = bound_record(&blob);
+            assert_eq!(
+                bound_submission_id(&good).expect("premise: the fixture binds"),
+                hex32(&good.submission_id).unwrap()
+            );
+            let rerouted = SubmissionRecord { chain_id_to: 84532, ..good.clone() };
+            assert!(bound_submission_id(&rerouted).is_err(), "a different destination must not be read");
+            let resourced = SubmissionRecord { chain_id_from: 1, ..good.clone() };
+            assert!(bound_submission_id(&resourced).is_err(), "a different source must not be read");
+            let other_domain = SubmissionRecord { bridge_domain: format!("0x{}", "11".repeat(32)), ..good.clone() };
+            assert!(bound_submission_id(&other_domain).is_err());
+            let no_scale = SubmissionRecord { bridge_decimals: None, ..good.clone() };
+            assert!(bound_submission_id(&no_scale).is_err(), "no scale, no id");
+        }
+        // With-auto params dropped (or swapped for "none") are a different id.
+        let with_auto = bound_record(&auto_blob(5, 1, &[0xfa; 20], b"payload"));
+        assert!(bound_submission_id(&SubmissionRecord { auto_params: "0x".into(), ..with_auto.clone() }).is_err());
+        assert!(bound_submission_id(&SubmissionRecord { auto_params: "0xdead".into(), ..with_auto }).is_err());
+        let garbage = SubmissionRecord { submission_id: "0xnothex".into(), ..bound_record(&[]) };
+        assert!(bound_submission_id(&garbage).is_err());
+    }
+
+    /// L7-7. "Have we already voted?" is answered by recovering the signature
+    /// over the right domain, never by the store's `signer` label.
+    #[test]
+    fn our_vote_is_recognised_by_recovery_not_by_label() {
+        let secret = libsecp256k1::SecretKey::parse(&[0x42u8; 32]).unwrap();
+        let me = crate::gate::address_of(&libsecp256k1::PublicKey::from_secret_key(&secret));
+        let my_label = crate::gate::evm_address(&secret);
+        let id = [0x99u8; 32];
+        let cancel = domain_id(CANCEL_PREFIX, &id);
+        let refund = domain_id(REFUND_PREFIX, &id);
+
+        // Genuine: our signature over the cancel digest.
+        let real = SignerSig { signer: my_label.clone(), signature: sign(&secret, &cancel) };
+        assert!(attested_by(std::slice::from_ref(&real), &cancel, &me));
+        // It is NOT a refund vote: the domains are distinct.
+        assert!(!attested_by(std::slice::from_ref(&real), &refund, &me));
+        // Our label on junk, or on someone else's signature: not our vote — this
+        // is what used to silence the attester for good.
+        let other = libsecp256k1::SecretKey::parse(&[0x43u8; 32]).unwrap();
+        let forged = [
+            SignerSig { signer: my_label.clone(), signature: format!("0x{}", "00".repeat(65)) },
+            SignerSig { signer: my_label.clone(), signature: sign(&other, &cancel) },
+            SignerSig { signer: my_label.clone(), signature: "not hex".into() },
+        ];
+        assert!(!attested_by(&forged, &cancel, &me));
+        // Our genuine signature under someone else's label still counts: the
+        // label is not what the gate reads.
+        let relabelled = SignerSig { signer: "0xsomebody".into(), signature: sign(&secret, &cancel) };
+        assert!(attested_by(&[relabelled], &cancel, &me));
     }
 
     // --- the Solana age rule (M-4 / M-13) -----------------------------------

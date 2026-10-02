@@ -27,9 +27,10 @@
 //!   * Solana is the SOURCE (`pending_refunds(chain_id)`): the `["refunded", id]`
 //!     PDA → `refunded`.
 //!
-//! The tx recorded is the claim/cancel/refund transaction's signature when one
-//! `getSignaturesForAddress` on the marker returns it, else the marker address
-//! itself — either is enough for an operator to find the transaction.
+//! The tx recorded is the claim/cancel/refund transaction's signature when
+//! `getSignaturesForAddress` on the marker returns one that provably CREATED the
+//! marker (see [`creates_marker`]), else the marker address itself — either is
+//! enough for an operator to find the transaction.
 //!
 //! ## Why it holds a credential of its own
 //!
@@ -53,7 +54,14 @@ use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_transaction_status::option_serializer::OptionSerializer;
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiCompiledInstruction,
+    UiInnerInstructions, UiInstruction, UiMessage, UiTransactionEncoding,
+};
 use tracing::{info, warn};
 
 use crate::config::{ObserverConfig, SourceChain};
@@ -230,7 +238,7 @@ impl Observer {
             if self.reported.already(&rec.submission_id, what) {
                 continue;
             }
-            let tx = self.marker_tx(&pda).await;
+            let tx = self.marker_tx(&pda, side).await;
             match self.store.report_observed(&rec.submission_id, what, &tx).await {
                 Ok(()) => {
                     self.reported.accepted(&rec.submission_id, what);
@@ -257,29 +265,114 @@ impl Observer {
     /// The signature of the transaction that created the marker, when one
     /// lookup finds it; otherwise the marker address, which is still enough to
     /// locate the transaction by hand. Never fails the report over this.
-    async fn marker_tx(&self, marker: &Pubkey) -> String {
+    ///
+    /// Audit 2026-10-02, L7-8: `getSignaturesForAddress` lists EVERY transaction
+    /// that mentions the address, and anyone can mention a derivable PDA in a
+    /// transaction of their own — before the real claim, even, since the id is
+    /// public from the `Sent` onward. Taking "the oldest successful one" let
+    /// such a transaction be recorded as the claim/cancel/refund. Each candidate
+    /// is now fetched and accepted only if [`creates_marker`] holds; otherwise
+    /// the next is tried, and with none the marker address is recorded.
+    async fn marker_tx(&self, marker: &Pubkey, side: Side) -> String {
         let cfg = GetConfirmedSignaturesForAddress2Config {
             before: None,
             until: None,
-            limit: Some(10),
+            limit: Some(MARKER_TX_CANDIDATES),
             commitment: Some(self.rpc.commitment()),
         };
-        match self.rpc.get_signatures_for_address_with_config(marker, cfg).await {
-            // Newest first. The marker is created by exactly one SUCCESSFUL
-            // transaction; a later failed replay attempt that named the address
-            // would sort above it, so take the oldest that did not error.
-            Ok(sigs) => sigs
-                .iter()
-                .rev()
-                .find(|s| s.err.is_none())
-                .map(|s| s.signature.clone())
-                .unwrap_or_else(|| marker.to_string()),
+        let sigs = match self.rpc.get_signatures_for_address_with_config(marker, cfg).await {
+            Ok(sigs) => sigs,
             Err(e) => {
                 tracing::debug!(%marker, error = %e, "no signature lookup; recording the marker address");
-                marker.to_string()
+                return marker.to_string();
+            }
+        };
+        let tx_cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(self.rpc.commitment()),
+            max_supported_transaction_version: Some(0),
+        };
+        // Newest first from the RPC; the creating transaction is the oldest
+        // that qualifies (a later replay of the same claim fails on-chain).
+        for s in sigs.iter().rev().filter(|s| s.err.is_none()) {
+            let Ok(sig) = Signature::from_str(&s.signature) else { continue };
+            match self.rpc.get_transaction_with_config(&sig, tx_cfg).await {
+                Ok(tx) if creates_marker(&tx, &self.program_id, marker, side) => return s.signature.clone(),
+                Ok(_) => tracing::debug!(%marker, signature = %s.signature, "mentions the marker but did not create it"),
+                Err(e) => tracing::debug!(%marker, signature = %s.signature, error = %e, "transaction lookup failed"),
             }
         }
+        marker.to_string()
     }
+}
+
+/// Signatures examined per marker by [`Observer::marker_tx`]; each costs a
+/// `getTransaction`. Display-only data, so a bound beats completeness.
+const MARKER_TX_CANDIDATES: usize = 10;
+
+/// `GateInstruction` discriminants that create a marker, and the account slot
+/// the program reads that marker from (`process_claim` / `process_cancel` /
+/// `process_refund` in `solana-gate`; pinned on the client side by the
+/// encoders in `target::wire`).
+const CLAIM_IX: (u8, usize) = (2, 2);
+const CANCEL_IX: (u8, usize) = (10, 1);
+const REFUND_IX: (u8, usize) = (11, 3);
+
+/// Did this transaction create `marker` through the gate program (pure,
+/// host-testable)? (Audit 2026-10-02, L7-8.)
+///
+/// True only when the transaction SUCCEEDED and some instruction in it — top
+/// level or inner (a CPI) — is the gate program running Claim or Cancel (for a
+/// destination `["executed", id]` marker) or Refund (for a source
+/// `["refunded", id]` one) with `marker` in the exact account slot the program
+/// checks against the PDA it derives from the instruction's own id, and creates.
+/// Such an instruction cannot succeed twice for one marker, so it is THE
+/// creating transaction. Merely listing the address — as a trailing extra
+/// account on some other gate call, in a system transfer, anywhere — is not.
+pub fn creates_marker(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    program_id: &Pubkey,
+    marker: &Pubkey,
+    side: Side,
+) -> bool {
+    let Some(meta) = tx.transaction.meta.as_ref() else { return false };
+    if meta.err.is_some() || meta.status.is_err() {
+        return false;
+    }
+    let EncodedTransaction::Json(ui) = &tx.transaction.transaction else { return false };
+    let UiMessage::Raw(msg) = &ui.message else { return false };
+    // Static keys, then (v0) the lookup-table loads: writable, then readonly.
+    let mut keys: Vec<&str> = msg.account_keys.iter().map(String::as_str).collect();
+    if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+        keys.extend(loaded.writable.iter().map(String::as_str));
+        keys.extend(loaded.readonly.iter().map(String::as_str));
+    }
+    let program = program_id.to_string();
+    let marker = marker.to_string();
+    let wanted: &[(u8, usize)] = match side {
+        Side::Destination => &[CLAIM_IX, CANCEL_IX],
+        Side::Source => &[REFUND_IX],
+    };
+    let creates = |ix: &UiCompiledInstruction| {
+        if keys.get(ix.program_id_index as usize) != Some(&program.as_str()) {
+            return false;
+        }
+        let Ok(data) = solana_sdk::bs58::decode(&ix.data).into_vec() else { return false };
+        let Some(&disc) = data.first() else { return false };
+        wanted.iter().any(|&(d, slot)| {
+            d == disc
+                && ix.accounts.get(slot).and_then(|&k| keys.get(k as usize)) == Some(&marker.as_str())
+        })
+    };
+    let inner: &[UiInnerInstructions] = match &meta.inner_instructions {
+        OptionSerializer::Some(v) => v,
+        _ => &[],
+    };
+    msg.instructions.iter().any(creates)
+        || inner.iter().flat_map(|i| &i.instructions).any(|ix| match ix {
+            UiInstruction::Compiled(c) => creates(c),
+            UiInstruction::Parsed(_) => false,
+        })
 }
 
 #[cfg(test)]
@@ -405,6 +498,140 @@ mod tests {
         r.retain_in_queue(&still);
         assert!(!r.already("0xaa", Terminal::Claimed), "gone from the queue => forgotten");
         assert!(r.already("0xbb", Terminal::Refunded), "still queued => still remembered");
+    }
+
+    // --- L7-8: which transaction created the marker ---------------------------
+
+    const SYSTEM: &str = "11111111111111111111111111111111";
+
+    fn key(b: u8) -> String {
+        Pubkey::new_from_array([b; 32]).to_string()
+    }
+
+    /// A `getTransaction` (encoding `json`) result, as the RPC returns it.
+    /// `ixs`/`inner` are `(program_id_index, accounts, data)`.
+    fn fixture(
+        keys: &[String],
+        ixs: &[(u8, &[u8], &[u8])],
+        inner: &[(u8, &[u8], &[u8])],
+        failed: bool,
+        loaded_writable: &[String],
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let ix = |(p, a, d): &(u8, &[u8], &[u8])| {
+            serde_json::json!({
+                "programIdIndex": p,
+                "accounts": a,
+                "data": solana_sdk::bs58::encode(d).into_string(),
+                "stackHeight": null
+            })
+        };
+        let (err, status) = if failed {
+            let e = serde_json::json!({"InstructionError": [0, {"Custom": 6}]});
+            (e.clone(), serde_json::json!({"Err": e}))
+        } else {
+            (serde_json::Value::Null, serde_json::json!({"Ok": null}))
+        };
+        let n = keys.len() + loaded_writable.len();
+        let v = serde_json::json!({
+            "slot": 311_000_123u64,
+            "blockTime": 1_759_000_000i64,
+            "version": 0,
+            "transaction": {
+                "signatures": ["5h6xBEauJ3PK6SWCZ1PGjBvj8vDdWG3KpwATGy1ARAXFSDwt8GFXM7W5Ncn16wmqokgpiKRLuS83KUxyZyv2sUYv"],
+                "message": {
+                    "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0, "numReadonlyUnsignedAccounts": 2},
+                    "accountKeys": keys,
+                    "recentBlockhash": SYSTEM,
+                    "instructions": ixs.iter().map(ix).collect::<Vec<_>>()
+                }
+            },
+            "meta": {
+                "err": err,
+                "status": status,
+                "fee": 5000,
+                "preBalances": vec![0u64; n],
+                "postBalances": vec![1u64; n],
+                "innerInstructions": if inner.is_empty() { serde_json::json!([]) } else {
+                    serde_json::json!([{"index": 0, "instructions": inner.iter().map(ix).collect::<Vec<_>>()}])
+                },
+                "logMessages": [],
+                "loadedAddresses": {"writable": loaded_writable, "readonly": []}
+            }
+        });
+        serde_json::from_value(v).expect("fixture matches the RPC's getTransaction shape")
+    }
+
+    /// Keys: 0 payer, 1 config, 2 asset, 3 MARKER, 4 vault, 5 receiver token,
+    /// 6 vault authority, 7 another id's marker, 8 system, 9 GATE, 10 other program.
+    fn keys(program: &Pubkey, marker: &Pubkey) -> Vec<String> {
+        let mut k: Vec<String> = (0u8..=10).map(|b| key(b + 1)).collect();
+        k[3] = marker.to_string();
+        k[8] = SYSTEM.into();
+        k[9] = program.to_string();
+        k
+    }
+
+    /// The real claim: gate program, `Claim` (2), the marker in slot 2.
+    #[test]
+    fn the_successful_gate_claim_creating_the_marker_is_accepted() {
+        let (program, marker) = (Pubkey::new_from_array([0xaa; 32]), Pubkey::new_from_array([0xbb; 32]));
+        let k = keys(&program, &marker);
+        let claim: &[u8] = &[1, 2, 3, 0, 4, 5, 6, 8];
+        let tx = fixture(&k, &[(9, claim, &[2, 0xde, 0xad])], &[], false, &[]);
+        assert!(creates_marker(&tx, &program, &marker, Side::Destination));
+        assert!(!creates_marker(&tx, &program, &marker, Side::Source), "a claim does not create a refund marker");
+        // The same transaction, but it FAILED: nothing was created.
+        let failed = fixture(&k, &[(9, claim, &[2, 0xde, 0xad])], &[], true, &[]);
+        assert!(!creates_marker(&failed, &program, &marker, Side::Destination));
+        // Cancel (10) reads the marker from slot 1.
+        let cancel = fixture(&k, &[(9, &[1, 3, 0, 8], &[10, 1])], &[], false, &[]);
+        assert!(creates_marker(&cancel, &program, &marker, Side::Destination));
+        // Refund (11) creates ["refunded", id] from slot 3, on the SOURCE side.
+        let refund = fixture(&k, &[(9, &[1, 2, 4, 3, 0, 5, 7, 6, 8], &[11])], &[], false, &[]);
+        assert!(creates_marker(&refund, &program, &marker, Side::Source));
+        assert!(!creates_marker(&refund, &program, &marker, Side::Destination));
+    }
+
+    /// THE finding: anyone can name the marker in a transaction of their own,
+    /// and every one of these succeeded. None of them created it.
+    #[test]
+    fn a_transaction_that_merely_mentions_the_marker_is_rejected() {
+        let (program, marker) = (Pubkey::new_from_array([0xaa; 32]), Pubkey::new_from_array([0xbb; 32]));
+        let k = keys(&program, &marker);
+        let cases: [(&str, Vec<(u8, &[u8], &[u8])>); 5] = [
+            // A system transfer of a lamport to the derived address.
+            ("system transfer", vec![(8, &[0, 3], &[2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0])]),
+            // A REAL claim of another transfer (marker 7 in slot 2) with ours
+            // appended as an extra account the program never reads.
+            ("another id's claim", vec![(9, &[1, 2, 7, 0, 4, 5, 6, 8, 3], &[2])]),
+            // A different gate instruction (Send = 1) naming it.
+            ("gate send", vec![(9, &[1, 3, 0, 8], &[1])]),
+            // The marker in a Claim's slot, but issued to ANOTHER program.
+            ("look-alike program", vec![(10, &[1, 2, 3, 0, 4, 5, 6, 8], &[2])]),
+            // Gate instruction with no data at all.
+            ("empty data", vec![(9, &[1, 2, 3, 0], &[])]),
+        ];
+        for (what, ixs) in cases {
+            let tx = fixture(&k, &ixs, &[], false, &[]);
+            assert!(!creates_marker(&tx, &program, &marker, Side::Destination), "{what}");
+            assert!(!creates_marker(&tx, &program, &marker, Side::Source), "{what}");
+        }
+    }
+
+    /// A claim the gate runs as a CPI (inner instruction) counts, and so does a
+    /// marker loaded through an address lookup table (v0).
+    #[test]
+    fn a_cpi_claim_and_a_lookup_table_marker_are_accepted() {
+        let (program, marker) = (Pubkey::new_from_array([0xaa; 32]), Pubkey::new_from_array([0xbb; 32]));
+        let k = keys(&program, &marker);
+        let outer: (u8, &[u8], &[u8]) = (10, &[0, 3, 9], &[7, 7]);
+        let tx = fixture(&k, &[outer], &[(9, &[1, 2, 3, 0, 4, 5, 6, 8], &[2])], false, &[]);
+        assert!(creates_marker(&tx, &program, &marker, Side::Destination));
+
+        let mut statics = k.clone();
+        statics[3] = key(0x55); // the marker is NOT a static key...
+        let alt = fixture(&statics, &[(9, &[1, 2, 11, 0, 4, 5, 6, 8], &[2])], &[], false, &[marker.to_string()]);
+        assert!(creates_marker(&alt, &program, &marker, Side::Destination), "...it is loaded at index 11");
     }
 
     /// The poll floor and the default: slower than the claim loop, never a

@@ -275,6 +275,69 @@ impl Store {
     }
 }
 
+/// Which half of the relayer this process is (audit 2026-10-02, L7-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Scan + sign, attest refunds, and (with `[target]`) deliver claims.
+    /// Holds the signing key and the `Sign`-scoped token.
+    Relayer,
+    /// `--observer-only`: report observed Solana markers to the store. Holds
+    /// the `Indexer`-scoped token and nothing else.
+    ObserverOnly,
+}
+
+/// `solana-relayer [--observer-only] [config.toml]`. Anything else is refused
+/// rather than ignored: a typo'd flag must not start the wrong half.
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<(Mode, String)> {
+    let mut mode = Mode::Relayer;
+    let mut path: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "--observer-only" => mode = Mode::ObserverOnly,
+            s if s.starts_with("--") => anyhow::bail!("unknown flag {s} (usage: solana-relayer [--observer-only] [config.toml])"),
+            _ if path.is_none() => path = Some(a),
+            _ => anyhow::bail!("more than one config path given (usage: solana-relayer [--observer-only] [config.toml])"),
+        }
+    }
+    Ok((mode, path.unwrap_or_else(|| "solana-relayer.toml".into())))
+}
+
+/// The credential rule (audit 2026-10-02, L7-14): a process holds the `Sign`
+/// token or the `Indexer` token, never both.
+///
+/// Together they are round-4 M-4's "pre-poison a future submissionId": `Sign`
+/// creates a row for an id that has not happened yet (the relayer holds a
+/// validator key, so its signature authenticates), and `Indexer` marks that row
+/// observed claimed/cancelled — so the real transfer lands already retired from
+/// every work queue. The store keeps the two scopes apart; this keeps the
+/// PROCESSES apart, so one compromised container yields at most one half.
+///
+/// * relayer mode refuses to start if an indexer token resolves (it used to run
+///   the observer in-process; that is now `--observer-only`);
+/// * observer-only mode needs the indexer token and refuses to start if the
+///   Sign token is in its environment.
+pub fn check_credentials(mode: Mode, sign_token: bool, indexer_token: bool) -> anyhow::Result<()> {
+    match mode {
+        Mode::Relayer if indexer_token => anyhow::bail!(
+            "this signing relayer can see the Indexer-scoped sig-store token ([store] \
+             indexer_token / indexer_token_env resolves). Holding it alongside the Sign token \
+             re-enables pre-poisoning future submissionIds (audit 2026-10-02, L7-14). Remove \
+             SIG_STORE_INDEXER_TOKEN from this process's environment and run the marker observer \
+             as its own process: `solana-relayer --observer-only <config>`"
+        ),
+        Mode::ObserverOnly if !indexer_token => anyhow::bail!(
+            "--observer-only needs the Indexer-scoped token: set [store] indexer_token_env (e.g. \
+             \"SIG_STORE_INDEXER_TOKEN\") and export that variable to this process"
+        ),
+        Mode::ObserverOnly if sign_token => anyhow::bail!(
+            "--observer-only must not hold the Sign-scoped token ([store] token_env resolves): \
+             together with the Indexer token it re-enables pre-poisoning future submissionIds \
+             (audit 2026-10-02, L7-14). Remove it from this process's environment"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn default_commitment() -> String {
     "finalized".into()
 }
@@ -586,5 +649,35 @@ mod tests {
     fn a_missing_cursor_replays_history_unless_the_operator_opts_out() {
         assert!(!Config::from_toml(&cfg("")).unwrap().source.start_at_tip);
         assert!(Config::from_toml(&cfg("start_at_tip = true")).unwrap().source.start_at_tip);
+    }
+
+    // --- L7-14: the Sign and Indexer credentials never share a process --------
+
+    fn args(a: &[&str]) -> anyhow::Result<(Mode, String)> {
+        parse_args(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn the_observer_is_a_flag_of_the_same_binary() {
+        assert_eq!(args(&[]).unwrap(), (Mode::Relayer, "solana-relayer.toml".into()));
+        assert_eq!(args(&["/c/x.toml"]).unwrap(), (Mode::Relayer, "/c/x.toml".into()));
+        assert_eq!(args(&["--observer-only", "/c/x.toml"]).unwrap(), (Mode::ObserverOnly, "/c/x.toml".into()));
+        assert_eq!(args(&["/c/x.toml", "--observer-only"]).unwrap(), (Mode::ObserverOnly, "/c/x.toml".into()));
+        assert!(args(&["--observer"]).is_err(), "a typo must not start the wrong half");
+        assert!(args(&["a.toml", "b.toml"]).is_err());
+    }
+
+    /// THE rule. Sign (create a row for a future id) + Indexer (mark it
+    /// observed) in one process is the M-4 pre-poison; neither mode starts with
+    /// both, and the observer does not start without its own credential.
+    #[test]
+    fn no_process_starts_holding_both_the_sign_and_indexer_tokens() {
+        for mode in [Mode::Relayer, Mode::ObserverOnly] {
+            assert!(check_credentials(mode, true, true).is_err(), "{mode:?} with both tokens");
+        }
+        assert!(check_credentials(Mode::Relayer, true, false).is_ok());
+        assert!(check_credentials(Mode::Relayer, false, false).is_ok(), "unauthenticated dev store");
+        assert!(check_credentials(Mode::ObserverOnly, false, true).is_ok());
+        assert!(check_credentials(Mode::ObserverOnly, false, false).is_err(), "an observer needs its token");
     }
 }

@@ -195,7 +195,30 @@ async fn main() -> anyhow::Result<()> {
 /// never across the receipt wait — the whole point is that the next send observes
 /// this tx as pending and takes `n + 1`, which it cannot do if the lock is still
 /// held while we wait for the block.
-type SendLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+///
+/// The lock also guards the per-chain [`ChainSendState`] (audit 2026-10-02,
+/// L7-6): which nonces this process's loops are already tracking, and the
+/// head-of-queue stall watch. Both are per ACCOUNT per chain, which is exactly
+/// what this lock is.
+type SendLock = std::sync::Arc<tokio::sync::Mutex<ChainSendState>>;
+
+/// Per-chain state shared by every loop submitting from the keeper account,
+/// guarded by the [`SendLock`].
+#[derive(Default)]
+struct ChainSendState {
+    /// Nonces each loop (keyed by [`Submitter::role`]) has broadcast and still
+    /// remembers in its [`PendingTxs`]. Those are bumped by [`maybe_replace`];
+    /// the head watch must never compete with it for the same nonce.
+    tracked: HashMap<&'static str, HashSet<u64>>,
+    head: HeadWatch,
+    /// Last time any loop on this chain ran the head check.
+    head_checked: Option<Instant>,
+}
+
+/// How often the head-of-queue check reads the account's nonces — a small
+/// fraction of [`RECEIPT_TIMEOUT`], so a stall is still acted on within about
+/// one window of starting.
+const HEAD_CHECK_INTERVAL: Duration = Duration::from_millis(RECEIPT_TIMEOUT.as_millis() as u64 / 12);
 
 /// Everything [`confirm`] needs to put a tx on one chain: that chain's
 /// [`SendLock`], and the keeper address the nonce is read for.
@@ -207,6 +230,9 @@ type SendLock = std::sync::Arc<tokio::sync::Mutex<()>>;
 struct Submitter {
     lock: SendLock,
     from: Address,
+    /// Which loop this is ("claim" / "refund"), the key of its entry in
+    /// [`ChainSendState::tracked`].
+    role: &'static str,
 }
 
 /// wrong network is not something to keep retrying.
@@ -353,7 +379,7 @@ async fn run_target(
     let retry = Duration::from_millis(target.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&target, &signer, "target").await?;
     let gate = Gate::new(gate_addr, &provider);
-    let submitter = Submitter { lock: send_lock, from: signer.address() };
+    let submitter = Submitter { lock: send_lock, from: signer.address(), role: "claim" };
 
     // Submissions already reported UNCLAIMABLE on this chain. Bounded in practice
     // by the number of simultaneously-stranded transfers, and entries are dropped
@@ -556,6 +582,7 @@ async fn run_target(
         // entry would live for the life of the process.
         stranded.retain_seen(&seen);
         pending.retain_seen(&seen);
+        submitter.unwedge_head(&provider, target.chain_id, pending.nonces()).await;
         tokio::time::sleep(Duration::from_millis(target.poll_interval_ms)).await;
     }
 }
@@ -576,7 +603,7 @@ async fn run_source_refunds(
     let retry = Duration::from_millis(src.poll_interval_ms.max(1000));
     let (provider, gate_addr, mut view, bridge_domain) = connect_gate(&src, &signer, "source refund").await?;
     let gate = Gate::new(gate_addr, &provider);
-    let submitter = Submitter { lock: send_lock, from: signer.address() };
+    let submitter = Submitter { lock: send_lock, from: signer.address(), role: "refund" };
     let mut pending = PendingTxs::default();
     // Reported-once memo, as in the claim loop.
     let mut stranded = StrandedLog::default();
@@ -646,6 +673,7 @@ async fn run_source_refunds(
         }
         pending.retain_seen(&seen);
         stranded.retain_seen(&seen);
+        submitter.unwedge_head(&provider, src.chain_id, pending.nonces()).await;
         tokio::time::sleep(Duration::from_millis(src.poll_interval_ms)).await;
     }
 }
@@ -970,9 +998,233 @@ impl PendingTxs {
         self.0.retain(|(id, _), _| seen.contains(id));
     }
 
+    /// Every nonce this memo is responsible for re-pricing. Handed to the head
+    /// watch so the two never act on the same nonce.
+    fn nonces(&self) -> HashSet<u64> {
+        self.0.values().filter_map(|f| f.tx.nonce).collect()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// Gas for a plain value transfer to an EOA — what the head-of-queue
+/// replacement is.
+const SELF_TRANSFER_GAS: u64 = 21_000;
+
+/// Watches the keeper account's head-of-queue nonce for a stall NOTHING in this
+/// process is tracking (audit 2026-10-02, L7-6).
+///
+/// [`PendingTxs`] is in memory. After a restart during a fee spike, an
+/// underpriced tx at nonce `n` is no longer remembered by anyone (the same
+/// happens when [`PendingTxs::retain_seen`] drops an entry because its id left
+/// the queue), so [`maybe_replace`] never bumps it — and every new tx, whose
+/// nonce `populate` reads as `.pending()`, queues behind it at `n+1`, `n+2`, ...
+/// The chain's keeper is wedged until someone clears the nonce by hand.
+///
+/// The signal needs no memory: the account's `latest` count (the next nonce to
+/// mine) stays below its `pending` count (the pool holds a tx at `latest`) and
+/// does not move. Once that has persisted for a full [`RECEIPT_TIMEOUT`], the
+/// head nonce is replaced by a 0-value self-transfer at a bumped fee. That is
+/// safe whatever the stuck tx was: a claim, cancel or refund that is displaced
+/// simply never executes, and its loop re-checks the chain and resends it at a
+/// fresh nonce. Bounded exactly like [`maybe_replace`]: one replacement per
+/// window, at most [`MAX_FEE_BUMPS`] per stalled nonce, never above
+/// [`MAX_FEE_MULTIPLE`] times the network estimate at the first replacement.
+#[derive(Default, Debug)]
+struct HeadWatch {
+    stall: Option<HeadStall>,
+}
+
+#[derive(Debug)]
+struct HeadStall {
+    /// The `latest` nonce that is not moving.
+    nonce: u64,
+    /// First tick that saw it stalled (and untracked).
+    since: Instant,
+    /// Last self-transfer broadcast (or last "exhausted" report) at this nonce.
+    last_sent: Option<Instant>,
+    /// Replacements attempted at this nonce; capped at [`MAX_FEE_BUMPS`].
+    bumps: u32,
+    /// The last replacement that went out, the base for the next bump.
+    last_tx: Option<TransactionRequest>,
+    /// Fixed at the first replacement: [`MAX_FEE_MULTIPLE`] x the estimate then.
+    ceiling: Option<u128>,
+}
+
+/// What [`HeadWatch::observe`] decided for this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadAction {
+    /// No stall, or one this process already tracks: nothing to do.
+    Idle,
+    /// Stalled, but not for a full window yet (or the last replacement is still
+    /// within its own window).
+    Wait,
+    /// Replace the head nonce with a self-transfer now.
+    Replace { nonce: u64, bump: u32 },
+    /// Stalled and out of bumps; reported once per window.
+    Exhausted { nonce: u64 },
+}
+
+impl HeadWatch {
+    /// The pure decision. `tracked` says whether some loop's [`PendingTxs`]
+    /// already owns the `latest` nonce (then [`maybe_replace`] handles it, under
+    /// its own policy, and this watch stands down entirely).
+    fn observe(&mut self, latest: u64, pending: u64, tracked: bool, now: Instant) -> HeadAction {
+        if pending <= latest || tracked {
+            self.stall = None;
+            return HeadAction::Idle;
+        }
+        let stall = match &mut self.stall {
+            Some(s) if s.nonce == latest => s,
+            _ => {
+                // A new head (the old one mined, or this is the first sighting):
+                // it gets a full window from now before anything is sent.
+                self.stall = Some(HeadStall {
+                    nonce: latest,
+                    since: now,
+                    last_sent: None,
+                    bumps: 0,
+                    last_tx: None,
+                    ceiling: None,
+                });
+                return HeadAction::Wait;
+            }
+        };
+        let waited_from = stall.last_sent.unwrap_or(stall.since);
+        if now.saturating_duration_since(waited_from) < RECEIPT_TIMEOUT {
+            return HeadAction::Wait;
+        }
+        stall.last_sent = Some(now);
+        if stall.bumps >= MAX_FEE_BUMPS {
+            return HeadAction::Exhausted { nonce: latest };
+        }
+        // Counted before sending, as in `maybe_replace`: a node that keeps
+        // refusing the replacement cannot turn this into a loop.
+        stall.bumps += 1;
+        HeadAction::Replace { nonce: latest, bump: stall.bumps }
+    }
+}
+
+/// The self-transfer that replaces a stalled head nonce, or `None` if no fee is
+/// known or the bump would cross the ceiling.
+///
+/// First replacement: the network's current price plus the minimum bump (the
+/// stuck tx's own fee is unknown — that is the point — but a tx stuck through a
+/// spike was priced under the market, so beating the market by >10% displaces
+/// it). The ceiling is fixed there, at [`MAX_FEE_MULTIPLE`] x that estimate.
+/// Later replacements bump the previous one exactly like [`reprice`] does.
+fn head_replacement(
+    from: Address,
+    nonce: u64,
+    prev: Option<&TransactionRequest>,
+    estimate: Option<alloy::eips::eip1559::Eip1559Estimation>,
+    gas_price: Option<u128>,
+    ceiling: &mut Option<u128>,
+) -> Option<TransactionRequest> {
+    if let Some(prev) = prev {
+        return reprice(prev, estimate, gas_price, (*ceiling)?);
+    }
+    let mut base = TransactionRequest::default()
+        .from(from)
+        .to(from)
+        .value(U256::ZERO)
+        .nonce(nonce)
+        .gas_limit(SELF_TRANSFER_GAS);
+    match (estimate, gas_price) {
+        (Some(e), _) => {
+            base.max_fee_per_gas = Some(e.max_fee_per_gas);
+            base.max_priority_fee_per_gas = Some(e.max_priority_fee_per_gas);
+        }
+        (None, Some(p)) => base.gas_price = Some(p),
+        (None, None) => return None,
+    }
+    let cap = fee_cap(&base).saturating_mul(MAX_FEE_MULTIPLE);
+    *ceiling = Some(cap);
+    reprice(&base, None, None, cap)
+}
+
+impl Submitter {
+    /// One tick of the head-of-queue watch (see [`HeadWatch`]). `tracked` is
+    /// the nonces this loop's [`PendingTxs`] currently owns; it replaces the
+    /// loop's entry in [`ChainSendState::tracked`].
+    ///
+    /// Runs under the [`SendLock`], so a replacement can never race a real
+    /// send for the nonce. Every failure here is logged and left for the next
+    /// tick — nothing about it can stop the loop.
+    async fn unwedge_head<P: Provider>(&self, provider: &P, chain_id: u64, tracked: HashSet<u64>) {
+        let mut state = self.lock.lock().await;
+        state.tracked.insert(self.role, tracked);
+        // Two nonce reads per check: pace them well inside the window rather
+        // than on every 1 s tick of every loop on this chain.
+        if state.head_checked.is_some_and(|t| t.elapsed() < HEAD_CHECK_INTERVAL) {
+            return;
+        }
+        state.head_checked = Some(Instant::now());
+        let latest = provider.get_transaction_count(self.from).latest().await;
+        let pending = provider.get_transaction_count(self.from).pending().await;
+        let (latest, pending) = match (latest, pending) {
+            (Ok(l), Ok(p)) => (l, p),
+            (Err(e), _) | (_, Err(e)) => {
+                debug!(chain_id, error = %e, "nonce read failed; head watch skips this tick");
+                return;
+            }
+        };
+        let is_tracked = state.tracked.values().any(|s| s.contains(&latest));
+        let (nonce, bump) = match state.head.observe(latest, pending, is_tracked, Instant::now()) {
+            HeadAction::Idle | HeadAction::Wait => return,
+            HeadAction::Exhausted { nonce } => {
+                warn!(
+                    chain_id, nonce, pending,
+                    "keeper account's head nonce is STILL stuck after the maximum number of \
+                     self-transfer replacements; every later tx queues behind it until it mines \
+                     or is cleared by hand"
+                );
+                return;
+            }
+            HeadAction::Replace { nonce, bump } => (nonce, bump),
+        };
+        let estimate = match provider.estimate_eip1559_fees().await {
+            Ok(e) => Some(e),
+            Err(_) => None,
+        };
+        let gas_price = if estimate.is_none() { provider.get_gas_price().await.ok() } else { None };
+        let stall = state.head.stall.as_mut().expect("Replace implies a stall");
+        let Some(tx) =
+            head_replacement(self.from, nonce, stall.last_tx.as_ref(), estimate, gas_price, &mut stall.ceiling)
+        else {
+            stall.bumps = MAX_FEE_BUMPS;
+            warn!(
+                chain_id, nonce, ceiling = ?stall.ceiling,
+                "stuck head nonce cannot be replaced (no fee estimate, or the bump would cross \
+                 the {MAX_FEE_MULTIPLE}x ceiling); leaving it to wait"
+            );
+            return;
+        };
+        match provider.send_transaction(tx.clone()).await {
+            Ok(sent) => {
+                warn!(
+                    chain_id, nonce, pending, bump, tx = %sent.tx_hash(), max_fee_per_gas = fee_cap(&tx),
+                    "keeper account's head nonce stuck for a full receipt window with no tx of ours \
+                     tracking it (e.g. underpriced before a restart); REPLACED it with a 0-value \
+                     self-transfer at a higher fee"
+                );
+                stall.last_tx = Some(tx);
+            }
+            // Most likely "replacement transaction underpriced": the stuck tx
+            // pays more than the market + 12.5%. The next window bumps from THIS
+            // attempt's price (still under the ceiling), so successive attempts
+            // climb instead of repeating a price the node already refused.
+            Err(e) => {
+                warn!(
+                    chain_id, nonce, bump, error = %e,
+                    "head-nonce self-transfer replacement was rejected; retrying higher after the next receipt window"
+                );
+                stall.last_tx = Some(tx);
+            }
+        }
     }
 }
 
@@ -1219,12 +1471,19 @@ async fn confirm<P: Provider + Clone>(
     // See [`SendLock`]: the nonce fetch and the broadcast are one critical section
     // per chain, and the guard is released before the receipt wait below.
     let (pending, tx, sent_at) = {
-        let _guard = submitter.lock.lock().await;
+        let mut state = submitter.lock.lock().await;
         let tx = populate(&provider, call.into_transaction_request(), submitter.from)
             .await
             .with_context(|| format!("send {verb}"))?;
         let pending =
             provider.send_transaction(tx.clone()).await.with_context(|| format!("send {verb}"))?;
+        // Ours, and about to be waited on (and, should the receipt time out,
+        // remembered in `PendingTxs`): keep the head watch off it. The loop
+        // replaces its whole set with what `PendingTxs` holds at the end of the
+        // tick, so an entry for a tx that mined is dropped there.
+        if let Some(n) = tx.nonce {
+            state.tracked.entry(submitter.role).or_default().insert(n);
+        }
         (pending, tx, Instant::now())
     };
     let hash = *pending.tx_hash();
@@ -2320,7 +2579,7 @@ mod domain_tests {
             assert!(started.elapsed() < Duration::from_secs(20), "anvil did not come up");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let submitter = Submitter { lock: Arc::new(tokio::sync::Mutex::new(())), from: me };
+        let submitter = Submitter { lock: SendLock::default(), from: me, role: "claim" };
         let to = Address::repeat_byte(0x42);
         let send = |id: &'static str| {
             let call = alloy::contract::CallBuilder::new_raw(provider.clone(), Bytes::new()).to(to);
@@ -2387,5 +2646,162 @@ mod domain_tests {
         let tx3 = provider.get_transaction_by_hash(h3.parse().unwrap()).await.unwrap().unwrap();
         assert_eq!(tx3.nonce(), 1);
         assert_eq!(provider.get_transaction_count(me).latest().await.unwrap(), 2);
+    }
+
+    /// L7-6, the decision. A head nonce that does not move while the pool holds
+    /// it, and that nothing in this process tracks, is replaced after one full
+    /// window, then once per window, at most `MAX_FEE_BUMPS` times.
+    #[test]
+    fn an_untracked_stalled_head_is_replaced_after_a_window_and_bounded() {
+        let t0 = Instant::now();
+        let w = RECEIPT_TIMEOUT;
+        let mut h = HeadWatch::default();
+        // No gap: nothing to do, ever.
+        assert_eq!(h.observe(7, 7, false, t0), HeadAction::Idle);
+        // First sighting of a gap starts the clock; nothing sent inside the window.
+        assert_eq!(h.observe(7, 9, false, t0), HeadAction::Wait);
+        assert_eq!(h.observe(7, 9, false, t0 + w / 2), HeadAction::Wait);
+        // A full window: replace nonce 7.
+        assert_eq!(h.observe(7, 9, false, t0 + w), HeadAction::Replace { nonce: 7, bump: 1 });
+        // Not a replacement per tick: the replacement gets its own window.
+        assert_eq!(h.observe(7, 9, false, t0 + w + w / 2), HeadAction::Wait);
+        let mut t = t0 + w;
+        for bump in 2..=MAX_FEE_BUMPS {
+            t += w;
+            assert_eq!(h.observe(7, 9, false, t), HeadAction::Replace { nonce: 7, bump });
+        }
+        t += w;
+        assert_eq!(h.observe(7, 9, false, t), HeadAction::Exhausted { nonce: 7 }, "capped");
+        assert_eq!(h.observe(7, 9, false, t + w / 2), HeadAction::Wait, "reported once per window");
+        assert_eq!(h.observe(7, 9, false, t + w), HeadAction::Exhausted { nonce: 7 });
+        // The head moves on: a NEW stall, with a fresh window and a fresh budget.
+        assert_eq!(h.observe(8, 9, false, t + w), HeadAction::Wait);
+        assert_eq!(h.observe(8, 9, false, t + 2 * w), HeadAction::Replace { nonce: 8, bump: 1 });
+        // The gap closes: forgotten.
+        assert_eq!(h.observe(9, 9, false, t + 3 * w), HeadAction::Idle);
+        assert!(h.stall.is_none());
+    }
+
+    /// L7-6. A head nonce that some loop's `PendingTxs` owns is `maybe_replace`'s
+    /// to bump (with the original call, under its own policy); the watch stands
+    /// down and restarts its window from scratch if the memo later lets go.
+    #[test]
+    fn a_tracked_head_is_left_to_the_fee_bump_memo() {
+        let t0 = Instant::now();
+        let w = RECEIPT_TIMEOUT;
+        let mut h = HeadWatch::default();
+        assert_eq!(h.observe(3, 4, true, t0), HeadAction::Idle);
+        assert_eq!(h.observe(3, 4, true, t0 + 10 * w), HeadAction::Idle);
+        assert_eq!(h.observe(3, 4, false, t0 + 10 * w), HeadAction::Wait, "memo forgot it: a full window first");
+        assert_eq!(h.observe(3, 4, true, t0 + 10 * w + w / 2), HeadAction::Idle);
+        assert_eq!(h.observe(3, 4, false, t0 + 11 * w), HeadAction::Wait, "and again after re-tracking");
+        assert_eq!(h.observe(3, 4, false, t0 + 12 * w), HeadAction::Replace { nonce: 3, bump: 1 });
+    }
+
+    /// L7-6, the price. A 0-value self-transfer at the stalled nonce, above the
+    /// market by at least the 10% replacement minimum, each later one bumped
+    /// from the last, never above `MAX_FEE_MULTIPLE` x the first estimate.
+    #[test]
+    fn the_head_replacement_is_a_bumped_self_transfer_under_the_ceiling() {
+        use alloy::eips::eip1559::Eip1559Estimation;
+        let me = Address::repeat_byte(0x0e);
+        let est = Eip1559Estimation { max_fee_per_gas: 1_000, max_priority_fee_per_gas: 100 };
+        let mut ceiling = None;
+        let first = head_replacement(me, 5, None, Some(est), None, &mut ceiling).expect("priced");
+        assert_eq!(ceiling, Some(4_000));
+        assert_eq!(first.from, Some(me));
+        assert_eq!(first.to, Some(alloy::primitives::TxKind::Call(me)));
+        assert_eq!(first.value, Some(U256::ZERO));
+        assert_eq!(first.nonce, Some(5));
+        assert_eq!(first.gas, Some(SELF_TRANSFER_GAS));
+        assert!(first.input.input().is_none_or(|b| b.is_empty()), "no calldata");
+        assert_eq!((first.max_fee_per_gas, first.max_priority_fee_per_gas), (Some(1_126), Some(113)));
+
+        let mut prev = first;
+        let mut n = 1;
+        while let Some(next) = head_replacement(me, 5, Some(&prev), Some(est), None, &mut ceiling) {
+            assert!(next.max_fee_per_gas.unwrap() * 10 >= prev.max_fee_per_gas.unwrap() * 11);
+            assert!(next.max_fee_per_gas.unwrap() <= 4_000, "never above the ceiling");
+            assert_eq!((next.nonce, next.to, next.value), (prev.nonce, prev.to, prev.value));
+            prev = next;
+            n += 1;
+            assert!(n < 50);
+        }
+        assert_eq!(ceiling, Some(4_000), "the ceiling is fixed at the first replacement");
+
+        // Legacy chain: gasPrice. No fee information at all: nothing is sent.
+        let mut c = None;
+        let legacy = head_replacement(me, 5, None, None, Some(800), &mut c).unwrap();
+        assert_eq!((legacy.gas_price, legacy.max_fee_per_gas, c), (Some(901), None, Some(3_200)));
+        assert!(head_replacement(me, 5, None, None, None, &mut None).is_none());
+    }
+
+    /// L7-6, end to end on anvil: a tx goes out at nonce 0 and is never
+    /// included; then the keeper "restarts" (the `PendingTxs` memo is gone).
+    /// The head watch notices the untracked stall and, after a full window,
+    /// replaces nonce 0 with a 0-value self-transfer that displaces it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_a_restart_a_forgotten_stuck_head_nonce_is_replaced() {
+        use alloy::consensus::Transaction as _;
+        use std::process::Stdio;
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _anvil = Kill(
+            std::process::Command::new("/usr/bin/anvil")
+                .args(["--port", &port.to_string(), "--no-mining"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn anvil"),
+        );
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".parse().unwrap();
+        let me = signer.address();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer))
+            .with_simple_nonce_management()
+            .connect_http(format!("http://127.0.0.1:{port}").parse().unwrap());
+        let started = Instant::now();
+        while provider.get_chain_id().await.is_err() {
+            assert!(started.elapsed() < Duration::from_secs(20), "anvil did not come up");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Before the restart: a claim at nonce 0 that never lands.
+        let h1 = {
+            let submitter = Submitter { lock: SendLock::default(), from: me, role: "claim" };
+            let call = alloy::contract::CallBuilder::new_raw(provider.clone(), Bytes::new())
+                .to(Address::repeat_byte(0x42));
+            let err = confirm(call, "claim", "0xsub1", "CLAIMED", &submitter).await.expect_err("times out");
+            err.downcast_ref::<ReceiptTimeout>().expect("typed timeout").hash
+        };
+
+        // After the restart: fresh state, nothing remembers nonce 0.
+        let submitter = Submitter { lock: SendLock::default(), from: me, role: "claim" };
+        submitter.unwedge_head(&provider, 31337, HashSet::new()).await;
+        assert!(provider.get_transaction_by_hash(h1).await.unwrap().is_some(), "first sighting: wait");
+        tokio::time::sleep(RECEIPT_TIMEOUT).await;
+        submitter.unwedge_head(&provider, 31337, HashSet::new()).await;
+
+        assert!(provider.get_transaction_by_hash(h1).await.unwrap().is_none(), "the stuck tx was displaced");
+        let _: serde_json::Value = provider.raw_request("evm_mine".into(), ()).await.unwrap();
+        assert_eq!(provider.get_transaction_count(me).latest().await.unwrap(), 1, "nonce 0 mined");
+        let block = provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .full()
+            .await
+            .unwrap()
+            .unwrap();
+        let mined = block.transactions.txns().next().expect("one tx").clone();
+        assert_eq!(mined.nonce(), 0);
+        assert_eq!(mined.to(), Some(me), "a self-transfer");
+        assert_eq!(mined.value(), U256::ZERO);
+        assert!(mined.input().is_empty());
     }
 }

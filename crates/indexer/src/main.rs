@@ -27,7 +27,8 @@ use alloy::primitives::{Address, B256};
 #[cfg(test)]
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::{Filter, Log};
+use alloy::eips::BlockNumberOrTag;
+use alloy::rpc::types::{Block, Filter, Log};
 use alloy_sol_types::SolEvent;
 use anyhow::Context;
 use bridge_core::abi::{Gate, SwapPool, SwapRouter};
@@ -275,19 +276,7 @@ struct Window {
 ///
 /// Returns the block the scan actually reached, which the caller uses as the
 /// cursor bound; `None` means this endpoint has nothing confirmed at
-/// `from_block` and read nothing at all.
-///
-/// ## Why the head is re-read here (audit 2026-09-16, M-7)
-///
-/// The loop's `cached_latest` and this `get_logs` are separate round trips, and
-/// behind a hosted URL sits a POOL of nodes at differing heights. A node that
-/// has not imported the range answers `Ok(vec![])` — success, no logs — which
-/// the loop could not tell from "nothing happened in these blocks", so the
-/// cursor moved past blocks nobody read. `block_confirmation` guards reorgs, not
-/// a peer being behind. Asking the same provider for its head and clamping to it
-/// makes the empty answer mean what it says. This is the rule the validator's
-/// scanner already applies, shared from `bridge_core::scan` so the two cannot
-/// drift.
+/// `from_block` (or could not show it served the window) and read nothing.
 async fn scan<P, F, Fut>(
     provider: &P,
     db: &Db,
@@ -301,13 +290,94 @@ where
     F: Fn(Db, u64, Log) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
+    let Some((scanned_to, logs)) = fetch_window(provider, chain_id, address, window).await? else {
+        return Ok(None);
+    };
+    let from_block = window.from_block;
+    for log in logs {
+        // Propagate handler failures instead of swallowing them. A transient
+        // DB/store error must fail the whole batch so the caller leaves the
+        // cursor where it is and reprocesses the range next tick — otherwise the
+        // event (a Sent/Claimed/Cancelled row) would be dropped permanently. All
+        // handler writes are idempotent upserts (ON CONFLICT / UPDATE), so
+        // reprocessing already-handled logs in the range is safe.
+        handler(db.clone(), chain_id, log)
+            .await
+            .with_context(|| format!("handling log in blocks [{from_block},{scanned_to}]"))?;
+    }
+    Ok(Some(scanned_to))
+}
+
+/// The RPC half of [`scan`]: the logs for `address` in the window, in chain
+/// order with orphans dropped, plus the block the window really reached.
+/// `Ok(None)` means "this endpoint did not demonstrably serve the window — read
+/// nothing, advance nothing". Database-free, so it is tested with a mocked
+/// provider alone.
+///
+/// ## Why the head is re-read here (audit 2026-09-16, M-7)
+///
+/// The loop's `cached_latest` and this `get_logs` are separate round trips, and
+/// behind a hosted URL sits a POOL of nodes at differing heights. A node that
+/// has not imported the range answers `Ok(vec![])` — success, no logs — which
+/// the loop could not tell from "nothing happened in these blocks", so the
+/// cursor moved past blocks nobody read. `block_confirmation` guards reorgs, not
+/// a peer being behind. Asking the provider for its head and clamping to it is
+/// the rule the validator's scanner already applies, shared from
+/// `bridge_core::scan` so the two cannot drift.
+///
+/// ## Why the logs travel in one batch with the window's last block (audit 2026-10-02, L7-5)
+///
+/// That head read is itself a separate HTTP request, so behind a load balancer
+/// an up-to-date node can answer it while `eth_getLogs` lands on a lagging one,
+/// whose empty (or truncated) answer was again counted as scanned. So
+/// `eth_getLogs` goes out in ONE JSON-RPC batch — one HTTP POST, which a
+/// balancer routes as a unit — together with `eth_getBlockByNumber(scanned_to)`,
+/// and the window only counts if:
+///
+///   * that block is non-null: whoever answered the batch has imported the
+///     window's last block, hence every block before it; and
+///   * the block is `scanned_to` and every returned log at `scanned_to` carries
+///     its hash: the logs and the block come from the same view of the chain.
+///
+/// Anything else is treated exactly like a lagging endpoint — `Ok(None)`, the
+/// cursor stays put and the range is re-read next tick. (`eth_getLogs` only
+/// takes a `blockHash` for a single block, so a hash-bound range query is not
+/// available; the batch is the closest JSON-RPC gets to "same backend".)
+async fn fetch_window<P: Provider>(
+    provider: &P,
+    chain_id: u64,
+    address: Address,
+    window: Window,
+) -> anyhow::Result<Option<(u64, Vec<Log>)>> {
     let Window { from_block, to_block, confirmations } = window;
     let head = provider.get_block_number().await.context("get_block_number (scan window)")?;
     let Some(scanned_to) = clamp_scan_window(from_block, to_block, head, confirmations) else {
         return Ok(None);
     };
     let filter = Filter::new().address(address).from_block(from_block).to_block(scanned_to);
-    let mut logs = provider.get_logs(&filter).await.context("get_logs")?;
+
+    let client = provider.client();
+    let mut batch = alloy::rpc::client::BatchRequest::new(&client);
+    let logs_call =
+        batch.add_call::<_, Vec<Log>>("eth_getLogs", &(filter,)).context("eth_getLogs (encode)")?;
+    let block_call = batch
+        .add_call::<_, Option<Block>>("eth_getBlockByNumber", &(BlockNumberOrTag::Number(scanned_to), false))
+        .context("eth_getBlockByNumber (encode)")?;
+    batch.send().await.context("get_logs batch")?;
+    let mut logs = logs_call.await.context("get_logs")?;
+    let block = block_call.await.context("eth_getBlockByNumber (scan window end)")?;
+
+    if !window_end_vouched(scanned_to, block.as_ref(), &logs) {
+        warn!(
+            chain_id,
+            from_block,
+            scanned_to,
+            "the node that served eth_getLogs did not vouch for the window's last block; \
+             not counting the range as scanned (retrying next tick)"
+        );
+        return Ok(None);
+    }
+
     logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
     // An orphaned log means the reorg was deeper than `block_confirmation`, which
@@ -324,18 +394,17 @@ where
              block_confirmation for this chain"
         );
     }
-    for log in logs {
-        // Propagate handler failures instead of swallowing them. A transient
-        // DB/store error must fail the whole batch so the caller leaves the
-        // cursor where it is and reprocesses the range next tick — otherwise the
-        // event (a Sent/Claimed/Cancelled row) would be dropped permanently. All
-        // handler writes are idempotent upserts (ON CONFLICT / UPDATE), so
-        // reprocessing already-handled logs in the range is safe.
-        handler(db.clone(), chain_id, log)
-            .await
-            .with_context(|| format!("handling log in blocks [{from_block},{scanned_to}]"))?;
-    }
-    Ok(Some(scanned_to))
+    Ok(Some((scanned_to, logs)))
+}
+
+/// L7-5: does the block returned alongside the logs prove the answering node
+/// served the whole window? It must exist, be `scanned_to`, and agree on the
+/// hash with every log the same answer placed at `scanned_to`.
+fn window_end_vouched(scanned_to: u64, block: Option<&Block>, logs: &[Log]) -> bool {
+    let Some(block) = block else { return false };
+    let end_hash = block.header.hash;
+    block.header.number == scanned_to
+        && logs.iter().all(|l| l.block_number != Some(scanned_to) || l.block_hash == Some(end_hash))
 }
 
 /// The log's transaction hash as `0x`-prefixed hex, or `""` if the RPC omitted
@@ -527,10 +596,79 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
         a.push_success(&U256::from(160u64));
         a.push_success(&Vec::<Log>::new());
+        a.push_success(&Some(block_at(150, B256::repeat_byte(0xbb))));
         let reached = scan(&provider, &db, 1, addr, Window { from_block: 100, to_block: 199, confirmations: 10 }, noop_handler)
             .await
             .expect("scan");
         assert_eq!(reached, Some(150), "may only advance as far as this endpoint confirmed");
+    }
+
+    fn block_at(number: u64, hash: B256) -> Block {
+        let mut b: Block = Block::default();
+        b.header.number = number;
+        b.header.hash = hash;
+        b
+    }
+
+    fn log_at(number: u64, hash: B256) -> Log {
+        Log { block_number: Some(number), block_hash: Some(hash), ..Default::default() }
+    }
+
+    const WIN: Window = Window { from_block: 100, to_block: 199, confirmations: 10 };
+
+    /// L7-5. The head comes from an up-to-date node (210 => window [100,199]),
+    /// but the batch carrying `eth_getLogs` is served by a node that has not
+    /// imported block 199: its block is `null` and its empty log list must NOT
+    /// count as "scanned". The same with a non-empty but truncated answer.
+    #[tokio::test]
+    async fn logs_from_a_node_without_the_window_end_are_not_counted_as_scanned() {
+        let addr = Address::repeat_byte(0x11);
+        for logs in [Vec::<Log>::new(), vec![log_at(120, B256::repeat_byte(1))]] {
+            let a = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+            a.push_success(&U256::from(210u64));
+            a.push_success(&logs);
+            a.push_success(&Option::<Block>::None);
+            let got = fetch_window(&provider, 1, addr, WIN).await.expect("lagging is not an error");
+            assert!(got.is_none(), "a batch whose node lacks block 199 must read nothing");
+            assert!(a.read_q().is_empty(), "exactly head + one batch of two calls");
+        }
+    }
+
+    /// L7-5. The block and the logs disagree on what block 199 is (or the node
+    /// answered for some other height): two views of the chain, not one.
+    #[tokio::test]
+    async fn logs_and_window_end_from_different_views_are_not_counted() {
+        let addr = Address::repeat_byte(0x11);
+        let h = B256::repeat_byte(0xaa);
+        let cases = [
+            (vec![log_at(199, B256::repeat_byte(0xcc))], block_at(199, h)), // hash mismatch
+            (vec![], block_at(198, h)),                                      // wrong height
+        ];
+        for (logs, block) in cases {
+            let a = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+            a.push_success(&U256::from(210u64));
+            a.push_success(&logs);
+            a.push_success(&Some(block));
+            assert!(fetch_window(&provider, 1, addr, WIN).await.expect("not an error").is_none());
+        }
+    }
+
+    /// L7-5, the healthy path: the batch's node has block 199 and agrees with
+    /// its logs, so the window counts and the logs come back in chain order.
+    #[tokio::test]
+    async fn a_vouched_window_is_scanned_in_chain_order() {
+        let addr = Address::repeat_byte(0x11);
+        let h = B256::repeat_byte(0xaa);
+        let a = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(a.clone());
+        a.push_success(&U256::from(210u64));
+        a.push_success(&vec![log_at(199, h), log_at(120, B256::repeat_byte(1))]);
+        a.push_success(&Some(block_at(199, h)));
+        let (to, logs) = fetch_window(&provider, 1, addr, WIN).await.expect("scan").expect("vouched");
+        assert_eq!(to, 199);
+        assert_eq!(logs.iter().map(|l| l.block_number.unwrap()).collect::<Vec<_>>(), vec![120, 199]);
     }
 
     /// The cursor bound for a tick is the LOWEST of what each scanner read, and
