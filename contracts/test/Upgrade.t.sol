@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, stdStorage, StdStorage} from "forge-std/Test.sol";
 import {Gate} from "../src/Gate.sol";
 import {GateDeployer} from "../src/GateDeployer.sol";
 import {TestToken} from "../src/TestToken.sol";
@@ -29,6 +29,8 @@ contract GateV2 is Gate {
 ///            in the first place. The timelock is what stops the upgrade power
 ///            from simply becoming a faster way to take the funds.
 contract UpgradeTest is Test {
+    using stdStorage for StdStorage;
+
     bytes32 constant DOMAIN_A = keccak256("mesh.generation.A");
     bytes32 constant DOMAIN_B = keccak256("mesh.generation.B");
 
@@ -538,6 +540,165 @@ contract UpgradeTest is Test {
         gate.scheduleUpgrade(v2);
         gate.cancelScheduledUpgrade(v2);
         assertEq(gate.upgradeCodehash(v2), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Audit 2026-10-02, L7-1 — the install call is pinned with the code
+    // -----------------------------------------------------------------
+
+    /// The finding: the schedule pinned address + code but not `data`, so the
+    /// owner could delegatecall any function of the reviewed implementation with
+    /// arguments nobody saw. Here the schedule says "install and appoint guardian
+    /// A"; an install that would appoint B instead (or run nothing) is refused,
+    /// and only the scheduled call goes through.
+    function test_Upgrade_DataIsPinned_OnlyTheScheduledCallInstalls() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        address guardianA = address(0xA11A);
+        address guardianB = address(0xB22B);
+        bytes memory scheduled = abi.encodeCall(Gate.setGuardian, (guardianA));
+        bytes memory swapped = abi.encodeCall(Gate.setGuardian, (guardianB));
+
+        gate.scheduleUpgrade(v2, scheduled);
+        assertEq(gate.upgradeDataHash(v2), keccak256(scheduled), "data hash pinned");
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.UpgradeDataMismatch.selector, v2, keccak256(scheduled), keccak256(swapped)
+            )
+        );
+        gate.upgradeToAndCall(v2, swapped);
+
+        // Dropping the call is a different install too.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.UpgradeDataMismatch.selector, v2, keccak256(scheduled), keccak256("")
+            )
+        );
+        gate.upgradeToAndCall(v2, "");
+
+        gate.upgradeToAndCall(v2, scheduled);
+        assertEq(GateV2(address(gate)).version(), "v2", "new logic is live");
+        assertEq(gate.guardian(), guardianA, "exactly the scheduled call ran");
+        assertEq(gate.upgradeReadyAt(v2), 0, "schedule burned");
+        assertEq(gate.upgradeDataHash(v2), 0, "data pin burned with it");
+    }
+
+    /// The old one-argument `scheduleUpgrade` keeps working and means "install
+    /// with NO call": it cannot be spent on an arbitrary initializer.
+    function test_Upgrade_EmptyDataSchedule_RefusesAnyCall() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        assertEq(gate.upgradeDataHash(v2), keccak256(""), "empty data pinned, not zero");
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+
+        bytes memory smuggled = abi.encodeCall(Gate.setGuardian, (address(0xBAD)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.UpgradeDataMismatch.selector, v2, keccak256(""), keccak256(smuggled)
+            )
+        );
+        gate.upgradeToAndCall(v2, smuggled);
+
+        gate.upgradeToAndCall(v2, "");
+        assertEq(GateV2(address(gate)).version(), "v2");
+        assertEq(gate.guardian(), address(0), "nothing ran at install");
+    }
+
+    /// Observers can only review what they can see: the schedule event carries
+    /// the install data in full, not just its hash.
+    function test_Upgrade_ScheduleEventPublishesTheData() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        bytes memory data = abi.encodeCall(Gate.setGuardian, (address(0xA11A)));
+
+        vm.expectEmit(true, true, false, true, address(gate));
+        emit Gate.UpgradeScheduled(v2, block.timestamp + gate.UPGRADE_DELAY(), keccak256(data), data);
+        gate.scheduleUpgrade(v2, data);
+
+        vm.expectEmit(true, true, false, true, address(gate));
+        emit Gate.UpgradeScheduled(v2, block.timestamp + gate.UPGRADE_DELAY(), keccak256(""), "");
+        gate.scheduleUpgrade(v2);
+    }
+
+    /// Changing the install call is a new schedule: it re-pins AND restarts the
+    /// delay, so the new data sits out the full 48 h too.
+    function test_Upgrade_ReschedulingWithNewDataRestartsTheDelay() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        bytes memory first = abi.encodeCall(Gate.setGuardian, (address(0xA11A)));
+        bytes memory second = abi.encodeCall(Gate.setGuardian, (address(0xB22B)));
+
+        gate.scheduleUpgrade(v2, first);
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+        gate.scheduleUpgrade(v2, second);
+        uint256 readyAt = gate.upgradeReadyAt(v2);
+        assertEq(gate.upgradeDataHash(v2), keccak256(second), "re-pinned");
+
+        vm.expectRevert(abi.encodeWithSelector(Gate.UpgradeNotReady.selector, v2, readyAt));
+        gate.upgradeToAndCall(v2, second);
+
+        vm.warp(readyAt);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Gate.UpgradeDataMismatch.selector, v2, keccak256(second), keccak256(first)
+            )
+        );
+        gate.upgradeToAndCall(v2, first);
+        gate.upgradeToAndCall(v2, second);
+        assertEq(gate.guardian(), address(0xB22B));
+    }
+
+    function test_Upgrade_GuardianCancelClearsThePinnedData() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address guardian = address(0x6A11);
+        gate.setGuardian(guardian);
+        address v2 = address(new GateV2());
+        bytes memory data = abi.encodeCall(Gate.setGuardian, (address(0xA11A)));
+        gate.scheduleUpgrade(v2, data);
+
+        vm.prank(guardian);
+        gate.cancelScheduledUpgrade(v2);
+        assertEq(gate.upgradeReadyAt(v2), 0);
+        assertEq(gate.upgradeCodehash(v2), 0);
+        assertEq(gate.upgradeDataHash(v2), 0);
+
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+        vm.expectRevert(abi.encodeWithSelector(Gate.UpgradeNotScheduled.selector, v2));
+        gate.upgradeToAndCall(v2, data);
+    }
+
+    /// A schedule that predates the data pin (the slot was `__gap`, so it reads
+    /// zero) matches no data at all — not even empty — and must be re-scheduled.
+    function test_Upgrade_ScheduleWithoutADataPin_IsFailClosed() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        gate.scheduleUpgrade(v2);
+        stdstore.target(address(gate)).sig("upgradeDataHash(address)").with_key(v2).checked_write(
+            bytes32(0)
+        );
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+
+        vm.expectRevert(
+            abi.encodeWithSelector(Gate.UpgradeDataMismatch.selector, v2, bytes32(0), keccak256(""))
+        );
+        gate.upgradeToAndCall(v2, "");
+    }
+
+    /// The pre-checks in the `upgradeToAndCall` override keep the real reason
+    /// for a refusal: a stranger gets NotOwner, not a data mismatch.
+    function test_Upgrade_StrangerWithTheScheduledDataIsStillRefused() public {
+        Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        address v2 = address(new GateV2());
+        bytes memory data = abi.encodeCall(Gate.setGuardian, (address(0xA11A)));
+        gate.scheduleUpgrade(v2, data);
+        vm.warp(block.timestamp + gate.UPGRADE_DELAY());
+
+        vm.prank(address(0xBADA55));
+        vm.expectRevert(Gate.NotOwner.selector);
+        gate.upgradeToAndCall(v2, data);
     }
 
     /// The implementation must be permanently uninitializable, or anyone can own

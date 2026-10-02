@@ -122,6 +122,11 @@ pub const GOVERNANCE_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
 /// The program's `SETUP_WINDOW`: how long after `init` assets may still be bound
 /// in one transaction, if `Seal` has not already closed the phase (H-5).
 pub const SETUP_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// The program's `MAX_THRESHOLD` (audit L7-4): the most signatures one
+/// `claim`/`cancel`/`refund` can carry inside Solana's 1232-byte packet, so the
+/// highest threshold `init` / `SetThreshold` accept. `solana-gate`'s
+/// `tests/round7_low.rs` measures it and pins this mirror.
+pub const MAX_THRESHOLD: u32 = 8;
 
 /// `keccak("addValidator" ‖ v)` — the action id `ScheduleGovernance` needs before
 /// `SetValidator { active: true }` will admit `v`. Must equal the program's

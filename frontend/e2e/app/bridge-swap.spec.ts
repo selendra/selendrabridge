@@ -103,6 +103,21 @@ test.describe("form", () => {
     await expect(primaryButton(page)).toHaveText("Corridor not configured");
   });
 
+  test("refuses when the source router's peer is not the registry's destination router (L7-9)", async ({ page }) => {
+    // The source router's owner can repoint remoteRouter instantly; a non-empty
+    // value that is not the registry's router for the destination must block.
+    const ROGUE = "0x" + "de".repeat(20);
+    await openCrossSwap(page, {
+      calls: { ...CALLS, a6b18e64: "raw:" + word(32) + word(20) + ROGUE.slice(2).padEnd(64, "0") },
+    });
+    await field(page, "Final token").fill(STABLE_B);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("5");
+    await expect(primaryButton(page)).toHaveText("Destination router mismatch — refusing to send");
+    await expect(primaryButton(page)).toBeDisabled();
+    await expect(page.locator(".notice--error")).toContainText(ROUTER_B);
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
+
   test("blocks an output larger than the destination pool's locked reserve", async ({ page }) => {
     await openCrossSwap(page);
     await field(page, "Final token").fill(STABLE_B);

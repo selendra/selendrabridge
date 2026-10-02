@@ -90,6 +90,8 @@ config_problems() {
         | "chains[chain_id=\(.chain_id | tojson)].public_rpc is not a plain url" ),
       ( .solana | select(. != null and .enabled == true)
         | (.rpc, .public_rpc) | select(. != null and (url_ok | not)) | "solana rpc \(tojson) is not a plain url" ),
+      ( .solana.rpcs | select(. != null and ((type != "array") or any(.[]; url_ok | not)))
+        | "solana.rpcs must be an array of plain urls" ),
       ( .database.docker // {} | (.user, .db) | select(. != null and (type != "string" or (test("^[A-Za-z_][A-Za-z0-9_]{0,62}$") | not)))
         | "database.docker.user/db \(tojson) must be a plain identifier" ),
       ( .database.docker.image | select(. != null and (type != "string" or (test("^[A-Za-z0-9][A-Za-z0-9./:@_-]*$") | not)))
@@ -485,6 +487,10 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo "chain_id = $SOL_CHAIN_ID"
       echo "program_id = $(tstr "$SOL_PROGRAM")"
       echo "rpc = $(tstr "$(j '.solana.rpc')")"
+      # L7-11: optional extra Solana RPCs, read on a majority with `rpc`.
+      if [[ "$(j '(.solana.rpcs // []) | length')" != "0" ]]; then
+        echo "rpcs = $(jq -c '.solana.rpcs' "$CONFIG")"
+      fi
     fi
     if [[ "$REFUND_ON" == "true" ]]; then
       # No [refund] block => this validator never votes on cancels/refunds, and

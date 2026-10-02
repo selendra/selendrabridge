@@ -62,6 +62,25 @@ pub struct SolanaPool {
 pub struct Snapshot {
     pub pool: PoolState,
     pub tokens: Vec<TokenState>,
+    /// The cluster's `Clock::unix_timestamp`, read in the SAME
+    /// `getMultipleAccounts` as the pool (so at the same slot) — the clock the
+    /// program's `StalePrice` guard uses. `None` when it could not be read;
+    /// freshness then fails closed (audit L7-15: the host clock is not the
+    /// chain's, and a skewed host served stale prices as fresh).
+    pub chain_now: Option<i64>,
+}
+
+/// The Clock sysvar. Only the runtime writes it, every slot.
+pub const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
+
+/// `unix_timestamp` out of the Clock sysvar's data — bincode of
+/// `{ slot: u64, epoch_start_timestamp: i64, epoch: u64,
+/// leader_schedule_epoch: u64, unix_timestamp: i64 }`, so bytes 32..40 LE.
+/// `None` for short data or a non-positive time (no real cluster reports one).
+pub fn clock_unix_timestamp(data: &[u8]) -> Option<i64> {
+    let raw: [u8; 8] = data.get(32..40)?.try_into().ok()?;
+    let t = i64::from_le_bytes(raw);
+    (t > 0).then_some(t)
 }
 
 /// Why a snapshot could not quote a swap.
@@ -75,6 +94,9 @@ pub enum QuoteError {
     StalePrice { mint: String },
     /// The arithmetic overflowed or a price is zero.
     Math,
+    /// The cluster clock could not be read, so freshness cannot be judged the
+    /// way the program judges it. Fails closed: no quote.
+    NoChainClock,
 }
 
 impl std::fmt::Display for QuoteError {
@@ -85,6 +107,7 @@ impl std::fmt::Display for QuoteError {
                 write!(f, "price for {mint} is stale; the program would refuse this swap (StalePrice)")
             }
             QuoteError::Math => write!(f, "quote does not compute (zero price or overflow)"),
+            QuoteError::NoChainClock => write!(f, "cluster clock unavailable; cannot tell a fresh price from a stale one"),
         }
     }
 }
@@ -112,16 +135,28 @@ impl Snapshot {
         swap_math::amount_out(amount, ti.price, ti.decimals, to.price, to.decimals, self.pool.fee_bps)
             .ok_or(QuoteError::Math)
     }
-}
 
-/// Wall-clock unix seconds — the off-chain stand-in for the cluster `Clock`
-/// the program reads. The two drift by at most a slot or two, far inside any
-/// sane `max_price_age`.
-pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    /// [`quote`](Self::quote) at the cluster's own clock ([`Snapshot::chain_now`]),
+    /// never the host's. No clock, no quote.
+    pub fn quote_at_chain_time(
+        &self,
+        mint_in: &[u8; 32],
+        mint_out: &[u8; 32],
+        amount: u64,
+    ) -> Result<u64, QuoteError> {
+        let now = self.chain_now.ok_or(QuoteError::NoChainClock)?;
+        self.quote(mint_in, mint_out, amount, now)
+    }
+
+    /// The program's freshness verdict for `token` at the cluster clock. With no
+    /// clock every priced leg reads stale; only the hub, which the program
+    /// exempts whatever the time, stays fresh.
+    pub fn price_fresh(&self, token: &TokenState) -> bool {
+        if token.mint == self.pool.hub_mint {
+            return true;
+        }
+        self.chain_now.is_some_and(|now| self.pool.price_is_fresh(token, now))
+    }
 }
 
 impl SolanaPool {
@@ -159,8 +194,21 @@ impl SolanaPool {
                 .ok_or_else(|| anyhow::anyhow!("no token PDA"))?;
             addrs.push(b58(&rec));
         }
+        // The cluster clock rides in the same call: same slot as the prices,
+        // and no extra upstream request.
+        addrs.push(CLOCK_SYSVAR.to_owned());
 
-        let values = self.get_multiple_accounts(&addrs).await?;
+        let mut values = self.get_multiple_accounts(&addrs).await?;
+        anyhow::ensure!(
+            values.len() == addrs.len(),
+            "getMultipleAccounts returned {} accounts for {} keys",
+            values.len(),
+            addrs.len()
+        );
+        let chain_now = values.pop().flatten().as_deref().and_then(clock_unix_timestamp);
+        if chain_now.is_none() {
+            tracing::warn!(program = %self.program, "cluster clock unreadable; Solana prices read as stale");
+        }
         let pool_raw = values
             .first()
             .and_then(|v| v.clone())
@@ -177,7 +225,18 @@ impl SolanaPool {
             }
         }
         tokens.sort_by_key(|t| (t.mint != pool.hub_mint, t.mint));
-        Ok(Snapshot { pool, tokens })
+        Ok(Snapshot { pool, tokens, chain_now })
+    }
+
+    /// The cluster's `Clock::unix_timestamp` on its own, for the scan path.
+    /// `None` on any failure — callers fail closed.
+    async fn chain_now(&self) -> Option<i64> {
+        let v = self
+            .get_multiple_accounts(&[CLOCK_SYSVAR.to_owned()])
+            .await
+            .inspect_err(|e| tracing::warn!(program = %self.program, error = %e, "cluster clock read failed"))
+            .ok()?;
+        v.into_iter().next().flatten().as_deref().and_then(clock_unix_timestamp)
     }
 
     /// `getMultipleAccounts`, returning each account's raw data (or `None` when
@@ -257,7 +316,8 @@ impl SolanaPool {
         })?;
         // Stable order for a stable UI: the hub first, then by mint.
         tokens.sort_by_key(|t| (t.mint != pool.hub_mint, t.mint));
-        Ok(Snapshot { pool, tokens })
+        let chain_now = self.chain_now().await;
+        Ok(Snapshot { pool, tokens, chain_now })
     }
 
     /// An SPL mint's decimals — needed to show a sane amount for an asset the
@@ -555,7 +615,7 @@ pub fn from_b58(s: &str) -> Option<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // --- the destination marker (EVM->Solana explorer status) -----------------
@@ -641,7 +701,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        Snapshot { pool, tokens }
+        Snapshot { pool, tokens, chain_now: None }
     }
 
     /// The quote applies the program's staleness guard: a leg the chain would
@@ -674,6 +734,55 @@ mod tests {
         assert!(bound > 0);
         assert!(s.quote(&hub, &alt, 1_000_000, 1_000 + bound).is_ok());
         assert!(matches!(s.quote(&hub, &alt, 1_000_000, 1_001 + bound), Err(QuoteError::StalePrice { .. })));
+    }
+
+    /// Clock sysvar bytes: slot, epoch_start_timestamp, epoch,
+    /// leader_schedule_epoch, unix_timestamp — all 8-byte LE.
+    pub(crate) fn clock_bytes(unix_timestamp: i64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(40);
+        v.extend_from_slice(&123u64.to_le_bytes());
+        v.extend_from_slice(&(unix_timestamp - 3600).to_le_bytes());
+        v.extend_from_slice(&7u64.to_le_bytes());
+        v.extend_from_slice(&8u64.to_le_bytes());
+        v.extend_from_slice(&unix_timestamp.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn clock_sysvar_decodes_unix_timestamp() {
+        assert_eq!(clock_unix_timestamp(&clock_bytes(1_700_000_000)), Some(1_700_000_000));
+        assert_eq!(clock_unix_timestamp(&clock_bytes(1_700_000_000)[..39]), None, "short");
+        assert_eq!(clock_unix_timestamp(&[]), None);
+        assert_eq!(clock_unix_timestamp(&clock_bytes(0)), None, "no real cluster is at epoch 0");
+        assert!(from_b58(CLOCK_SYSVAR).is_some(), "the sysvar id is a real 32-byte key");
+    }
+
+    /// L7-15: freshness is judged at the CLUSTER clock carried in the snapshot,
+    /// and with no clock it fails closed — never at the host's clock.
+    #[test]
+    fn freshness_uses_the_chain_clock_and_fails_closed_without_one() {
+        let (hub, alt) = ([1u8; 32], [2u8; 32]);
+        let mut s = snap(100);
+        let alt_rec = s.tokens[1].clone();
+        let hub_rec = s.tokens[0].clone();
+
+        // No clock: no quote, the priced leg reads stale, the exempt hub fresh.
+        assert_eq!(s.quote_at_chain_time(&hub, &alt, 2_000_000), Err(QuoteError::NoChainClock));
+        assert!(!s.price_fresh(&alt_rec));
+        assert!(s.price_fresh(&hub_rec));
+
+        // The chain says 1_100: fresh, whatever the host clock (years later) says.
+        s.chain_now = Some(1_100);
+        assert_eq!(s.quote_at_chain_time(&hub, &alt, 2_000_000), Ok(1_000_000));
+        assert!(s.price_fresh(&alt_rec));
+
+        // The chain says 1_101: stale, even if a host clock were behind it.
+        s.chain_now = Some(1_101);
+        assert_eq!(
+            s.quote_at_chain_time(&hub, &alt, 2_000_000),
+            Err(QuoteError::StalePrice { mint: b58(&alt) })
+        );
+        assert!(!s.price_fresh(&alt_rec));
     }
 
     #[test]

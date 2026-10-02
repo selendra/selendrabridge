@@ -135,6 +135,9 @@ contract LiveGateUpgradeTest is Test {
         (, uint8 bridgeBefore,) = gate.bridgeDecimalsOf(LIVE_TST);
 
         vm.startPrank(owner);
+        // The LIVE gate still runs pre-L7-1 code, which pins no install data, so
+        // the one-argument schedule is what it understands. On a gate already at
+        // L7-1 this must be `scheduleUpgrade(impl, <the initializeV2 calldata>)`.
         gate.scheduleUpgrade(impl);
         vm.warp(block.timestamp + gate.UPGRADE_DELAY());
         UUPSUpgradeable(LIVE_GATE).upgradeToAndCall(

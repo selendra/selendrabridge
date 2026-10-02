@@ -304,14 +304,33 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         can be installed. Appended from `__gap` like every field above.
     mapping(address implementation => bytes32 codehash) public upgradeCodehash;
 
+    /// @notice `keccak256` of the exact `data` the scheduled implementation will
+    ///         be installed with ({upgradeToAndCall}'s second argument). Empty
+    ///         data pins `keccak256("")`, never zero.
+    ///
+    /// @dev    Audit 2026-10-02, L7-1. Pinning the address and the code still
+    ///         left the INSTALL CALL open: `upgradeToAndCall(impl, data)`
+    ///         delegatecalls `data` into the gate, so the owner could run any
+    ///         function of the reviewed implementation with arguments nobody saw
+    ///         during the 48 h (e.g. `initializeV2`'s token/chain lists). The
+    ///         schedule now commits to the data as well, and {UpgradeScheduled}
+    ///         publishes it in full so holders review what will actually run.
+    ///
+    ///         ZERO MEANS "NOTHING PINNED", and a zero pin matches no data
+    ///         (`keccak256` of anything is non-zero), so a schedule made before
+    ///         this field existed is fail-closed: re-schedule it. Appended from
+    ///         `__gap` like every field above.
+    mapping(address implementation => bytes32 dataHash) public upgradeDataHash;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
     ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
     ///      `supportedChain` took one each: 49 -> 47. `bridgeDecimalsOf` took
     ///      one: 47 -> 46. `setupDeadline` took one: 46 -> 45. `upgradeCodehash`
-    ///      took one: 45 -> 44. The gap still ends at slot 63.)
-    uint256[44] private __gap;
+    ///      took one: 45 -> 44. `upgradeDataHash` took one: 44 -> 43. The gap still
+    ///      ends at slot 63.)
+    uint256[43] private __gap;
 
     /// @param amount the WIRE amount, in the asset's bridge decimals (see
     ///        {BridgeDecimals}) — what the submissionId commits to, not the local
@@ -375,9 +394,17 @@ contract Gate is Initializable, UUPSUpgradeable {
     event GuardianSet(address indexed guardian);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
-    /// @notice An implementation entered the upgrade queue. `readyAt` is when it
-    ///         becomes installable — the public warning users act on.
-    event UpgradeScheduled(address indexed implementation, uint256 readyAt);
+    /// @notice An implementation entered the upgrade queue, together with the
+    ///         exact call it will be installed with: `data` is what
+    ///         {upgradeToAndCall} must be given (empty = install only), and
+    ///         `dataHash` is its pinned `keccak256` (see {upgradeDataHash}).
+    ///         `readyAt` is when it becomes installable — the public warning
+    ///         users act on.
+    /// @dev    L7-1 widened this event (new topic0): an indexer of the old
+    ///         `UpgradeScheduled(address,uint256)` must move to this signature.
+    event UpgradeScheduled(
+        address indexed implementation, uint256 readyAt, bytes32 indexed dataHash, bytes data
+    );
     event UpgradeCancelled(address indexed implementation);
     /// @notice A validator addition or threshold decrease entered the queue.
     ///         `readyAt` is when it becomes executable — the public warning.
@@ -459,6 +486,10 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @dev the implementation's code changed after it was scheduled (audit
     ///      round 6, LOW; see {upgradeCodehash}). Re-schedule to review the new code.
     error ImplementationCodeChanged(address implementation, bytes32 scheduled, bytes32 current);
+    /// @dev {upgradeToAndCall} was given install data other than what was
+    ///      scheduled (audit 2026-10-02, L7-1; see {upgradeDataHash}). A pin of
+    ///      zero is a schedule made before data was pinned: re-schedule it.
+    error UpgradeDataMismatch(address implementation, bytes32 scheduled, bytes32 given);
     /// @dev a validator addition / threshold decrease was attempted without first
     ///      going through {scheduleGovernance}
     error GovernanceNotScheduled(bytes32 actionId);
@@ -661,23 +692,42 @@ contract Gate is Initializable, UUPSUpgradeable {
     // ---------------------------------------------------------------------
 
     /// @notice Queue `implementation` for installation once {UPGRADE_DELAY} has
-    ///         elapsed. Emits {UpgradeScheduled} so holders can see the pending
-    ///         change and withdraw before it lands.
+    ///         elapsed, with NO install call: it can then only be installed by
+    ///         `upgradeToAndCall(implementation, "")`. Kept for backward
+    ///         compatibility; it is exactly `scheduleUpgrade(implementation, "")`.
+    function scheduleUpgrade(address implementation) external onlyOwner {
+        _scheduleUpgrade(implementation, "");
+    }
+
+    /// @notice Queue `implementation` for installation once {UPGRADE_DELAY} has
+    ///         elapsed, installed by `upgradeToAndCall(implementation, data)`
+    ///         with exactly this `data`. Emits {UpgradeScheduled} carrying the
+    ///         data in full, so holders can see the pending change — code AND
+    ///         the call it runs at install — and withdraw before it lands.
     /// @dev    Re-scheduling an implementation RESTARTS its delay rather than
     ///         keeping the earliest deadline. Otherwise an owner could schedule
     ///         an address once, wait out the window, and hold an indefinitely
-    ///         re-usable instant-upgrade right against it.
+    ///         re-usable instant-upgrade right against it. It also re-pins the
+    ///         data, so changing the install call costs a full new delay.
     ///
     ///         The code is pinned as well as the address (audit round 6, LOW; see
     ///         {upgradeCodehash}): an address with no code is refused outright,
     ///         and re-scheduling re-pins the hash along with the new deadline.
-    function scheduleUpgrade(address implementation) external onlyOwner {
+    ///         The install data is pinned too (audit 2026-10-02, L7-1; see
+    ///         {upgradeDataHash}).
+    function scheduleUpgrade(address implementation, bytes calldata data) external onlyOwner {
+        _scheduleUpgrade(implementation, data);
+    }
+
+    function _scheduleUpgrade(address implementation, bytes memory data) private {
         if (implementation == address(0)) revert ZeroAddress();
         if (implementation.code.length == 0) revert ImplementationHasNoCode(implementation);
         uint256 readyAt = block.timestamp + UPGRADE_DELAY;
+        bytes32 dataHash = keccak256(data);
         upgradeReadyAt[implementation] = readyAt;
         upgradeCodehash[implementation] = implementation.codehash;
-        emit UpgradeScheduled(implementation, readyAt);
+        upgradeDataHash[implementation] = dataHash;
+        emit UpgradeScheduled(implementation, readyAt, dataHash, data);
     }
 
     /// @notice Drop a queued implementation. The guardian may do this as well as
@@ -688,7 +738,29 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (msg.sender != owner && msg.sender != guardian) revert NotAuthorizedToPause();
         delete upgradeReadyAt[implementation];
         delete upgradeCodehash[implementation];
+        delete upgradeDataHash[implementation];
         emit UpgradeCancelled(implementation);
+    }
+
+    /// @notice Install a scheduled implementation. Only the exact `data` it was
+    ///         scheduled with is accepted (audit 2026-10-02, L7-1).
+    /// @dev    OZ's UUPS hands {_authorizeUpgrade} the implementation but NOT
+    ///         the data, so the data pin is enforced here. The full schedule is
+    ///         validated FIRST, so an unscheduled / immature / foreign-caller
+    ///         install keeps reporting its real reason rather than a data
+    ///         mismatch; `super` then re-runs {_authorizeUpgrade}, which burns
+    ///         the schedule.
+    function upgradeToAndCall(address newImplementation, bytes memory data)
+        public
+        payable
+        override
+        onlyOwner
+    {
+        _requireMaturedUpgrade(newImplementation);
+        bytes32 pinned = upgradeDataHash[newImplementation];
+        bytes32 given = keccak256(data);
+        if (given != pinned) revert UpgradeDataMismatch(newImplementation, pinned, given);
+        super.upgradeToAndCall(newImplementation, data);
     }
 
     /// @dev The UUPS hook. Enforces owner + scheduled + matured + unchanged code,
@@ -696,12 +768,21 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///      implementation; without the delete, a rolled-back upgrade could be
     ///      re-installed instantly. A schedule made before {upgradeCodehash}
     ///      existed pins zero and so never matches: re-schedule it (fail-closed).
+    ///      The install data is checked in {upgradeToAndCall}, the only caller.
     ///
     ///      Deliberately does NOT have a pause/emergency bypass. An upgrade that
     ///      is urgent enough to skip the delay is indistinguishable on-chain from
     ///      an owner takeover, which is the exact thing the delay defends against;
     ///      genuine emergencies are served by {pause}, which is immediate.
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        _requireMaturedUpgrade(newImplementation);
+        delete upgradeReadyAt[newImplementation];
+        delete upgradeCodehash[newImplementation];
+        delete upgradeDataHash[newImplementation];
+    }
+
+    /// @dev Scheduled + matured + not expired + code unchanged since scheduling.
+    function _requireMaturedUpgrade(address newImplementation) private view {
         uint256 readyAt = upgradeReadyAt[newImplementation];
         if (readyAt == 0) revert UpgradeNotScheduled(newImplementation);
         if (block.timestamp < readyAt) revert UpgradeNotReady(newImplementation, readyAt);
@@ -716,8 +797,6 @@ contract Gate is Initializable, UUPSUpgradeable {
         if (newImplementation.codehash != pinned) {
             revert ImplementationCodeChanged(newImplementation, pinned, newImplementation.codehash);
         }
-        delete upgradeReadyAt[newImplementation];
-        delete upgradeCodehash[newImplementation];
     }
 
     // ---------------------------------------------------------------------

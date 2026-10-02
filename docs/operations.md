@@ -256,7 +256,9 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
   configured with two or more `rpcs` also refuses to START scanning on fewer than two
   healthy ones. The startup `Gate.bridgeDomain()` read and every `[[destinations]]` bridge-decimals
   read are taken the same way — from every healthy endpoint, used only when two agree as
-  a majority — and a destination configured with two `rpcs` likewise waits for both;
+  a majority — and a destination configured with two `rpcs` is not read until both are
+  healthy (connected lazily, per destination: only transfers INTO a destination that is
+  not ready yet are held and retried; corridors to every other peer keep signing);
   a disagreement is logged as `RPC ENDPOINTS DISAGREE` and retried, never signed through. `[corroborate] require = true` (bridge config `.corroborate.require`)
   now only matters for a chain configured with a single endpoint: it withholds instead
   of signing on that one source. Watch for `RPC ENDPOINTS DISAGREE` — that line means
@@ -269,6 +271,24 @@ Transfers are denominated in each asset's **bridge decimals** (`docs/architectur
   the candidate is skipped (`refund attestation failed … no 2 endpoints agree`) and
   retried next tick — a late refund, never a wrong one. Historical `sentBy` reads on
   the cancel leg now need an archive-capable SECOND endpoint as well.
+  Audit round 7 (LOW) refinements:
+  - `rpc`/`rpcs` are **deduplicated after normalising** (trim, trailing `/`, case of
+    scheme and host, default port), so `["A", "A/"]` is ONE endpoint, not a fake second
+    opinion. Two entries on the same `host:port` (e.g. two keys at one provider) log a
+    warning at startup, and are **refused** when `[corroborate] require = true` and every
+    entry of a list is on one server. Use endpoints on different hosts.
+  - With **three or more** endpoints the refund loop takes the head, and the aged block of
+    the cancel leg, that a strict majority vouches for — one endpoint reporting a low head
+    or "no block old enough" no longer blocks every cancel. With two, both must agree as
+    before.
+  - The refund loop connects each chain lazily: a chain short of healthy endpoints only
+    skips the candidates touching it (retried every tick), not the whole loop.
+  - `[[solana_destinations]]` accepts `rpcs = [...]` alongside `rpc`. The asset account is
+    read from each; a scale is used on a majority, and "no record" only when every
+    answering endpoint says so — one endpoint answering `null` among several is a retry,
+    not a permanent withhold. Give Solana two RPCs as well.
+  - A `Sent` whose `autoParams` does not decode is logged and skipped (not signed, nonce
+    consumed, scanner **not** paused) instead of pausing the scanner as an id mismatch.
 - **Seal the Solana gate, and seal it last.** Since H-5 `claim` returns `NotSealed` (`Custom(26)`) until `gate-admin seal` has run, and afterwards a new asset binding needs `gate-admin schedule-governance --register-asset --debridge-id … --mint … --vault … --bridge-decimals …` plus the 48 h delay. `deploy-from-json.sh` runs it (honouring `gate.seal`); a gate left unsealed takes transfers and settles none of them.
 
 ---
@@ -429,15 +449,15 @@ The EVM gate/pool `owner()` holds governance — `scheduleUpgrade`, `scheduleGov
 bash scripts/rotate-keys.sh docker/<stack>/configs/chains.json status
 ```
 
-Every `owner`, `oracle` and `guardian` column printed there must be a different key, and none of them the deployer's hot key. To get there on EVM:
+Every `owner`, `oracle` and `guardian` column printed there must be a different key, and none of them the deployer's hot key. The script covers each chain's gate, swap pool (`swap_pool`) and **SwapRouter** (`router`, or `swap_router`). The router matters as much as the gate (audit L7-9): its owner calls `setRemoteRouter` instantly, so whoever holds that key decides where every future swap-and-bridge's stable lands on the destination, and it also holds `rescue` and the stable-rescue schedule. A chain whose entry records no router gets a `WARNING` and its router — if one is deployed — is **not** moved; add `"router": "0x…"` to the entry first. `status` also prints each router's `remoteRouter(peer)` against the router the file records for that peer and flags any `MISMATCH`. To get there on EVM:
 
-1. `handover` — signed by the current owner from a keystore (never argv). Moves each pool's oracle to a new low-value key, optionally appoints a guardian on every gate and pool, and starts the two-step `transferOwnership` to the cold owner (hardware wallet or multisig). Dry run by default; `--execute` sends.
+1. `handover` — signed by the current owner from a keystore (never argv). Moves each pool's oracle to a new low-value key, optionally appoints a guardian on every gate, pool and router, and starts the two-step `transferOwnership` to the cold owner (hardware wallet or multisig). Dry run by default; `--execute` sends.
    ```bash
    bash scripts/rotate-keys.sh <chains.json> handover --keystore <owner.json> \
         --new-oracle 0x… --new-owner 0x… --guardian 0x… [--execute]
    ```
 2. Put the new oracle's key in `price-keeper.toml` `[oracle]` and restart `price-keeper`. Until then it logs `we are not this pool's oracle` — prices go stale, they are not moved.
-3. `accept` — signed by the new owner: `acceptOwnership()` on every gate and pool.
+3. `accept` — signed by the new owner: `acceptOwnership()` on every gate, pool and router.
 4. `status` again.
 
 **Set a guardian.** `cancelScheduledUpgrade` and `cancelScheduledGovernance` accept only the owner or the guardian. With no guardian, the 48 h timelock can be cancelled only by the key it is meant to protect against: a stolen owner key schedules an upgrade, and nobody else can stop it.
@@ -542,6 +562,18 @@ These are the knobs whose values *are* security properties. None of them is a la
 | `FALLBACK_GRACE` | `SwapRouter` (constant) | 6 h | How long a blocked destination swap is retried before the carrier stable is delivered instead |
 | `block_confirmation` | validator / indexer | per chain | Reorg depth the scanner is safe against |
 | rate limit / body cap | `sig-store`, `graphql-api` | 50 rps, 256 kB | What one credential can cost the service |
+
+**An upgrade schedule pins the implementation's address, its code hash AND the install call** (audit 2026-10-02, L7-1). `scheduleUpgrade(impl)` means "install with no call" — only `upgradeToAndCall(impl, 0x)` is accepted. To run an initializer at install (e.g. `initializeV2(tokens, chains)`), schedule it with the exact calldata, which `UpgradeScheduled(impl, readyAt, dataHash, data)` then publishes for review:
+
+```bash
+DATA=$(cast calldata 'initializeV2(address[],uint256[])' '[0x…]' '[1337]')
+cast send $GATE 'scheduleUpgrade(address,bytes)' $IMPL $DATA      # owner; starts the 48 h
+cast call $GATE 'upgradeDataHash(address)(bytes32)' $IMPL         # == cast keccak $DATA
+# 48 h later, byte-for-byte the same DATA, or it reverts UpgradeDataMismatch:
+cast send $GATE 'upgradeToAndCall(address,bytes)' $IMPL $DATA
+```
+
+Changing the data means re-scheduling, which restarts the delay. A schedule made by a gate implementation that predates L7-1 has no data pin (reads zero) and is refused by the new code — re-schedule it after the upgrade lands.
 
 ### 9.1 Rotating a validator
 

@@ -122,7 +122,9 @@ cd ..        && cargo test -p bridge-core                  # Rust must reproduce
 ## Governance is delayed, in both directions that grant power
 
 The Gate is UUPS behind a proxy, and an implementation swap waits out
-`UPGRADE_DELAY` (48 h) after `scheduleUpgrade`. The same delay covers the two
+`UPGRADE_DELAY` (48 h) after `scheduleUpgrade`. The schedule pins the
+implementation's code hash and the exact `upgradeToAndCall` data, so what runs
+at install is what sat out the delay. The same delay covers the two
 changes that buy the same power without touching the code — **adding a
 validator** and **lowering the threshold** — because an owner who could do those
 in one transaction could sign a claim for every corridor and empty the gate with

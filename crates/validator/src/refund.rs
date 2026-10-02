@@ -135,13 +135,21 @@ impl GateReader {
     /// make a claimed transfer look unclaimed — and this loop would then attest a
     /// cancel for a transfer that was actually paid.
     ///
-    /// The LOWEST head among the endpoints that answered, so no single endpoint
-    /// can push the read past what the others have. A head that is too low only
-    /// makes the read older, and older is the safe direction on both legs:
-    /// `cancelled` only ever goes false→true, so an older read can only HIDE a
-    /// burn (delaying a refund); and a cancel attested off a stale `executed =
-    /// false` cannot be used, because `claim` and `cancel` share the gate's one
-    /// `executed` flag and `cancel` reverts once it is set.
+    /// The highest head a STRICT MAJORITY of the answering endpoints has
+    /// reached ([`majority_floor`]), so no single endpoint can push the read past
+    /// what the others have. With two endpoints that is the lower of the two
+    /// heads, exactly as before. With three or more (audit round 7, L7-12) it is
+    /// no longer the lowest: one endpoint reporting a stale or bogus LOW head
+    /// used to drag every read back with it, and on the cancel leg that made the
+    /// aged-block check fail for every candidate — one endpoint blocking all
+    /// cancels. Now it is outvoted, while a head no majority has reached still
+    /// cannot be used.
+    ///
+    /// A head that is too low only makes the read older, and older is the safe
+    /// direction on both legs: `cancelled` only ever goes false→true, so an older
+    /// read can only HIDE a burn (delaying a refund); and a cancel attested off a
+    /// stale `executed = false` cannot be used, because `claim` and `cancel`
+    /// share the gate's one `executed` flag and `cancel` reverts once it is set.
     async fn confirmed_block(&self) -> anyhow::Result<u64> {
         let mut heads: Vec<u64> = Vec::new();
         for (_, p) in &self.endpoints {
@@ -156,7 +164,7 @@ impl GateReader {
             self.endpoints.len(),
             self.min_agree
         );
-        let latest = heads.into_iter().min().expect("min_agree >= 1");
+        let latest = majority_floor(&heads).expect("min_agree >= 1");
         Ok(latest.saturating_sub(self.block_confirmation))
     }
 
@@ -200,11 +208,18 @@ impl GateReader {
     /// skewed clock must not be able to attest early, and block timestamps are
     /// what the chain actually agrees on).
     ///
-    /// Each endpoint locates one from the SAME confirmed head, and the OLDEST
-    /// result is used: every honest endpoint's answer is genuinely old enough,
-    /// and anything older is too, so a lying endpoint can only push the block
-    /// further back — which makes `was_sent_by_block` harder to satisfy, never
-    /// easier. Any endpoint answering `None` (no block that old) wins outright.
+    /// Each endpoint locates one from the SAME confirmed head, and the newest
+    /// block that a STRICT MAJORITY of them vouch is old enough is used
+    /// ([`agreed_aged_block`]): every block at or before an endpoint's answer is
+    /// old enough by that endpoint's account, and `None` vouches for nothing.
+    /// Too NEW is the dangerous direction (a transfer would count as aged
+    /// early), and no minority can push it there; too OLD only makes
+    /// `was_sent_by_block` harder to satisfy.
+    ///
+    /// With two endpoints that is the OLDER answer, and `None` from either wins
+    /// — the strict rule this always had. With three or more (audit round 7,
+    /// L7-12) one endpoint answering `None`, or an absurdly old block, no
+    /// longer blocks every cancel attestation: it is outvoted.
     ///
     /// `Ok(None)` means the chain has no block that old yet (a fresh dev chain),
     /// in which case nothing may be attested.
@@ -226,7 +241,7 @@ impl GateReader {
             self.min_agree,
             failed.join("; ")
         );
-        Ok(oldest_aged_block(&found))
+        Ok(agreed_aged_block(&found))
     }
 
     /// Was `id` already locked on this gate as of `block`?
@@ -244,6 +259,62 @@ impl GateReader {
             Ok(gate.sentBy(id).block(at).call().await? != Address::ZERO)
         })
         .await
+    }
+}
+
+/// A configured chain whose [`GateReader`] may not be connected yet (audit
+/// round 7, L7-13). See `run` for why connecting is lazy.
+struct LazyReader {
+    chain_id: u64,
+    gate: String,
+    endpoints: Vec<String>,
+    reader: Option<GateReader>,
+}
+
+impl LazyReader {
+    fn new(chain_id: u64, gate: String, endpoints: Vec<String>) -> Self {
+        LazyReader { chain_id, gate, endpoints, reader: None }
+    }
+
+    /// Try once to connect, if not connected yet. Never blocks beyond the one
+    /// probe; a chain that is still short of healthy endpoints stays `None` and
+    /// its candidates are skipped this tick.
+    async fn ensure(&mut self, block_confirmation: u64, require: bool) {
+        if self.reader.is_some() {
+            return;
+        }
+        match GateReader::connect(self.chain_id, &self.gate, &self.endpoints, block_confirmation, require).await {
+            Ok(r) => {
+                info!(chain_id = self.chain_id, endpoints = r.endpoints.len(), "refund loop: chain connected");
+                self.reader = Some(r);
+            }
+            Err(e) => warn!(
+                chain_id = self.chain_id,
+                error = %e,
+                "refund loop: chain not readable yet — candidates touching it are skipped until it \
+                 is (other chains proceed); retrying next tick"
+            ),
+        }
+    }
+}
+
+/// What the refund loop can do with a chain id.
+enum Reader<'a> {
+    Ready(&'a GateReader),
+    /// Configured, but not connected yet. Must NOT be treated as unreadable:
+    /// an unreadable SOURCE opens the refund leg without its source-side
+    /// checks (round 4, M-4), which is only right for a chain no reader exists
+    /// for at all.
+    NotReady,
+    /// Not configured on this validator.
+    NotConfigured,
+}
+
+fn lookup(readers: &BTreeMap<u64, LazyReader>, chain_id: u64) -> Reader<'_> {
+    match readers.get(&chain_id) {
+        None => Reader::NotConfigured,
+        Some(LazyReader { reader: Some(r), .. }) => Reader::Ready(r),
+        Some(_) => Reader::NotReady,
     }
 }
 
@@ -282,10 +353,27 @@ async fn aged_block_on(
     Ok(None)
 }
 
-/// The oldest of several endpoints' aged blocks; `None` if any found none. See
-/// [`GateReader::aged_block`] for why the oldest is the safe choice.
-fn oldest_aged_block(found: &[Option<u64>]) -> Option<u64> {
-    found.iter().copied().collect::<Option<Vec<u64>>>()?.into_iter().min()
+/// The newest aged block a strict majority of the endpoints vouch for; `None`
+/// when no majority vouches for any. See [`GateReader::aged_block`] for why.
+/// `None < Some(_)` in `Option`'s order, which is exactly "vouches for nothing".
+fn agreed_aged_block(found: &[Option<u64>]) -> Option<u64> {
+    majority_floor(found).flatten()
+}
+
+/// The largest value that a STRICT MAJORITY of `values` are at or above — the
+/// `(n/2 + 1)`-th largest. `None` only for an empty slice.
+///
+/// Used where a value is safe in one direction only (L7-12): a minority can
+/// neither raise the result above what a majority reported nor drag it down.
+/// For one value it is that value; for two, the smaller (both must vouch); for
+/// three, the median.
+fn majority_floor<T: Ord + Copy>(values: &[T]) -> Option<T> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    Some(v[values.len() / 2])
 }
 
 struct DestinationState {
@@ -459,33 +547,22 @@ pub async fn run(
     let signer_addr = signer.address();
     let retry = Duration::from_millis(cfg.poll_interval_ms.max(1000));
 
-    // Connect every chain up front. A validator that cannot read a chain must not
-    // vote on transfers touching it, so we don't paper over a bad endpoint — but a
-    // transient RPC hiccup at startup must not permanently kill the loop (it would
-    // stay dead until the process is bounced, stranding refunds). Retry connect,
-    // exactly as the transfer scanner does.
-    let connect = |chain_id: u64, gate: String, endpoints: Vec<String>| async move {
-        loop {
-            match GateReader::connect(chain_id, &gate, &endpoints, cfg.block_confirmation, require_corroboration)
-                .await {
-                Ok(reader) => break reader,
-                Err(e) => {
-                    warn!(chain_id, error = %e, "refund loop: connecting RPC failed; retrying");
-                    tokio::time::sleep(retry).await;
-                }
-            }
-        }
-    };
-
-    let mut source_readers: BTreeMap<u64, GateReader> = BTreeMap::new();
+    // Every chain is CONFIGURED up front and CONNECTED lazily (audit round 7,
+    // L7-13). A validator that cannot read a chain must not vote on transfers
+    // touching it, so a bad endpoint is never papered over — but this used to
+    // wait, forever, until every chain had connected, so one dead endpoint on
+    // one chain stopped the refund loop for all of them. Now each tick retries
+    // the chains that are not ready yet, and only candidates touching such a
+    // chain are skipped (see `handle_candidate`); the rest proceed.
+    let mut source_readers: BTreeMap<u64, LazyReader> = BTreeMap::new();
     for (chain_id, gate, endpoints) in &sources {
-        source_readers.insert(*chain_id, connect(*chain_id, gate.clone(), endpoints.clone()).await);
+        source_readers.insert(*chain_id, LazyReader::new(*chain_id, gate.clone(), endpoints.clone()));
     }
 
-    let mut dest_readers: BTreeMap<u64, GateReader> = BTreeMap::new();
+    let mut dest_readers: BTreeMap<u64, LazyReader> = BTreeMap::new();
     for dest in &cfg.destinations {
         let endpoints = dest.endpoints()?;
-        dest_readers.insert(dest.chain_id, connect(dest.chain_id, dest.gate.clone(), endpoints).await);
+        dest_readers.insert(dest.chain_id, LazyReader::new(dest.chain_id, dest.gate.clone(), endpoints));
     }
 
     info!(
@@ -497,6 +574,10 @@ pub async fn run(
     );
 
     loop {
+        for r in source_readers.values_mut().chain(dest_readers.values_mut()) {
+            r.ensure(cfg.block_confirmation, require_corroboration).await;
+        }
+
         // Walk the queue a page at a time (audit 2026-09-16, H-6). Unpaged, a
         // queue grown past the client's response cap returned an error on every
         // tick forever, so no refund could ever be attested again.
@@ -570,8 +651,8 @@ async fn handle_candidate(
     rec: &SubmissionRecord,
     // Verified by `bound_submission_id`: the id `rec`'s params hash to.
     id: B256,
-    source_readers: &BTreeMap<u64, GateReader>,
-    dest_readers: &BTreeMap<u64, GateReader>,
+    source_readers: &BTreeMap<u64, LazyReader>,
+    dest_readers: &BTreeMap<u64, LazyReader>,
     signer: &PrivateKeySigner,
     signer_addr: Address,
     sink: &StoreBackend,
@@ -579,12 +660,30 @@ async fn handle_candidate(
 ) -> anyhow::Result<()> {
     // The DESTINATION must be readable: whether a transfer was delivered is the
     // one fact no attestation may take from the store. A destination we cannot
-    // read is a corridor we do not vote on.
-    let Some(dst) = dest_readers.get(&rec.chain_id_to) else { return Ok(()) };
+    // read — or cannot read YET (L7-13) — is a corridor we do not vote on.
+    let dst = match lookup(dest_readers, rec.chain_id_to) {
+        Reader::Ready(r) => r,
+        Reader::NotReady => {
+            tracing::debug!(submission_id = %rec.submission_id, chain = rec.chain_id_to,
+                            "destination not connected yet; skipping this tick");
+            return Ok(());
+        }
+        Reader::NotConfigured => return Ok(()),
+    };
     // The SOURCE may be unreadable (round 4, M-4: a Solana source). Then only the
     // refund leg is possible — `decide` enforces that — and the age is never
-    // claimed: `aged_out` stays false.
-    let src = source_readers.get(&rec.chain_id_from);
+    // claimed: `aged_out` stays false. A source that IS configured but not yet
+    // connected is not "unreadable": skip the candidate until it connects, or
+    // the refund leg would run without the source checks it always had.
+    let src = match lookup(source_readers, rec.chain_id_from) {
+        Reader::Ready(r) => Some(r),
+        Reader::NotConfigured => None,
+        Reader::NotReady => {
+            tracing::debug!(submission_id = %rec.submission_id, chain = rec.chain_id_from,
+                            "source not connected yet; skipping this tick");
+            return Ok(());
+        }
+    };
 
     let dst_state = dst.destination_state(id).await.context("reading destination gate")?;
     let src_state = match src {
@@ -781,7 +880,7 @@ mod tests {
     use alloy::primitives::U256;
 
     /// A candidate whose id genuinely binds its params.
-    fn bound_record() -> SubmissionRecord {
+    pub(super) fn bound_record() -> SubmissionRecord {
         let domain = B256::repeat_byte(0xD0);
         let token = Address::repeat_byte(0x33);
         let debridge_id = bridge_core::debridge_id(U256::from(1u64), token);
@@ -988,9 +1087,101 @@ mod round6_tests {
     /// by then), never forward.
     #[test]
     fn the_oldest_aged_block_wins() {
-        assert_eq!(oldest_aged_block(&[Some(900), Some(950)]), Some(900));
-        assert_eq!(oldest_aged_block(&[Some(900), Some(1)]), Some(1));
-        assert_eq!(oldest_aged_block(&[Some(900), None]), None, "no block old enough: nothing ages out");
+        // Two endpoints: unchanged — both must vouch, so the older answer.
+        assert_eq!(agreed_aged_block(&[Some(900), Some(950)]), Some(900));
+        assert_eq!(agreed_aged_block(&[Some(900), Some(1)]), Some(1));
+        assert_eq!(agreed_aged_block(&[Some(900), None]), None, "no block old enough: nothing ages out");
+        assert_eq!(agreed_aged_block(&[Some(900)]), Some(900));
+    }
+
+    /// Audit round 7, L7-12: with three endpoints one liar is outvoted in BOTH
+    /// directions — it can neither block every cancel (`None`, or an absurdly
+    /// old block) nor make a transfer count as aged early (a block too new).
+    #[test]
+    fn with_three_endpoints_one_liar_cannot_move_the_aged_block() {
+        // "None wins outright" no longer holds for a lone None.
+        assert_eq!(agreed_aged_block(&[Some(900), None, Some(900)]), Some(900));
+        assert_eq!(agreed_aged_block(&[Some(900), Some(1), Some(900)]), Some(900));
+        // The dangerous direction: a liar's too-new block is not used.
+        assert_eq!(agreed_aged_block(&[Some(900), Some(10_000), Some(900)]), Some(900));
+        // Two vouching for nothing is a majority: nothing ages out.
+        assert_eq!(agreed_aged_block(&[Some(900), None, None]), None);
+        // Honest-but-different answers: the newest a majority vouches for.
+        assert_eq!(agreed_aged_block(&[Some(900), Some(800), Some(850)]), Some(850));
+    }
+
+    #[test]
+    fn majority_floor_is_what_a_strict_majority_has_reached() {
+        assert_eq!(majority_floor::<u64>(&[]), None);
+        assert_eq!(majority_floor(&[7u64]), Some(7));
+        assert_eq!(majority_floor(&[100u64, 5]), Some(5), "two: both must have reached it");
+        assert_eq!(majority_floor(&[100u64, 5, 100]), Some(100), "a low liar is outvoted");
+        assert_eq!(majority_floor(&[100u64, u64::MAX, 100]), Some(100), "a high liar is outvoted");
+        assert_eq!(majority_floor(&[1u64, 2, 3, 4]), Some(2), "four: three must have reached it");
+    }
+
+    /// End to end: one endpoint reporting a stale head no longer drags the
+    /// confirmed block (and so every read, and the aged-block search) back.
+    #[tokio::test]
+    async fn a_low_head_from_one_of_three_endpoints_is_outvoted() {
+        let r = reader(&[stub(100, false, false).await, stub(1, false, false).await, stub(100, false, false).await]);
+        assert_eq!(r.confirmed_block().await.unwrap(), 98);
+        // Two endpoints keep the strict rule: the lower head.
+        let r = reader(&[stub(100, false, false).await, stub(50, false, false).await]);
+        assert_eq!(r.confirmed_block().await.unwrap(), 48);
+    }
+
+    // ---- L7-13: chains connect lazily, one at a time -------------------------
+
+    #[tokio::test]
+    async fn a_chain_with_a_dead_endpoint_is_not_ready_and_does_not_hold_up_others() {
+        let mut half_dead = LazyReader::new(1, "0x6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a".into(),
+                                            vec![stub(100, false, false).await, "http://127.0.0.1:1/".into()]);
+        let mut healthy = LazyReader::new(1, "0x6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a".into(),
+                                          vec![stub(100, false, false).await, stub(100, false, false).await]);
+        half_dead.ensure(2, false).await;
+        healthy.ensure(2, false).await;
+        let map: BTreeMap<u64, LazyReader> = [(1, half_dead), (2, healthy)].into_iter().collect();
+        assert!(matches!(lookup(&map, 1), Reader::NotReady), "two configured, one healthy: not read single-source");
+        assert!(matches!(lookup(&map, 2), Reader::Ready(_)));
+        assert!(matches!(lookup(&map, 3), Reader::NotConfigured));
+    }
+
+    /// A configured source that has not connected yet must NOT be taken for an
+    /// unreadable one: that would attest a refund without the source checks.
+    /// The sink is dead, so any attempt to attest shows up as an error.
+    #[tokio::test]
+    async fn a_not_yet_connected_source_skips_rather_than_attesting_without_source_checks() {
+        let rec = super::tests::bound_record(); // 1 -> 2
+        let id = bound_submission_id(&rec).unwrap();
+        let burned = || async { reader(&[stub(100, false, true).await, stub(100, false, true).await]) };
+        let mut dests = BTreeMap::new();
+        let mut d = LazyReader::new(2, String::new(), vec![]);
+        d.reader = Some(burned().await);
+        dests.insert(2, d);
+        let signer = PrivateKeySigner::random();
+        let sink = StoreBackend::remote_for_role("http://127.0.0.1:1", "SIG_STORE_VALIDATOR_TOKEN");
+
+        // Source configured, not connected: skipped, nothing attempted.
+        let mut srcs = BTreeMap::new();
+        srcs.insert(1, LazyReader::new(1, String::new(), vec![]));
+        handle_candidate(&rec, id, &srcs, &dests, &signer, signer.address(), &sink, 60)
+            .await
+            .expect("a not-ready source is a skip, not an attestation attempt");
+
+        // Contrast: with NO source configured the refund leg does proceed
+        // (round 4, M-4) — and reaches the (dead) sink.
+        let none = BTreeMap::new();
+        assert!(handle_candidate(&rec, id, &none, &dests, &signer, signer.address(), &sink, 60)
+            .await
+            .is_err());
+
+        // And a destination not connected yet is a skip too.
+        let mut not_ready = BTreeMap::new();
+        not_ready.insert(2, LazyReader::new(2, String::new(), vec![]));
+        handle_candidate(&rec, id, &none, &not_ready, &signer, signer.address(), &sink, 60)
+            .await
+            .expect("a not-ready destination is a skip");
     }
 
     // ---- end to end, against stub JSON-RPC endpoints -----------------------

@@ -132,10 +132,10 @@ async fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<_>>()?;
     // Solana peers are separate: an EVM gate reader can never vouch for a Solana
     // payout, so without these every EVM->Solana transfer is refused.
-    let solana_peers: Vec<(u64, [u8; 32], String)> = cfg
+    let solana_peers: Vec<(u64, [u8; 32], Vec<String>)> = cfg
         .solana_destinations
         .iter()
-        .map(|d| Ok((d.chain_id, d.program_key()?, d.rpc.clone())))
+        .map(|d| Ok((d.chain_id, d.program_key()?, d.endpoints()?)))
         .collect::<anyhow::Result<_>>()?;
     if scale_peers.is_empty() && solana_peers.is_empty() {
         warn!(
@@ -198,7 +198,7 @@ async fn scan_source(
     sink: Arc<StoreBackend>,
     runtime: Arc<Mutex<Runtime>>,
     scale_peers: Vec<(u64, String, Vec<String>)>,
-    solana_peers: Vec<(u64, [u8; 32], String)>,
+    solana_peers: Vec<(u64, [u8; 32], Vec<String>)>,
     policy: AllowlistPolicy,
     corroborate: CorroboratePolicy,
 ) -> anyhow::Result<()> {
@@ -278,48 +278,37 @@ async fn scan_source(
         }
     }
 
-    // H-2: connect the peer gates this loop will cross-check against. Same retry
-    // posture as the source connection — a peer that is momentarily down must not
-    // kill the loop, and `connect_all_checked` verifies the chain id so a
-    // wrong-chain endpoint cannot answer for a peer it is not.
+    // H-2: the peer gates this loop will cross-check against. A peer that is
+    // down must not kill the loop, and `connect_all_checked` verifies the chain
+    // id so a wrong-chain endpoint cannot answer for a peer it is not.
     //
     // ALL healthy endpoints, not the first (audit round 6, LOW): the scale read
     // is taken on a `provider::majority`, so one lying peer RPC cannot stop this
-    // validator signing a corridor. And, as for the source, a peer configured
-    // with a second endpoint waits for it — endpoints are probed only here, so
-    // starting on one would read that peer single-source for the process's life.
+    // validator signing a corridor. And a peer configured with a second endpoint
+    // is not read until that one is healthy too — never single-source.
+    //
+    // LAZILY, per destination (audit round 7, L7-13). This used to wait here,
+    // forever, until EVERY peer had enough healthy endpoints — so one dead
+    // endpoint on one peer chain stopped this source signing anything at all.
+    // Each `scale::Destination` now probes its endpoints the first time a
+    // transfer to it needs them and keeps re-probing until enough are healthy;
+    // until then that corridor's read is a retryable error (never `Unknown`), so
+    // the transfer is retried rather than skipped, and transfers to every ready
+    // destination are signed meanwhile.
     let scale_guard = {
         let mut dests = Vec::new();
         for (chain_id, gate_str, urls) in &scale_peers {
             let gate_addr: Address = gate_str
                 .parse()
                 .with_context(|| format!("bad gate address for destination {chain_id}"))?;
-            let min_agree = provider::min_agree(urls.len(), false);
-            let endpoints = loop {
-                match provider::connect_all_checked(urls, *chain_id).await {
-                    Ok(e) if e.len() >= min_agree => break e,
-                    Ok(e) => {
-                        warn!(chain_id, endpoints_configured = urls.len(), endpoints_healthy = e.len(),
-                              "fewer than TWO healthy destination RPC endpoints for a peer configured \
-                               with a second: not reading its bridge decimals single-source \
-                               (audit round 6, LOW); retrying");
-                        tokio::time::sleep(retry).await;
-                    }
-                    Err(e) => {
-                        warn!(chain_id, error = %e,
-                              "connecting destination RPC for the bridge-decimals check failed; retrying");
-                        tokio::time::sleep(retry).await;
-                    }
-                }
-            };
-            dests.push(scale::Destination { chain_id: *chain_id, gate: gate_addr, endpoints, min_agree });
+            dests.push(scale::Destination::new(*chain_id, gate_addr, urls.clone()));
         }
         let solana = solana_peers
             .iter()
-            .map(|(chain_id, program_id, rpc)| scale::SolanaDestination {
+            .map(|(chain_id, program_id, rpcs)| scale::SolanaDestination {
                 chain_id: *chain_id,
                 program_id: *program_id,
-                rpc: rpc.clone(),
+                rpcs: rpcs.clone(),
             })
             .collect();
         scale::ScaleGuard::new(dests, solana)
@@ -767,8 +756,33 @@ async fn handle_log(
         }
     }
 
+    // An execution payload our decoder cannot parse (audit round 7, L7-2). It
+    // used to be folded into "no payload", which then failed the id check below
+    // — and an id mismatch PAUSES the scanner, so anyone able to emit such a
+    // payload could halt every validator at once. It is not a sign of a lying
+    // RPC (the window was corroborated) but of an event we cannot vouch for:
+    // refuse to sign THIS event, consume its nonce (the transfer really happened,
+    // and the sequence must stay intact) and carry on. The transfer stays
+    // recoverable through cancel -> refund.
+    let submission = match Submission::from_sent_event(ev, bridge_domain) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                submission_id = %emitted_id,
+                chain_from,
+                chain_to,
+                nonce,
+                error = %e,
+                "Sent event carries autoParams that do not decode — refusing to sign it \
+                 (nonce advanced, scanner NOT paused; audit L7-2)"
+            );
+            runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
+            return Ok(true);
+        }
+    };
+
     // Independently recompute the submissionId; never sign one we can't reproduce.
-    let computed_id = Submission::from_sent_event(ev, bridge_domain).compute_id();
+    let computed_id = submission.compute_id();
     if computed_id != emitted_id {
         warn!(
             emitted = %emitted_id,
@@ -862,4 +876,80 @@ async fn handle_log(
         "SIGNED and stored"
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Bytes, U256};
+
+    /// A `Sent` log for corridor 1 -> 2, nonce 0, with the given payload and
+    /// emitted id.
+    fn sent_log(auto_params: Vec<u8>, emitted: B256) -> alloy::rpc::types::Log {
+        let ev = Gate::Sent {
+            submissionId: emitted,
+            debridgeId: B256::repeat_byte(2),
+            amount: U256::from(5u64),
+            bridgeDecimals: 6,
+            chainIdFrom: U256::from(1u64),
+            chainIdTo: U256::from(2u64),
+            receiver: Bytes::from(vec![0xAB; 20]),
+            nonce: U256::ZERO,
+            autoParams: Bytes::from(auto_params),
+            nativeSender: Bytes::from(vec![0xCD; 20]),
+            token: Address::repeat_byte(9),
+        };
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: Address::repeat_byte(0x6A), data: ev.encode_log_data() },
+            ..Default::default()
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("validator-l7-2-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Audit round 7, L7-2. An undecodable `autoParams` used to become "no
+    /// payload", fail the id check, and PAUSE the scanner — one user's event
+    /// halting every validator. Now: not signed, not paused, nonce consumed.
+    #[tokio::test]
+    async fn an_undecodable_auto_params_event_is_skipped_not_signed_and_does_not_pause() {
+        let dir = scratch("skip");
+        let sink = StoreBackend::file(dir.join("sigs")).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&dir.join("state.json"), 0).unwrap()));
+        let signer = PrivateKeySigner::random();
+        let guard = scale::ScaleGuard::new(vec![], vec![]);
+
+        let log = sent_log(vec![0xFF; 7], B256::repeat_byte(1));
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard).await;
+        assert!(matches!(r, Ok(true)), "processed (skipped), got {r:?}");
+
+        let rt = runtime.lock().await;
+        assert!(!rt.paused(), "an undecodable payload must not pause the scanner");
+        assert_eq!(rt.last_nonce(1, 2), Some(0), "the nonce is consumed so the sequence stays intact");
+        drop(rt);
+        let stored = std::fs::read_dir(dir.join("sigs")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(stored, 0, "nothing was signed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The contrast: a DECODABLE event whose id we cannot reproduce still
+    /// pauses — that is the "lying RPC" signal and stays a hard stop.
+    #[tokio::test]
+    async fn a_genuine_id_mismatch_still_pauses() {
+        let dir = scratch("mismatch");
+        let sink = StoreBackend::file(dir.join("sigs")).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&dir.join("state.json"), 0).unwrap()));
+        let signer = PrivateKeySigner::random();
+        let guard = scale::ScaleGuard::new(vec![], vec![]);
+
+        let log = sent_log(vec![], B256::repeat_byte(1));
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &log, None, B256::ZERO, &guard).await;
+        assert!(matches!(r, Ok(false)), "got {r:?}");
+        assert!(runtime.lock().await.paused());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

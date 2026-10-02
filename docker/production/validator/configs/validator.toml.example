@@ -93,6 +93,10 @@ gate = "0x0000000000000000000000000000000000000000"
 chain_id = 7565164
 program_id = "YourSolanaGateProgramId111111111111111111111"
 rpc = "https://your-solana-rpc.example.com"
+# Optional extra Solana RPCs (on other hosts). The asset account is read from
+# each and used only on a majority, so one endpoint answering "no account" is
+# retried instead of withholding the transfer's signature for good.
+# rpcs = ["https://another-solana-rpc.example.com"]
 
 # ── Refund attestation ────────────────────────────────────────────────────────
 # Omit this whole block and this validator never votes on whether a stranded

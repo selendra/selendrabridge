@@ -2687,6 +2687,7 @@ dependencies = [
  "async-graphql-axum",
  "axum 0.7.9",
  "base64",
+ "borsh",
  "bridge-core",
  "bridge-solana",
  "bs58",

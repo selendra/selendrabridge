@@ -30,6 +30,7 @@ import {
   readDecimals,
   readRemoteRouter,
   readRouterGate,
+  remoteRouterMatches,
   rpcRequest,
   sendApprove,
   sendBridge,
@@ -534,7 +535,13 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
       alive = false;
     };
   }, [crossSwap, routerOk, router, toChainId, wallet.request, wallet.chainId, fromChainId]);
-  const corridorOk = !!remoteRouterHex && remoteRouterHex !== "0x";
+  const corridorSet = !!remoteRouterHex && remoteRouterHex !== "0x";
+  // L7-9: set is not enough. The source router's owner changes `remoteRouter`
+  // instantly, and it is where the bridged stable goes — so it must be exactly
+  // the router the registry lists for the destination, or nothing is sent.
+  const expectedRemoteRouter = toReg?.router ?? null;
+  const corridorMatches = corridorSet && remoteRouterMatches(remoteRouterHex, expectedRemoteRouter);
+  const corridorOk = corridorSet && corridorMatches;
 
   const doApprove = async () => {
     if (!wallet.address || fromChainId == null) return;
@@ -595,7 +602,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   };
 
   const doSwapAndBridge = async () => {
-    if (!wallet.address || toChainId == null || fromChainId == null || !remoteRouterHex) return;
+    if (!wallet.address || toChainId == null || fromChainId == null || !remoteRouterHex || !corridorOk) return;
     setTx({ kind: "pending", label: "Swapping + bridging…" });
     try {
       const hash = await sendSwapAndBridge(
@@ -771,7 +778,9 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     button = { label: `Too precise — this asset bridges at most ${bridgeDecimalsOfToken} decimals`, disabled: true };
   else if (amountTooWide) button = { label: "Amount too large for a Solana receiver", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
-  else if (crossSwap && !corridorOk) button = { label: "Corridor not configured", disabled: true };
+  else if (crossSwap && !corridorSet) button = { label: "Corridor not configured", disabled: true };
+  else if (crossSwap && !corridorMatches)
+    button = { label: "Destination router mismatch — refusing to send", disabled: true };
   else if (crossSwap && destExceedsLock) button = { label: "Exceeds destination pool lock", disabled: true };
   else if (needsApprove) button = { label: crossSwap ? "Approve for router" : "Approve token", onClick: doApprove };
   else button = { label: crossSwap ? "Swap & Bridge" : "Bridge", onClick: crossSwap ? doSwapAndBridge : doSend };
@@ -1047,10 +1056,27 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
           destination pool's locked reserve. Reduce the amount.
         </div>
       )}
-      {stage === "idle" && crossSwap && routerOk && toChainId != null && !corridorOk && wallet.chainId === fromChainId && (
+      {stage === "idle" && crossSwap && routerOk && toChainId != null && !corridorSet && wallet.chainId === fromChainId && (
         <div className="notice notice--warn">
           This router has no corridor registered for {toName} yet (owner must call{" "}
           <code>setRemoteRouter</code>).
+        </div>
+      )}
+      {stage === "idle" && crossSwap && routerOk && toChainId != null && corridorSet && !corridorMatches && wallet.chainId === fromChainId && (
+        <div className="notice notice--error">
+          {expectedRemoteRouter ? (
+            <>
+              This router would send the bridged stable on {toName} to{" "}
+              <code className="mono">{remoteRouterHex}</code>, but the registry's router for {toName} is{" "}
+              <code className="mono">{expectedRemoteRouter}</code>. Refusing to send: the stable would not reach a
+              router that can finish the swap.
+            </>
+          ) : (
+            <>
+              The registry lists no router for {toName}, so the peer this router sends the bridged stable to (
+              <code className="mono">{remoteRouterHex}</code>) cannot be checked. Refusing to send.
+            </>
+          )}
         </div>
       )}
 

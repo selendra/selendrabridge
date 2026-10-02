@@ -34,3 +34,8 @@ base64 = "0.22"
 bs58 = "0.5"
 async-graphql = "7"
 async-graphql-axum = "7"
+
+[dev-dependencies]
+# Tests encode pool/token accounts the way the program writes them, to serve
+# from a mock RPC. Same major the swap-math layouts derive with.
+borsh = "1"

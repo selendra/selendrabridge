@@ -66,14 +66,29 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use bridge_core::abi::Gate;
+use bridge_core::config::redact_url;
 
 use crate::provider;
 
 /// An EVM destination gate this validator can read well enough to vote on.
+///
+/// ## Connected lazily (audit round 7, L7-13)
+///
+/// The scan loop used to connect every destination up front and wait, forever,
+/// until each had `min_agree` healthy endpoints — so one dead endpoint on one
+/// peer chain stopped this source signing transfers to EVERY peer. Now the
+/// endpoints are probed the first time a transfer to this chain needs them, and
+/// re-probed on every later attempt until enough are healthy. Until then a read
+/// is an `Err` — retryable, never `Unknown` — so a transfer to a not-yet-ready
+/// destination is retried with the cursor rolled back, and nothing is withheld
+/// for good. Corridors to ready destinations are unaffected.
 pub struct Destination {
     pub chain_id: u64,
     pub gate: Address,
-    /// Every healthy endpoint for the peer chain, (redacted url, provider).
+    /// The configured urls, probed by [`Destination::endpoints`].
+    urls: Vec<String>,
+    /// Every healthy endpoint for the peer chain, (redacted url, provider), once
+    /// at least `min_agree` of them passed the probe. `None` until then.
     ///
     /// Audit round 6, LOW: this used to be ONE provider — `connect_checked`
     /// kept the first healthy endpoint — so a single lying destination RPC could
@@ -81,16 +96,56 @@ pub struct Destination {
     /// liveness (claim enforces the scale on-chain since the scale went into the
     /// submissionId), but every other gate read is corroborated now, so this is
     /// too: the scale is taken only when [`provider::majority`] agrees.
-    pub endpoints: Vec<(String, DynProvider)>,
+    connected: Mutex<Option<Vec<(String, DynProvider)>>>,
     /// [`provider::min_agree`] for the peer's CONFIGURED endpoint count.
     pub min_agree: usize,
+}
+
+impl Destination {
+    /// A destination that connects on first use.
+    pub fn new(chain_id: u64, gate: Address, urls: Vec<String>) -> Self {
+        let min_agree = provider::min_agree(urls.len(), false);
+        Destination { chain_id, gate, urls, connected: Mutex::new(None), min_agree }
+    }
+
+    /// Already-connected endpoints (tests).
+    #[cfg(test)]
+    pub fn connected(chain_id: u64, gate: Address, endpoints: Vec<(String, DynProvider)>, min_agree: usize) -> Self {
+        Destination { chain_id, gate, urls: vec![], connected: Mutex::new(Some(endpoints)), min_agree }
+    }
+
+    /// The healthy endpoints, probing them now if that has not succeeded yet.
+    /// `Err` (retryable) while fewer than `min_agree` are healthy: a chain
+    /// configured with a second endpoint is never read single-source.
+    async fn endpoints(&self) -> anyhow::Result<Vec<(String, DynProvider)>> {
+        let mut slot = self.connected.lock().await;
+        if let Some(e) = slot.as_ref() {
+            return Ok(e.clone());
+        }
+        let healthy = provider::connect_all_checked(&self.urls, self.chain_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("destination {} not ready: {e}", self.chain_id))?;
+        anyhow::ensure!(
+            healthy.len() >= self.min_agree,
+            "destination {} not ready: {} healthy RPC endpoint(s) of {} configured, need {} \
+             to read its bridge decimals (audit round 6/L7-13); will retry",
+            self.chain_id,
+            healthy.len(),
+            self.urls.len(),
+            self.min_agree
+        );
+        *slot = Some(healthy.clone());
+        Ok(healthy)
+    }
 }
 
 /// A Solana gate program this validator can read, for EVM->Solana transfers.
 pub struct SolanaDestination {
     pub chain_id: u64,
     pub program_id: [u8; 32],
-    pub rpc: String,
+    /// Every configured Solana JSON-RPC url (audit round 7, L7-11). Each is
+    /// asked; see [`ScaleGuard::solana_destination_scale`] for the rule.
+    pub rpcs: Vec<String>,
 }
 
 enum Peer {
@@ -225,8 +280,9 @@ impl ScaleGuard {
         dest: &Destination,
         debridge_id: B256,
     ) -> anyhow::Result<Option<u8>> {
+        let endpoints = dest.endpoints().await?;
         provider::read_agreed(
-            &dest.endpoints,
+            &endpoints,
             dest.min_agree,
             "destination bridge decimals",
             |p| evm_scale_on(dest, p, debridge_id),
@@ -316,6 +372,49 @@ async fn evm_scale_on(dest: &Destination, provider: DynProvider, debridge_id: B2
     }
 }
 
+/// One Solana endpoint's verdict on the `["asset", id]` account. Compared
+/// across endpoints as a whole, rather than the raw account bytes, so endpoints
+/// that agree on the scale agree even if they served different finalized slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SolanaAnswer {
+    /// `value: null` — no such account.
+    Absent,
+    /// An account exists but is not one this validator can vouch for.
+    Unusable(&'static str),
+    /// A current, program-owned record at this scale.
+    Scale(u8),
+}
+
+/// The rule for combining several Solana endpoints' answers (audit round 7,
+/// L7-11). Pure, so it is testable without a network.
+///
+/// * A scale is taken on a [`provider::majority`] — one lying or lagging
+///   endpoint can neither forge one nor, by dissenting, stall the read.
+/// * A NEGATIVE answer (`Absent`/`Unusable`) withholds the signature for good,
+///   so it must be the majority AND unanimous among the endpoints that
+///   answered. One endpoint answering `null` among several that see the account
+///   is a disagreement — retried — not a verdict.
+/// * Anything else is `Err`: too few answers, or no majority.
+///
+/// With one configured endpoint (`min_agree == 1`) this is exactly the old
+/// single-source behaviour.
+pub(crate) fn settle_solana(
+    answers: &[(String, SolanaAnswer)],
+    min_agree: usize,
+) -> Result<SolanaAnswer, provider::NoMajority> {
+    let refs: Vec<(&str, SolanaAnswer)> = answers.iter().map(|(u, a)| (u.as_str(), a.clone())).collect();
+    let agreed = provider::majority(&refs, min_agree)?;
+    if matches!(agreed, SolanaAnswer::Scale(_)) || answers.iter().all(|(_, a)| *a == agreed) {
+        return Ok(agreed);
+    }
+    Err(provider::NoMajority {
+        reason: format!(
+            "a definitive \"no usable asset record\" must be unanimous, got {answers:?}"
+        ),
+        disagreement: true,
+    })
+}
+
 impl ScaleGuard {
     async fn solana_destination_scale(
         &self,
@@ -330,10 +429,30 @@ impl ScaleGuard {
             return Ok(None);
         };
         let program_b58 = bs58::encode(dest.program_id).into_string();
-        // Transport faults (HTTP errors, rate limits, JSON-RPC errors) propagate
-        // and are retried; what the account itself says is definitive.
-        match self.solana_account(dest, &pda).await? {
-            None => {
+
+        // Every endpoint, and the answers combined by `settle_solana`. Transport
+        // faults (HTTP errors, rate limits, JSON-RPC errors, oversized bodies)
+        // are not answers; what an account says is.
+        let mut answers: Vec<(String, SolanaAnswer)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for url in &dest.rpcs {
+            let shown = redact_url(url);
+            match self.solana_account(url, &pda).await {
+                Ok(None) => answers.push((shown, SolanaAnswer::Absent)),
+                Ok(Some((owner, data))) => {
+                    let a = match solana_asset_scale(owner == program_b58, &data, &did) {
+                        Ok(d) => SolanaAnswer::Scale(d),
+                        Err(why) => SolanaAnswer::Unusable(why),
+                    };
+                    answers.push((shown, a));
+                }
+                Err(e) => failed.push(format!("{shown}: {e}")),
+            }
+        }
+        let min_agree = provider::min_agree(dest.rpcs.len(), false);
+        match settle_solana(&answers, min_agree) {
+            Ok(SolanaAnswer::Scale(d)) => Ok(Some(d)),
+            Ok(SolanaAnswer::Absent) => {
                 warn!(
                     chain_id = dest.chain_id,
                     %debridge_id,
@@ -341,21 +460,36 @@ impl ScaleGuard {
                 );
                 Ok(None)
             }
-            Some((owner, data)) => match solana_asset_scale(owner == program_b58, &data, &did) {
-                Ok(d) => Ok(Some(d)),
-                Err(why) => {
-                    warn!(chain_id = dest.chain_id, %debridge_id, reason = why, "Solana asset account unusable");
-                    Ok(None)
+            Ok(SolanaAnswer::Unusable(why)) => {
+                warn!(chain_id = dest.chain_id, %debridge_id, reason = why, "Solana asset account unusable");
+                Ok(None)
+            }
+            Err(e) => {
+                if e.disagreement {
+                    warn!(
+                        chain_id = dest.chain_id,
+                        %debridge_id,
+                        answers = ?answers,
+                        "SOLANA RPC ENDPOINTS DISAGREE about an asset account — not signing this \
+                         source until they agree (audit L7-11). One endpoint is wrong or lagging: \
+                         investigate."
+                    );
                 }
-            },
+                Err(anyhow::anyhow!(
+                    "Solana destination {} asset scale: {}{}",
+                    dest.chain_id,
+                    e.reason,
+                    if failed.is_empty() { String::new() } else { format!(" (failed: {})", failed.join("; ")) }
+                ))
+            }
         }
     }
 
-    /// `getAccountInfo` at `finalized`: the account's owner (base58) and raw data,
-    /// or `None` when it does not exist.
+    /// `getAccountInfo` at `finalized` against ONE endpoint: the account's owner
+    /// (base58) and raw data, or `None` when it does not exist.
     async fn solana_account(
         &self,
-        dest: &SolanaDestination,
+        url: &str,
         address: &[u8; 32],
     ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
         let body = serde_json::json!({
@@ -364,14 +498,12 @@ impl ScaleGuard {
             "method": "getAccountInfo",
             "params": [bs58::encode(address).into_string(), {"encoding": "base64", "commitment": "finalized"}],
         });
-        let res = self.http.post(&dest.rpc).json(&body).send().await?;
+        // `without_url`: a hosted endpoint's url is its API key.
+        let mut res = self.http.post(url).json(&body).send().await.map_err(|e| e.without_url())?;
         if !res.status().is_success() {
             anyhow::bail!("HTTP {}", res.status());
         }
-        let bytes = res.bytes().await?;
-        if bytes.len() > MAX_SOLANA_RESPONSE {
-            anyhow::bail!("oversized getAccountInfo response ({} bytes)", bytes.len());
-        }
+        let bytes = read_capped(&mut res, MAX_SOLANA_RESPONSE).await?;
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         if let Some(err) = v.get("error") {
             anyhow::bail!("getAccountInfo error: {err}");
@@ -389,6 +521,24 @@ impl ScaleGuard {
             .ok_or_else(|| anyhow::anyhow!("account data is not base64"))?;
         Ok(Some((owner, base64::engine::general_purpose::STANDARD.decode(b64)?)))
     }
+}
+
+/// Read a response body, refusing it as soon as it exceeds `cap` bytes (audit
+/// round 7, L7-11). `res.bytes()` buffered the WHOLE body before the size check,
+/// so an endpoint streaming an endless reply cost unbounded memory first.
+async fn read_capped(res: &mut reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = res.content_length() {
+        anyhow::ensure!(len <= cap as u64, "oversized getAccountInfo response ({len} bytes declared)");
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.without_url())? {
+        anyhow::ensure!(
+            out.len() + chunk.len() <= cap,
+            "oversized getAccountInfo response (over {cap} bytes)"
+        );
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Did the chain itself ANSWER (a revert, or a reply that is not this function's
@@ -492,12 +642,12 @@ mod tests {
     #[tokio::test]
     async fn a_transport_failure_is_retryable_not_a_withhold() {
         let g = ScaleGuard::new(
-            vec![Destination {
-                chain_id: 1338,
-                gate: Address::repeat_byte(4),
-                endpoints: vec![("dead".into(), dead_provider())],
-                min_agree: 1,
-            }],
+            vec![Destination::connected(
+                1338,
+                Address::repeat_byte(4),
+                vec![("dead".into(), dead_provider())],
+                1,
+            )],
             vec![],
         );
         let r = g
@@ -521,7 +671,7 @@ mod tests {
     async fn a_configured_solana_peer_is_not_unconfigured() {
         let g = ScaleGuard::new(
             vec![],
-            vec![SolanaDestination { chain_id: 7565164, program_id: [9; 32], rpc: "http://127.0.0.1:1".into() }],
+            vec![SolanaDestination { chain_id: 7565164, program_id: [9; 32], rpcs: vec!["http://127.0.0.1:1".into()] }],
         );
         let _ = g
             .verdict(6, 7565164, B256::ZERO)
@@ -588,6 +738,166 @@ mod tests {
             .unwrap();
         assert_eq!(data.len(), 98);
         assert_eq!(solana_asset_scale(true, &data, &did), Ok(6));
+    }
+
+    // --- audit round 7, L7-11: several Solana RPCs, majority rule -------------
+
+    fn a(answers: &[SolanaAnswer]) -> Vec<(String, SolanaAnswer)> {
+        answers.iter().enumerate().map(|(i, x)| (format!("rpc{i}"), x.clone())).collect()
+    }
+
+    #[test]
+    fn settle_solana_takes_a_majority_scale_and_only_a_unanimous_negative() {
+        use SolanaAnswer::*;
+        // One configured endpoint: the old single-source behaviour, unchanged.
+        assert_eq!(settle_solana(&a(&[Absent]), 1), Ok(Absent));
+        assert_eq!(settle_solana(&a(&[Scale(6)]), 1), Ok(Scale(6)));
+        // Two: both, identically.
+        assert_eq!(settle_solana(&a(&[Scale(6), Scale(6)]), 2), Ok(Scale(6)));
+        assert_eq!(settle_solana(&a(&[Absent, Absent]), 2), Ok(Absent));
+        // THE finding: one `null` beside an endpoint that sees the account is a
+        // disagreement to retry, never a permanent withhold.
+        let e = settle_solana(&a(&[Scale(6), Absent]), 2).unwrap_err();
+        assert!(e.disagreement, "{e:?}");
+        // Three: one liar is outvoted when it denies the account...
+        assert_eq!(settle_solana(&a(&[Scale(6), Absent, Scale(6)]), 2), Ok(Scale(6)));
+        // ...but a negative needs every answering endpoint, so one endpoint that
+        // DOES see the record keeps the transfer retryable.
+        assert!(settle_solana(&a(&[Absent, Absent, Scale(6)]), 2).is_err());
+        assert!(settle_solana(&a(&[Unusable("x"), Unusable("x"), Absent]), 2).is_err());
+        // Different scales, or too few answers: nothing.
+        assert!(settle_solana(&a(&[Scale(6), Scale(9)]), 2).is_err());
+        let e = settle_solana(&a(&[Scale(6)]), 2).unwrap_err();
+        assert!(!e.disagreement, "one answer of two is not an accusation: {e:?}");
+    }
+
+    const PROGRAM: [u8; 32] = [9; 32];
+
+    /// A Solana JSON-RPC stub. `account = Some(bytes)` serves a program-owned
+    /// account, `None` serves `value: null`; `pad` bloats the body.
+    async fn sol_stub(account: Option<Vec<u8>>, pad: usize) -> String {
+        use axum::{routing::post, Json, Router};
+        let owner = bs58::encode(PROGRAM).into_string();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                assert_eq!(req["method"], "getAccountInfo");
+                let value = match &account {
+                    Some(d) => serde_json::json!({
+                        "owner": owner,
+                        "data": [base64::engine::general_purpose::STANDARD.encode(d), "base64"],
+                    }),
+                    None => serde_json::Value::Null,
+                };
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "result": { "context": { "slot": 1 }, "value": value },
+                    "pad": "x".repeat(pad),
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/")
+    }
+
+    fn sol_guard(rpcs: Vec<String>) -> ScaleGuard {
+        ScaleGuard::new(vec![], vec![SolanaDestination { chain_id: 7565164, program_id: PROGRAM, rpcs }])
+    }
+
+    const DID: [u8; 32] = [3; 32];
+
+    #[tokio::test]
+    async fn one_solana_rpc_answering_null_among_several_is_retried_not_withheld() {
+        let rec = asset_bytes(DID, 6, 9, 0);
+        let g = sol_guard(vec![sol_stub(Some(rec.clone()), 0).await, sol_stub(None, 0).await]);
+        let r = g.verdict(6, 7565164, B256::from(DID)).await;
+        assert!(r.is_err(), "a lone null must not become Unknown (a permanent withhold), got {r:?}");
+
+        // The same null, outvoted by two endpoints that see the record.
+        let g = sol_guard(vec![
+            sol_stub(Some(rec.clone()), 0).await,
+            sol_stub(None, 0).await,
+            sol_stub(Some(rec), 0).await,
+        ]);
+        assert_eq!(g.verdict(6, 7565164, B256::from(DID)).await.unwrap(), Verdict::Agree(6));
+    }
+
+    #[tokio::test]
+    async fn solana_rpcs_that_agree_are_read_and_a_unanimous_absence_is_unknown() {
+        let rec = asset_bytes(DID, 6, 9, 0);
+        let g = sol_guard(vec![sol_stub(Some(rec.clone()), 0).await, sol_stub(Some(rec), 0).await]);
+        assert_eq!(g.verdict(9, 7565164, B256::from(DID)).await.unwrap(), Verdict::Mismatch { source: 9, destination: 6 });
+
+        let g = sol_guard(vec![sol_stub(None, 0).await, sol_stub(None, 0).await]);
+        let v = g.verdict(6, 7565164, B256::from(DID)).await.unwrap();
+        assert!(matches!(v, Verdict::Unknown(_)), "every endpoint says no record: {v:?}");
+    }
+
+    /// The size cap holds while reading, not after buffering the whole body.
+    #[tokio::test]
+    async fn an_oversized_solana_response_is_refused() {
+        let g = sol_guard(vec![sol_stub(Some(asset_bytes(DID, 6, 9, 0)), MAX_SOLANA_RESPONSE + 1).await]);
+        let e = g.verdict(6, 7565164, B256::from(DID)).await.unwrap_err();
+        assert!(e.to_string().contains("oversized"), "{e}");
+    }
+
+    // --- audit round 7, L7-13: destinations connect lazily -----------------
+
+    /// An EVM gate stub on chain 1338 answering `bridgeDecimalsFor` with scale 6.
+    async fn evm_stub(chain: u64) -> String {
+        use alloy_sol_types::SolCall;
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| async move {
+                let result = match req["method"].as_str() {
+                    Some("eth_chainId") => serde_json::json!(format!("{chain:#x}")),
+                    Some("eth_call") => {
+                        let tx = &req["params"][0];
+                        let input = tx["input"].as_str().or(tx["data"].as_str()).unwrap_or_default();
+                        let sel = hex::decode(&input[2..10]).unwrap();
+                        assert_eq!(sel, Gate::bridgeDecimalsForCall::SELECTOR);
+                        let ret = Gate::bridgeDecimalsForCall::abi_encode_returns(
+                            &Gate::bridgeDecimalsForReturn {
+                                set: true,
+                                bridgeDecimals: 6,
+                                localDecimals: 18,
+                                localToken: Address::repeat_byte(1),
+                            },
+                        );
+                        serde_json::json!(format!("0x{}", hex::encode(ret)))
+                    }
+                    m => panic!("stub RPC: unexpected method {m:?}"),
+                };
+                Json(serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/")
+    }
+
+    /// One peer with a dead endpoint no longer holds up the others: building the
+    /// guard connects nothing, the dead peer's corridor is a RETRYABLE error (not
+    /// `Unknown`, so its transfers are not skipped for good) and never a
+    /// single-source read, while a healthy peer in the same guard is read.
+    #[tokio::test]
+    async fn a_dead_destination_endpoint_withholds_only_its_own_corridor_and_retryably() {
+        let half_dead = evm_stub(1339).await;
+        let g = ScaleGuard::new(
+            vec![
+                // configured with two, one dead: must not be read on one
+                Destination::new(1339, Address::repeat_byte(4), vec![half_dead, "http://127.0.0.1:1".into()]),
+                Destination::new(1338, Address::repeat_byte(4), vec![evm_stub(1338).await, evm_stub(1338).await]),
+            ],
+            vec![],
+        );
+        let r = g.verdict(6, 1339, B256::ZERO).await;
+        assert!(r.is_err(), "a destination short of healthy endpoints is retried, got {r:?}");
+        assert_eq!(g.verdict(6, 1338, B256::ZERO).await.unwrap(), Verdict::Agree(6));
     }
 }
 

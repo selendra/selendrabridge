@@ -112,7 +112,7 @@ use std::str::FromStr;
 
 use bridge_solana::instruction::{
     add_validator_action_id, lower_threshold_action_id, register_asset_action_id, GateInstruction,
-    GovernanceSchedule, InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS,
+    GovernanceSchedule, InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS, MAX_THRESHOLD,
 };
 use borsh::BorshDeserialize as _;
 use solana_relayer::gate::{
@@ -142,6 +142,17 @@ fn parse_sigs(args: &Args) -> anyhow::Result<Vec<Vec<u8>>> {
         anyhow::ensure!(s.len() == 65, "each signature must be 65 bytes, got {}", s.len());
     }
     Ok(out)
+}
+
+/// L7-4: the program refuses a threshold above `MAX_THRESHOLD` (`ThresholdTooHigh`,
+/// `Custom(29)`) — one claim/cancel/refund cannot carry more signatures than a
+/// 1232-byte packet holds. Refusing here saves a doomed transaction.
+fn check_threshold_cap(threshold: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        threshold <= MAX_THRESHOLD,
+        "--threshold {threshold} exceeds MAX_THRESHOLD {MAX_THRESHOLD} (Solana packet limit)"
+    );
+    Ok(())
 }
 
 /// The governance action id a `schedule-governance` / `cancel-governance` /
@@ -459,6 +470,7 @@ fn run() -> anyhow::Result<()> {
                 args.all("--validator").iter().map(|v| hex20(v)).collect::<Result<_, _>>()?;
             anyhow::ensure!(!validators.is_empty(), "init needs at least one --validator");
             let threshold: u32 = args.req("--threshold")?.parse()?;
+            check_threshold_cap(threshold)?;
             let chain_id: u64 = args.req("--chain-id")?.parse()?;
             // The program refuses it too; refusing here saves a doomed transaction.
             anyhow::ensure!(chain_id != 0, "--chain-id must be non-zero (it is bound into every submissionId)");
@@ -551,6 +563,7 @@ fn run() -> anyhow::Result<()> {
         // in both directions, and the action id is printed for the schedule step.
         "set-threshold" => {
             let threshold: u32 = args.req("--threshold")?.parse()?;
+            check_threshold_cap(threshold)?;
             let action_id = lower_threshold_action_id(threshold);
             println!("lowerThreshold action id: 0x{}", hex::encode(action_id));
             println!(

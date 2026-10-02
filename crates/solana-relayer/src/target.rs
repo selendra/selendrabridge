@@ -16,7 +16,8 @@
 //!     so a handful exhausts the compute budget and `claim` — plus `cancel` and
 //!     `refund`, which share the same verifier — fail forever. We therefore read
 //!     the on-chain config, keep only signatures that recover to a REGISTERED
-//!     validator, and cap the array at the validator count.
+//!     validator, and cap the array at the gate's threshold (L7-4: 69 bytes per
+//!     signature against a 1232-byte packet — see the program's `MAX_THRESHOLD`).
 //!   * **skip what is already executed** — the marker PDA is authoritative.
 
 use std::collections::HashSet;
@@ -241,7 +242,7 @@ pub fn encodable(rec: &SubmissionRecord, gate_domain: &[u8; 32]) -> Result<Encod
 }
 
 /// Signatures ordered by recovered signer, ascending, keeping ONLY registered
-/// validators and capping the result at the validator count.
+/// validators and capping the result at the gate's THRESHOLD (audit L7-4).
 ///
 /// The filter is the important half. The gate counts only validator signatures
 /// toward quorum, so a non-validator signature can never help — but it still
@@ -274,7 +275,13 @@ fn ordered_signatures(
         .collect();
     with_addr.sort_by_key(|(a, _)| *a);
     with_addr.dedup_by_key(|(a, _)| *a); // the gate requires STRICTLY ascending
-    with_addr.truncate(cfg.validators.len());
+    // L7-4: exactly `threshold` — the lowest-ordered ones, still ascending. Each
+    // signature is 69 bytes of a 1232-byte packet, so forwarding every validator's
+    // made a 10+-validator gate's claim/cancel/refund oversized FOREVER, even at
+    // threshold 3; and every extra one is another ~25k CU of `secp256k1_recover`
+    // that buys nothing. Never more than the validator count either (the gate
+    // refuses a longer array outright).
+    with_addr.truncate((cfg.threshold as usize).min(cfg.validators.len()));
     with_addr.into_iter().map(|(_, s)| s).collect()
 }
 
@@ -582,11 +589,12 @@ impl Submitter {
             return Ok(());
         }
         if raw_sigs.len() > signatures.len() {
-            warn!(
+            // Routine since L7-4: a quorum past the threshold is trimmed to it.
+            info!(
                 submission_id = %rec.submission_id,
                 dropped = raw_sigs.len() - signatures.len(),
                 kept = signatures.len(),
-                "dropped stored signatures that are not from registered validators"
+                "dropped stored signatures beyond the threshold or not from registered validators"
             );
         }
 
@@ -895,7 +903,7 @@ mod tests {
         let id = [0x11u8; 32];
         let digest = bridge_solana::verify::eth_signed_digest(&id);
         let raw: Vec<Vec<u8>> = (1u8..=4).map(|s| sign(s, &digest).1).collect();
-        let cfg = gate_for(&[1, 2, 3, 4], &digest, 2);
+        let cfg = gate_for(&[1, 2, 3, 4], &digest, 4);
 
         let ordered = ordered_signatures(&id, &raw, &cfg);
         assert_eq!(ordered.len(), 4);
@@ -976,6 +984,32 @@ mod tests {
 
         let cfg = gate_for(&[1, 2], &digest, 2);
         assert_eq!(ordered_signatures(&id, &raw, &cfg).len(), 2);
+    }
+
+    /// L7-4: a 12-validator gate at threshold 3, every validator has signed.
+    /// Forwarding all twelve is 828 bytes of signatures — no claim, cancel or
+    /// refund transaction fits 1232 bytes — so exactly `threshold` go out: the
+    /// LOWEST-ordered valid ones, still strictly ascending. Same for every domain,
+    /// since claim, cancel and refund all build their array here.
+    #[test]
+    fn the_array_is_truncated_to_the_threshold_on_every_path() {
+        let id = [0x11u8; 32];
+        let seeds: Vec<u8> = (1u8..=12).collect();
+        for digest_input in [id, domain_id(CANCEL_PREFIX, &id), domain_id(REFUND_PREFIX, &id)] {
+            let digest = bridge_solana::verify::eth_signed_digest(&digest_input);
+            let cfg = gate_for(&seeds, &digest, 3);
+            // Every validator signed, plus junk from a non-validator, shuffled.
+            let mut raw: Vec<Vec<u8>> = seeds.iter().rev().map(|s| sign(*s, &digest).1).collect();
+            raw.push(sign(99, &digest).1);
+
+            let ordered = ordered_signatures(&digest_input, &raw, &cfg);
+            assert_eq!(ordered.len(), 3, "exactly threshold signatures, not the validator count");
+
+            let got: Vec<[u8; 20]> = ordered.iter().map(|s| recovered_address(&digest, s).unwrap()).collect();
+            let mut lowest = cfg.validators.clone();
+            lowest.sort();
+            assert_eq!(got, lowest[..3].to_vec(), "the three lowest validators, ascending");
+        }
     }
 
     /// Build a `Config` account body the way the PROGRAM serializes it. Every

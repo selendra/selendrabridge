@@ -387,6 +387,31 @@ export async function readRemoteRouter(req: Eip1193Request, router: string, chai
 }
 
 /**
+ * Does the source router's on-chain `remoteRouter(dst)` equal the router the
+ * registry lists for `dst`? (audit L7-9) The source router's owner sets
+ * `remoteRouter` instantly, and that is where `swapAndBridge` sends the bridged
+ * stable — so "non-empty" is not enough: a stolen owner key could point it at
+ * any address. Compare against the registry's `router` for the destination:
+ * a 0x address compares case-insensitively with a 20-byte value, a base58
+ * Solana key with a 32-byte value. Fails closed: no registry router, an
+ * unparsable one, or an empty/unread on-chain value is a mismatch.
+ */
+export function remoteRouterMatches(remoteHex: string | null | undefined, registryRouter: string | null | undefined): boolean {
+  if (!remoteHex || !registryRouter) return false;
+  const got = strip0x(remoteHex).toLowerCase();
+  if (got.length === 0 || !/^[0-9a-f]*$/.test(got) || /^0*$/.test(got)) return false;
+  const want = registryRouter.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(want)) return got === strip0x(want).toLowerCase();
+  if (/^0x[0-9a-fA-F]{64}$/.test(want)) return got === strip0x(want).toLowerCase();
+  try {
+    const b = b58decode(want);
+    return b.length === 32 && got === strip0x(bytesToHex(b)).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The SwapRouter's immutable `gate()` — the authoritative Gate the router locks
  * into (M5). The `swapAndBridge` Sent event is emitted by THIS gate, so the log
  * parser must match against it, not the user-editable Gate address field (which

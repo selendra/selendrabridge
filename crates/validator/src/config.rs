@@ -91,11 +91,22 @@ pub struct SolanaDestinationChain {
     pub chain_id: u64,
     /// The gate program id, base58.
     pub program_id: String,
-    /// Solana JSON-RPC URL.
-    pub rpc: String,
+    /// Solana JSON-RPC URL (back-compat single form).
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Several Solana JSON-RPC URLs (audit round 7, L7-11). The asset account is
+    /// read from every one and its scale taken only on a majority; with one URL
+    /// a single endpoint answering "no such account" withheld that transfer's
+    /// signature for good. Merged with `rpc` (which leads) and deduplicated.
+    #[serde(default)]
+    pub rpcs: Vec<String>,
 }
 
 impl SolanaDestinationChain {
+    pub fn endpoints(&self) -> anyhow::Result<Vec<String>> {
+        endpoints(&self.rpc, &self.rpcs, &format!("solana destination {}", self.chain_id))
+    }
+
     /// The program id as the 32 raw bytes PDA derivation hashes.
     pub fn program_key(&self) -> anyhow::Result<[u8; 32]> {
         let raw = bs58::decode(self.program_id.trim())
@@ -197,15 +208,101 @@ impl RefundChain {
 ///
 /// The single-`rpc` form is back-compat; when both are given the singular one
 /// leads, so an operator adding `rpcs` for failover keeps their existing primary.
+///
+/// Deduplicated on [`normalise_url`], not on the raw string (audit round 7,
+/// L7-10). The docs always promised deduplication, but `rpcs = ["A", "A"]` — or
+/// `"A"` and `"A/"` — yielded two endpoints, and H-4 corroboration and the
+/// refund path's `min_agree = 2` then compared one endpoint with itself: a
+/// second opinion in name only. Blank entries are dropped.
 fn endpoints(rpc: &Option<String>, rpcs: &[String], what: &str) -> anyhow::Result<Vec<String>> {
-    let mut out = rpcs.to_vec();
-    if let Some(rpc) = rpc {
-        if !out.iter().any(|u| u == rpc) {
-            out.insert(0, rpc.clone());
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in rpc.iter().chain(rpcs.iter()) {
+        let url = raw.trim();
+        if url.is_empty() {
+            continue;
+        }
+        if seen.insert(normalise_url(url)) {
+            out.push(url.to_string());
         }
     }
     anyhow::ensure!(!out.is_empty(), "{what} has no RPC endpoints (set `rpc` or `rpcs`)");
     Ok(out)
+}
+
+/// The comparison key for one RPC url: trimmed, scheme and host lower-cased,
+/// the scheme's default port dropped, and trailing `/` removed. The path and
+/// query keep their case — on a hosted endpoint they carry the API key, and two
+/// keys differing only in case are two keys.
+pub(crate) fn normalise_url(url: &str) -> String {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.trim_end_matches('/').to_string();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(split);
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let mut hostport = hostport.to_ascii_lowercase();
+    for (s, port) in [("http", ":80"), ("ws", ":80"), ("https", ":443"), ("wss", ":443")] {
+        if scheme == s && hostport.ends_with(port) {
+            hostport.truncate(hostport.len() - port.len());
+        }
+    }
+    let authority = match userinfo {
+        Some(u) => format!("{u}@{hostport}"),
+        None => hostport,
+    };
+    format!("{scheme}://{authority}{tail}").trim_end_matches('/').to_string()
+}
+
+/// The SERVER an url points at: lower-cased `host[:port]`, without scheme,
+/// credentials, path or a default port. Two entries on one server are one
+/// provider, however their paths (API keys) differ.
+pub(crate) fn url_server(url: &str) -> String {
+    let norm = normalise_url(url);
+    let rest = norm.split_once("://").map(|(_, r)| r).unwrap_or(&norm);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit('@').next().unwrap_or(authority).to_string()
+}
+
+/// How many distinct servers ([`url_server`]) an endpoint list spans.
+pub(crate) fn distinct_servers(urls: &[String]) -> usize {
+    urls.iter().map(|u| url_server(u)).collect::<std::collections::HashSet<_>>().len()
+}
+
+/// L7-10: two entries on the same server are not two opinions. Warn when a
+/// list repeats a server; refuse outright when `[corroborate] require = true`
+/// and EVERY entry is on one server, because the "second endpoint" that policy
+/// insists on would then be the first one asked twice.
+fn check_independent_servers(what: &str, urls: &[String], require: bool) -> anyhow::Result<()> {
+    if urls.len() < 2 {
+        return Ok(());
+    }
+    let servers = distinct_servers(urls);
+    if servers >= urls.len() {
+        return Ok(());
+    }
+    let shown: Vec<String> = urls.iter().map(|u| bridge_core::config::redact_url(u)).collect();
+    if servers < 2 && require {
+        anyhow::bail!(
+            "{what}: every RPC endpoint is on the same server ({}). With [corroborate] \
+             require = true each read needs a SECOND, independent endpoint, and the same \
+             provider asked twice is not one (audit L7-10). Add an endpoint on another host.",
+            shown.join(", ")
+        );
+    }
+    tracing::warn!(
+        what,
+        endpoints = ?shown,
+        distinct_servers = servers,
+        "two or more RPC endpoints share a server: corroboration between them is the same \
+         provider agreeing with itself (audit L7-10). Use endpoints on different hosts."
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,9 +481,24 @@ impl Config {
             }
             for d in &cfg.solana_destinations {
                 d.program_key()?;
-                if d.rpc.trim().is_empty() {
-                    anyhow::bail!("solana destination {}: rpc is empty", d.chain_id);
-                }
+                d.endpoints()?;
+            }
+        }
+
+        // L7-10: every endpoint list, checked for entries on one server.
+        {
+            let require = cfg.corroborate.require;
+            for s in &cfg.sources {
+                check_independent_servers(&format!("source chain {}", s.chain_id), &s.endpoints()?, require)?;
+            }
+            for d in &cfg.destinations {
+                check_independent_servers(&format!("destination {}", d.chain_id), &d.endpoints()?, require)?;
+            }
+            for d in cfg.refund.iter().flat_map(|r| r.destinations.iter()) {
+                check_independent_servers(&format!("refund destination {}", d.chain_id), &d.endpoints()?, require)?;
+            }
+            for d in &cfg.solana_destinations {
+                check_independent_servers(&format!("solana destination {}", d.chain_id), &d.endpoints()?, require)?;
             }
         }
 
@@ -680,6 +792,93 @@ mod tests {
         assert!(Config::from_toml(&both).is_err());
         let empty = format!("{base}token_env = \" \"\n");
         assert!(Config::from_toml(&empty).is_err());
+    }
+
+    // --- audit round 7, L7-10: one endpoint is not two -----------------------
+
+    #[test]
+    fn endpoints_are_deduplicated_after_normalising() {
+        let e = endpoints(&None, &["http://A".into(), "http://A".into()], "t").unwrap();
+        assert_eq!(e, vec!["http://A".to_string()], "THE finding: [A, A] is one endpoint");
+
+        let e = endpoints(
+            &Some(" HTTPS://Rpc.Example.com/ ".into()),
+            &[
+                "https://rpc.example.com".into(),
+                "https://rpc.example.com:443/".into(),
+                "https://RPC.example.com//".into(),
+                "".into(),
+            ],
+            "t",
+        )
+        .unwrap();
+        assert_eq!(e, vec!["HTTPS://Rpc.Example.com/".to_string()], "the singular `rpc` leads, trimmed");
+
+        // The path is the API key on a hosted endpoint: case matters there.
+        let e = endpoints(&None, &["https://h.io/v2/Key".into(), "https://h.io/v2/key".into()], "t").unwrap();
+        assert_eq!(e.len(), 2);
+        // A different port is a different server.
+        let e = endpoints(&None, &["http://127.0.0.1:8545".into(), "http://127.0.0.1:8546".into()], "t").unwrap();
+        assert_eq!(e.len(), 2);
+        assert!(endpoints(&None, &[" ".into()], "t").is_err(), "blank only => no endpoints");
+    }
+
+    #[test]
+    fn servers_are_compared_by_host_and_port() {
+        assert_eq!(url_server("https://user:pw@Eth.Alchemy.com:443/v2/K"), "eth.alchemy.com");
+        assert_eq!(
+            distinct_servers(&["https://eth.alchemy.com/v2/K1".into(), "https://eth.alchemy.com/v2/K2".into()]),
+            1
+        );
+        assert_eq!(distinct_servers(&["https://a.io".into(), "https://b.io".into()]), 2);
+    }
+
+    fn two_rpcs(a: &str, b: &str, require: bool) -> String {
+        format!(
+            "[source]\nchain_id = 1337\nrpcs = [\"{a}\", \"{b}\"]\n\
+             gate = \"0x0000000000000000000000000000000000000001\"\nblock_confirmation = 3\n\
+             [signer]\nprivate_key = \"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d\"\n\
+             [store]\ndir = \"./sigs\"\n[corroborate]\nrequire = {require}\n"
+        )
+    }
+
+    /// Two keys on one provider are one opinion: refused when the operator
+    /// demanded a second one, warned about otherwise.
+    #[test]
+    fn same_server_endpoints_are_refused_under_require_and_loaded_otherwise() {
+        let (a, b) = ("https://eth.alchemy.com/v2/K1", "https://eth.alchemy.com/v2/K2");
+        let err = Config::from_toml(&two_rpcs(a, b, true)).unwrap_err().to_string();
+        assert!(err.contains("same server"), "got: {err}");
+        assert!(!err.contains("K1"), "the error must not print the keyed url: {err}");
+        assert!(Config::from_toml(&two_rpcs(a, b, false)).is_ok(), "advisory without require");
+        assert!(Config::from_toml(&two_rpcs(a, "https://rpc.ankr.com/eth", true)).is_ok());
+        // A literal duplicate collapses to ONE endpoint, which `require`
+        // already handles at runtime (withhold), so it still loads.
+        let c = Config::from_toml(&two_rpcs(a, a, false)).unwrap();
+        assert_eq!(c.sources[0].endpoints().unwrap().len(), 1);
+    }
+
+    /// L7-11: a Solana destination takes `rpcs` alongside the legacy `rpc`.
+    #[test]
+    fn a_solana_destination_takes_several_rpcs() {
+        let toml = format!(
+            "{}[[solana_destinations]]\nchain_id = 7565164\n\
+             program_id = \"Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1\"\n\
+             rpc = \"https://api.devnet.solana.com\"\n\
+             rpcs = [\"https://api.devnet.solana.com/\", \"https://devnet.helius-rpc.com/?api-key=k\"]\n",
+            cfg("block_confirmation = 12")
+        );
+        let c = Config::from_toml(&toml).expect("loads");
+        assert_eq!(
+            c.solana_destinations[0].endpoints().unwrap(),
+            vec!["https://api.devnet.solana.com".to_string(), "https://devnet.helius-rpc.com/?api-key=k".to_string()]
+        );
+        let none = format!(
+            "{}[[solana_destinations]]\nchain_id = 7565164\n\
+             program_id = \"Bvh4JxhWBCFXfc4iu8Cm9PCw86EAH4Yn39pHpzwnQFc1\"\n",
+            cfg("block_confirmation = 12")
+        );
+        assert!(Config::from_toml(&none).is_err(), "no rpc at all is a startup error");
     }
 
     /// Adding `deny_unknown_fields` must not break a config anyone ships: every

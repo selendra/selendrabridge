@@ -664,15 +664,15 @@ impl Swaps {
             .await
             .inspect_err(|e| tracing::warn!(chain_id, error = %e, "solana pool read failed"))
             .ok()?;
-        Some(Self::solana_tokens(sol, &snap, crate::solana_pool::unix_now()))
+        Some(Self::solana_tokens(sol, &snap))
     }
 
     /// Flatten a decoded Solana snapshot into the wire shape, stamping each
-    /// token with the program's own freshness verdict at `now`.
+    /// token with the program's own freshness verdict at the CLUSTER clock read
+    /// with the snapshot (audit L7-15) — stale when that clock is unknown.
     fn solana_tokens(
         sol: &crate::solana_pool::SolanaPool,
         snap: &crate::solana_pool::Snapshot,
-        now: i64,
     ) -> Vec<PoolToken> {
         let mut out = Vec::with_capacity(snap.tokens.len());
         for t in &snap.tokens {
@@ -692,7 +692,7 @@ impl Swaps {
                 max_swap_usd,
                 is_stable: t.mint == snap.pool.hub_mint,
                 price_set_at: Some(t.price_set_at),
-                price_fresh: Some(snap.pool.price_is_fresh(t, now)),
+                price_fresh: Some(snap.price_fresh(t)),
             });
         }
         out
@@ -715,7 +715,8 @@ impl Swaps {
         // `Snapshot::quote` applies the program's `StalePrice` guard as well as
         // its arithmetic: a stale leg yields no quote rather than a number the
         // chain will refuse.
-        match snap.quote(&mint_in, &mint_out, amount, crate::solana_pool::unix_now()) {
+        // At the cluster's clock, not the host's (audit L7-15); no clock, no quote.
+        match snap.quote_at_chain_time(&mint_in, &mint_out, amount) {
             Ok(v) => Some(v.to_string()),
             Err(e) => {
                 tracing::warn!(token_in, token_out, error = %e, "solana quote refused");
@@ -740,7 +741,7 @@ impl Swaps {
                     .await
                     .inspect_err(|e| tracing::warn!(chain_id, error = %e, "solana pool read failed"))
                     .ok()?;
-                let tokens = Self::solana_tokens(sol, &snap, crate::solana_pool::unix_now());
+                let tokens = Self::solana_tokens(sol, &snap);
                 (sol.program.clone(), tokens, Some(snap.pool.effective_max_price_age()))
             }
         };
@@ -1022,5 +1023,111 @@ mod tests {
         assert_eq!(swaps.solana_signature_status(9, &sig, gate).await.as_deref(), Some("finalized"));
         // No pool and no gate: still nothing to ask.
         assert_eq!(swaps.solana_blockhash(10, chains.solana_gate(10)).await, None);
+    }
+
+    /// A mock Solana RPC serving one pool over `getMultipleAccounts`: the pool
+    /// PDA, one token record per mint, and the Clock sysvar reporting
+    /// `clock` (`None` = the sysvar comes back null). Returns its URL.
+    async fn mock_solana_pool(
+        pool: swap_math::PoolState,
+        tokens: Vec<swap_math::TokenState>,
+        clock: Option<i64>,
+    ) -> String {
+        use axum::{routing::post, Json, Router};
+        use base64::Engine;
+        let program = crate::solana_pool::from_b58(SOL_PROGRAM).unwrap();
+        let mut accounts: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        accounts.insert(
+            crate::solana_pool::b58(&swap_math::pda::pool_address(&program).unwrap()),
+            borsh::to_vec(&pool).unwrap(),
+        );
+        for t in &tokens {
+            accounts.insert(
+                crate::solana_pool::b58(&swap_math::pda::token_address(&program, &t.mint).unwrap()),
+                borsh::to_vec(t).unwrap(),
+            );
+        }
+        if let Some(now) = clock {
+            accounts.insert(
+                crate::solana_pool::CLOCK_SYSVAR.to_owned(),
+                crate::solana_pool::tests::clock_bytes(now),
+            );
+        }
+        let accounts = Arc::new(accounts);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<serde_json::Value>| {
+                let accounts = accounts.clone();
+                async move {
+                    assert_eq!(req["method"], "getMultipleAccounts");
+                    let value: Vec<serde_json::Value> = req["params"][0]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|k| match accounts.get(k.as_str().unwrap()) {
+                            Some(d) => serde_json::json!({
+                                "data": [base64::engine::general_purpose::STANDARD.encode(d), "base64"],
+                                "executable": false, "lamports": 1, "owner": "x", "rentEpoch": 0
+                            }),
+                            None => serde_json::Value::Null,
+                        })
+                        .collect();
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                        "result": {"context": {"slot": 1}, "value": value}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Audit L7-15: Solana price staleness is judged at the CLUSTER's clock (the
+    /// Clock sysvar, read with the pool), not the host's. The price here was set
+    /// at t = 1_000_000 — decades before any host clock — so the old host-clock
+    /// check called it stale; the chain says 50 s later, so it is fresh, and the
+    /// API must agree with the program. With no readable clock it fails closed.
+    #[tokio::test]
+    async fn solana_freshness_follows_the_chain_clock_not_the_host() {
+        let (hub, alt) = ([1u8; 32], [2u8; 32]);
+        let pool = swap_math::PoolState { hub_mint: hub, max_price_age: 100, ..Default::default() };
+        let tokens = vec![
+            swap_math::TokenState {
+                mint: hub, decimals: 6, price: swap_math::PRICE_ONE, listed: true, ..Default::default()
+            },
+            swap_math::TokenState {
+                mint: alt, decimals: 6, price: 2 * swap_math::PRICE_ONE, listed: true,
+                price_set_at: 1_000_000, ..Default::default()
+            },
+        ];
+        let (hub58, alt58) = (crate::solana_pool::b58(&hub), crate::solana_pool::b58(&alt));
+
+        let swaps_at = |url: String| {
+            let mut swaps = Swaps::new();
+            swaps.add_spec(&format!("9={url},{SOL_PROGRAM}")).unwrap();
+            swaps.set_symbols(9, BTreeMap::from([(hub58.clone(), "USD".into()), (alt58.clone(), "ALT".into())]));
+            swaps
+        };
+        let alt_fresh = |toks: &[PoolToken]| toks.iter().find(|t| t.token == alt58).unwrap().price_fresh;
+
+        // Chain time inside the window: fresh and quotable.
+        let swaps = swaps_at(mock_solana_pool(pool.clone(), tokens.clone(), Some(1_000_050)).await);
+        assert_eq!(swaps.quote(9, &hub58, &alt58, "2000000").await.as_deref(), Some("1000000"));
+        assert_eq!(alt_fresh(&swaps.pools(9).await.unwrap()), Some(true));
+        let info = swaps.pool_info(9).await.unwrap();
+        assert_eq!(alt_fresh(&info.tokens), Some(true));
+
+        // Chain time one second past it: stale, no quote.
+        let swaps = swaps_at(mock_solana_pool(pool.clone(), tokens.clone(), Some(1_000_101)).await);
+        assert_eq!(swaps.quote(9, &hub58, &alt58, "2000000").await, None);
+        assert_eq!(alt_fresh(&swaps.pools(9).await.unwrap()), Some(false));
+
+        // No clock: fail closed — stale and no quote; the exempt hub stays fresh.
+        let swaps = swaps_at(mock_solana_pool(pool.clone(), tokens.clone(), None).await);
+        assert_eq!(swaps.quote(9, &hub58, &alt58, "2000000").await, None);
+        let toks = swaps.pools(9).await.unwrap();
+        assert_eq!(alt_fresh(&toks), Some(false));
+        assert_eq!(toks.iter().find(|t| t.token == hub58).unwrap().price_fresh, Some(true));
     }
 }

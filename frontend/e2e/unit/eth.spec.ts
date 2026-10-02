@@ -18,6 +18,7 @@ import {
   readDecimals,
   readRemoteRouter,
   readRouterGate,
+  remoteRouterMatches,
   sendApprove,
   sendBridge,
   sendFinalize,
@@ -384,6 +385,26 @@ test.describe("reads", () => {
   test("readRouterGate refuses a short return instead of inventing an address", async () => {
     const { req } = stubProvider({ chainId: 1337, callReturn: "0x1234" });
     await expect(readRouterGate(req, A)).rejects.toThrow(/no address/);
+  });
+
+  test("remoteRouterMatches: the on-chain peer must be the registry's router (L7-9)", () => {
+    const reg = "0xAbCdEf0123456789aBcDeF0123456789AbCdEf01";
+    expect(remoteRouterMatches(reg.toLowerCase(), reg)).toBe(true);
+    expect(remoteRouterMatches("0x" + reg.slice(2).toUpperCase(), reg)).toBe(true);
+    expect(remoteRouterMatches("0x" + "de".repeat(20), reg)).toBe(false);
+    // fails closed
+    expect(remoteRouterMatches("0x", reg)).toBe(false);
+    expect(remoteRouterMatches(null, reg)).toBe(false);
+    expect(remoteRouterMatches(reg, null)).toBe(false);
+    expect(remoteRouterMatches(reg, "")).toBe(false);
+    expect(remoteRouterMatches(reg, "not-an-address!")).toBe(false);
+    expect(remoteRouterMatches("0x" + "00".repeat(20), "0x" + "00".repeat(20))).toBe(false);
+    // a 20-byte value padded to 32 is a different receiver, not a match
+    expect(remoteRouterMatches("0x" + "00".repeat(12) + reg.slice(2), reg)).toBe(false);
+    // a Solana (base58, 32-byte) router compares by its raw bytes
+    const sol = "11111111111111111111111111111112"; // 31 zero bytes then 0x01
+    expect(remoteRouterMatches("0x" + "00".repeat(31) + "01", sol)).toBe(true);
+    expect(remoteRouterMatches("0x" + "00".repeat(31) + "02", sol)).toBe(false);
   });
 
   test("readRemoteRouter decodes dynamic bytes, and '0x' means no corridor", async () => {

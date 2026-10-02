@@ -9,6 +9,13 @@
 # <chains.json> is a generation's runtime chain list, e.g.
 # docker/testnet-mesh10/configs/chains.json. Non-EVM entries (Solana) are skipped.
 #
+# Contracts covered, per chain: the gate, the swap pool (`swap_pool`) and the
+# SwapRouter (`router`, or `swap_router`; a bare address or {"address": ...}).
+# The pool and router are optional; a chain with no router recorded gets a
+# WARNING, because a router left on the hot key is not moved by this script
+# (audit L7-9: its owner sets remoteRouter instantly and so decides where
+# every future swap-and-bridge's stable lands on the destination).
+#
 # T-5: the price-keeper signed with the key that is owner() of every gate and
 # pool, so that one container held governance (scheduleUpgrade,
 # scheduleGovernance, transferOwnership, seal, ...). And no gate had a guardian,
@@ -18,14 +25,14 @@
 # Order, which matters:
 #   1. handover (signed by the CURRENT owner)
 #        pool.setOracle(new-oracle)      the price-keeper's only role
-#        gate/pool.setGuardian(guardian) optional, but see above; do it here,
-#                                        while the hot key can still send it
-#        gate/pool.transferOwnership(new-owner)   step 1 of 2; nothing moves yet
+#        gate/pool/router.setGuardian(guardian)  optional, but see above; do it
+#                                        here, while the hot key can still send it
+#        gate/pool/router.transferOwnership(new-owner)  step 1 of 2; nothing moves yet
 #   2. put the NEW ORACLE key in price-keeper.toml and restart price-keeper.
 #      Between 1 and 2 the keeper logs "we are not this pool's oracle" — prices
 #      go stale for at most one poll, they are not moved.
 #   3. accept (signed by the NEW owner, from its cold wallet/keystore)
-#        gate/pool.acceptOwnership()
+#        gate/pool/router.acceptOwnership()
 #   4. status — every owner/oracle/guardian must be off the old key.
 #
 # Without --execute, handover/accept only print the calls they would send.
@@ -57,11 +64,33 @@ done
 is_addr() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]] && [[ ! "$1" =~ ^0x0{40}$ ]]; }
 lc() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
 
-# chain_id \t rpc \t gate \t pool  — EVM entries only (a 0x-address gate).
-mapfile -t ROWS < <(jq -r '.[]
-  | select((.gate // "") | test("^0x[0-9a-fA-F]{40}$"))
-  | [.chain_id, (.rpc_url // .public_rpc_url), .gate, (.swap_pool.address // "")] | @tsv' "$CHAINS")
+# chain_id US rpc US gate US pool US router — EVM entries only (a 0x-address
+# gate). Fields are split on the ASCII unit separator, not a tab: tab is IFS
+# whitespace, so `read` would collapse an empty pool and shift the router into
+# its place.
+US=$'\x1f'
+addr_of() { printf '%s' '(if type == "object" then (.address // "") else (. // "") end)'; }
+mapfile -t ROWS < <(jq -r "
+  .[]
+  | select((.gate // \"\") | test(\"^0x[0-9a-fA-F]{40}\$\"))
+  | [ (.chain_id | tostring), (.rpc_url // .public_rpc_url), .gate,
+      ((.swap_pool // \"\") | $(addr_of)),
+      ((.router // .swap_router // \"\") | $(addr_of)) ]
+  | join(\"\u001f\")" "$CHAINS")
 (( ${#ROWS[@]} )) || die "no EVM chains in $CHAINS"
+
+row() { IFS="$US" read -r cid rpc gate pool router <<<"$1"; }
+
+# Every chain must name its router or say loudly that it does not.
+for r in "${ROWS[@]}"; do
+  row "$r"
+  if [[ -z "$router" ]]; then
+    printf 'WARNING: chain %s has no router recorded in %s — if a SwapRouter is deployed there it is\n' "$cid" "$CHAINS" >&2
+    printf '         NOT covered by this script and stays on its current owner. Add "router": "0x…".\n' >&2
+  elif ! is_addr "$router"; then
+    die "chain $cid: router '$router' is not a non-zero 0x address"
+  fi
+done
 
 AUTH=()
 signer() {
@@ -73,7 +102,7 @@ signer() {
   echo "signer: $SIGNER"
 }
 
-call() { cast call --rpc-url "$1" "$2" "$3" 2>/dev/null || echo "?"; }
+call() { cast call --rpc-url "$1" "$2" "${@:3}" 2>/dev/null || echo "?"; }
 
 # send <rpc> <to> <sig> [args...] — prints, and sends only with --execute.
 send() {
@@ -85,11 +114,31 @@ send() {
 }
 
 status() {
-  for row in "${ROWS[@]}"; do
-    IFS=$'\t' read -r cid rpc gate pool <<<"$row"
+  local r d dcid drouter remote
+  for r in "${ROWS[@]}"; do
+    row "$r"
     echo "== chain $cid"
     echo "  gate $gate  owner=$(call "$rpc" "$gate" 'owner()(address)')  pending=$(call "$rpc" "$gate" 'pendingOwner()(address)')  guardian=$(call "$rpc" "$gate" 'guardian()(address)')"
     [[ -n "$pool" ]] && echo "  pool $pool  owner=$(call "$rpc" "$pool" 'owner()(address)')  pending=$(call "$rpc" "$pool" 'pendingOwner()(address)')  oracle=$(call "$rpc" "$pool" 'oracle()(address)')  guardian=$(call "$rpc" "$pool" 'guardian()(address)')"
+    if [[ -z "$router" ]]; then
+      echo "  router (none recorded — NOT checked)"
+      continue
+    fi
+    echo "  router $router  owner=$(call "$rpc" "$router" 'owner()(address)')  pending=$(call "$rpc" "$router" 'pendingOwner()(address)')  guardian=$(call "$rpc" "$router" 'guardian()(address)')"
+    # remoteRouter(peer) must be the router this file records for that peer;
+    # anything else is where the owner key is sending swap-and-bridge stable.
+    for d in "${ROWS[@]}"; do
+      IFS="$US" read -r dcid _ _ _ drouter <<<"$d"
+      [[ "$dcid" != "$cid" ]] || continue
+      remote="$(call "$rpc" "$router" 'remoteRouter(uint256)(bytes)' "$dcid")"
+      if [[ -z "$drouter" ]]; then
+        echo "    remoteRouter($dcid)=$remote  (peer has no router recorded)"
+      elif [[ "$(lc "$remote")" == "$(lc "$drouter")" ]]; then
+        echo "    remoteRouter($dcid)=$remote  ok"
+      else
+        echo "    remoteRouter($dcid)=$remote  MISMATCH: expected $drouter"
+      fi
+    done
   done
 }
 
@@ -108,20 +157,29 @@ handover() {
   [[ -z "$GUARDIAN" || "$(lc "$GUARDIAN")" != "$(lc "$NEW_ORACLE")" ]] \
     || die "the guardian must not be the hot oracle key"
 
-  for row in "${ROWS[@]}"; do
-    IFS=$'\t' read -r cid rpc gate pool <<<"$row"
-    echo "== chain $cid"
-    for c in "$gate" ${pool:+"$pool"}; do
+  local r c
+  # Check every chain before sending anything, so a wrong signer or a
+  # contract already handed over stops the run before it is half done.
+  for r in "${ROWS[@]}"; do
+    row "$r"
+    for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
       [[ "$(lc "$(call "$rpc" "$c" 'owner()(address)')")" == "$s" ]] \
         || die "chain $cid: $c is not owned by the signer $SIGNER"
     done
+  done
+  for r in "${ROWS[@]}"; do
+    row "$r"
+    echo "== chain $cid"
     [[ -n "$pool" ]] && send "$rpc" "$pool" 'setOracle(address)' "$NEW_ORACLE"
     if [[ -n "$GUARDIAN" ]]; then
-      send "$rpc" "$gate" 'setGuardian(address)' "$GUARDIAN"
-      [[ -n "$pool" ]] && send "$rpc" "$pool" 'setGuardian(address)' "$GUARDIAN"
+      for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
+        send "$rpc" "$c" 'setGuardian(address)' "$GUARDIAN"
+      done
     fi
-    send "$rpc" "$gate" 'transferOwnership(address)' "$NEW_OWNER"
-    [[ -n "$pool" ]] && send "$rpc" "$pool" 'transferOwnership(address)' "$NEW_OWNER"
+    for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
+      send "$rpc" "$c" 'transferOwnership(address)' "$NEW_OWNER"
+    done
+    [[ -n "$router" ]] || echo "  WARNING: no router recorded for chain $cid — a SwapRouter there is NOT handed over"
   done
   (( EXECUTE )) || { echo "(dry run — pass --execute to send)"; return; }
   echo
@@ -132,14 +190,21 @@ handover() {
 accept() {
   signer
   local s; s="$(lc "$SIGNER")"
-  for row in "${ROWS[@]}"; do
-    IFS=$'\t' read -r cid rpc gate pool <<<"$row"
-    echo "== chain $cid"
-    for c in "$gate" ${pool:+"$pool"}; do
+  local r c
+  for r in "${ROWS[@]}"; do
+    row "$r"
+    for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
       [[ "$(lc "$(call "$rpc" "$c" 'pendingOwner()(address)')")" == "$s" ]] \
         || die "chain $cid: $c has no pending handover to $SIGNER (run 'handover' first)"
+    done
+  done
+  for r in "${ROWS[@]}"; do
+    row "$r"
+    echo "== chain $cid"
+    for c in "$gate" ${pool:+"$pool"} ${router:+"$router"}; do
       send "$rpc" "$c" 'acceptOwnership()'
     done
+    [[ -n "$router" ]] || echo "  WARNING: no router recorded for chain $cid — a SwapRouter there is NOT accepted"
   done
   (( EXECUTE )) || echo "(dry run — pass --execute to send)"
 }

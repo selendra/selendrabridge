@@ -544,9 +544,27 @@ impl Config {
             );
             return Err(ProgramError::AccountDataTooSmall);
         }
-        self.serialize(&mut &mut config_ai.data.borrow_mut()[..])?;
-        Ok(())
+        write_zero_padded(self, config_ai)
     }
+}
+
+/// Serialize `value` at the start of `ai`'s data and ZERO every byte after it
+/// (audit L7-3).
+///
+/// Appending a field to a stored struct relies on the bytes past the old body
+/// being zero, so an existing account reads the new field as 0 — see
+/// [`in_setup_phase`] and [`CONFIG_SLACK`]. Overwriting only the new body broke
+/// that the moment a body SHRANK: removing a validator moves the tail of
+/// `Config` 20 bytes down and left the old copy of it (corridor nonces,
+/// `sealed`, `setup_deadline`) in the slack, where the next appended field
+/// would read it as garbage — and a garbage `bool` fails Borsh, bricking
+/// `load_config` for every instruction.
+fn write_zero_padded<T: BorshSerialize>(value: &T, ai: &AccountInfo) -> ProgramResult {
+    let mut data = ai.data.borrow_mut();
+    let mut rest: &mut [u8] = &mut data[..];
+    value.serialize(&mut rest)?;
+    rest.fill(0);
+    Ok(())
 }
 
 /// Load the program's canonical `Config`, refusing any account that is not the
@@ -1417,6 +1435,44 @@ pub enum GateError {
     /// [`vault_binding_allowed`].
     #[error("vault already backs a different mint or wire scale")]
     VaultAssetMismatch,
+    /// L7-4: a threshold above [`MAX_THRESHOLD`] — more signatures than fit in
+    /// one Solana transaction next to the largest instruction they authorise, so
+    /// the gate could never claim, cancel or refund again. `Custom(29)`.
+    #[error("threshold exceeds MAX_THRESHOLD (its signatures would not fit in one transaction)")]
+    ThresholdTooHigh,
+}
+
+/// The largest threshold a gate may be configured with (audit L7-4).
+///
+/// A Solana transaction is capped at 1232 bytes and every signature a
+/// `claim`/`cancel`/`refund` carries costs 69 of them (a 4-byte Borsh length +
+/// 65 bytes). `verify_threshold` needs only `threshold` signatures and the
+/// relayer sends exactly that many, so the THRESHOLD — not the validator count —
+/// is what has to fit. Measured by `tests/round7_low.rs` against the relayer's
+/// exact shape (legacy transaction, `SetComputeUnitLimit` + the gate
+/// instruction, payer the only signer), 32-byte receiver and native sender, no
+/// auto-params:
+///
+/// | instruction | accounts | bytes at 8 sigs | max sigs per packet |
+/// |-------------|----------|-----------------|---------------------|
+/// | `refund`    | 10       | 1195            | **8**               |
+/// | `claim`     | 9        | 1162            | 9                   |
+/// | `cancel`    | 4        | 997             | 11                  |
+///
+/// `refund` binds, so the cap is 8: a threshold of 9 would leave every transfer
+/// OUT of this gate unrefundable. An empty auto-params block (+32 bytes) still
+/// fits all three at 8 (refund 1227 B). Auto-params are hashed into the id and
+/// carried verbatim, and `Gate.sol` does not bound their payload, so a transfer
+/// with a large auto payload is oversized at ANY threshold — no cap fixes that.
+pub const MAX_THRESHOLD: u32 = 8;
+
+/// L7-4: refuse a threshold whose signatures could never fit one transaction.
+fn check_threshold_cap(threshold: u32) -> Result<(), ProgramError> {
+    if threshold > MAX_THRESHOLD {
+        msg!("threshold {} exceeds MAX_THRESHOLD {}", threshold, MAX_THRESHOLD);
+        return Err(GateError::ThresholdTooHigh.into());
+    }
+    Ok(())
 }
 
 /// Pure init-time validator-set rule (host-testable; `init` itself cannot run
@@ -1433,6 +1489,7 @@ fn validate_validator_set(validators: &[[u8; 20]], threshold: u32) -> Result<(),
     if threshold == 0 || threshold > validators.len() as u32 {
         return Err(ProgramError::InvalidArgument);
     }
+    check_threshold_cap(threshold)?;
     for (i, v) in validators.iter().enumerate() {
         if v == &[0u8; 20] {
             return Err(GateError::ZeroValidator.into());
@@ -2489,6 +2546,9 @@ fn process_set_threshold(
     if threshold == 0 || threshold > cfg.validators.len() as u32 {
         return Err(ProgramError::InvalidArgument);
     }
+    // L7-4: refused although a raise is otherwise instant and unscheduled — a
+    // threshold past the packet limit is a gate that can never move funds again.
+    check_threshold_cap(threshold)?;
     if threshold < cfg.threshold {
         let gov_ai = next_account_info(it)
             .map_err(|_| ProgramError::from(GateError::GovernanceNotScheduled))?;
@@ -2691,7 +2751,9 @@ fn process_register_asset(
         // without growing it, the write below could not fit (audit round 6, LOW).
         grow_program_account(owner, asset_ai, system_program, space)?;
     }
-    record.serialize(&mut &mut asset_ai.data.borrow_mut()[..])?;
+    // Fixed-size today, but it sits in front of [`ASSET_CONFIG_SLACK`] that a
+    // future field will read as zero — same rule as `Config::store` (L7-3).
+    write_zero_padded(&record, asset_ai)?;
     if legacy_upgrade {
         msg!("legacy asset record upgraded at identity scale; vault binding backfilled");
         return Ok(());
@@ -3786,6 +3848,19 @@ mod c1_tests {
         assert_eq!(validate_validator_set(&[a, b], 0), Err(ProgramError::InvalidArgument));
         assert_eq!(validate_validator_set(&[a, b], 3), Err(ProgramError::InvalidArgument));
         assert_eq!(validate_validator_set(&[], 1), Err(ProgramError::InvalidArgument));
+    }
+
+    /// L7-4: `init` refuses a threshold whose signatures cannot fit one packet,
+    /// however many validators back it — and accepts exactly the cap.
+    #[test]
+    fn init_refuses_a_threshold_above_the_packet_cap() {
+        let set: Vec<[u8; 20]> = (1..=12u8).map(|i| [i; 20]).collect();
+        assert_eq!(validate_validator_set(&set, MAX_THRESHOLD), Ok(()));
+        assert_eq!(
+            validate_validator_set(&set, MAX_THRESHOLD + 1),
+            Err(GateError::ThresholdTooHigh.into())
+        );
+        assert_eq!(ProgramError::from(GateError::ThresholdTooHigh), ProgramError::Custom(29));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may
