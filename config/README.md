@@ -158,6 +158,7 @@ them).
 
 | field | meaning |
 | --- | --- |
+| `profile` | `"dev"` (default; `"local"` is accepted as an alias) or `"production"`. Under `production` an inline `private_key` / `keystore_password` anywhere — validators, keepers, `price_keeper`, Solana relayers — is refused at generation: every key must come from `private_key_env` or a `keystore`. See "keeping secrets out of the files" |
 | `threshold` | signatures a claim needs; must match the deployed gates |
 | `runtime.run_dir` | generated configs, logs, pid file, validator cursors, `tokens.env`. Default (`null`): `${XDG_STATE_HOME:-~/.local/state}/selendra-bridge/<name>`. Created 0700 with every file 0600 (M-11: the TOMLs carry private keys). Keep it OUT of `/tmp` for anything long-running: `systemd-tmpfiles-clean` sweeps `/tmp` daily, and losing a validator's cursor means it restarts from `start_block` — on a live chain that is a backlog it may take hours to crawl back through |
 | `runtime.bin_dir` | where the compiled services are (`target/debug`, `target/release`, …) |
@@ -229,6 +230,25 @@ services log a warning at startup). The sig-store tokens accept the same
 treatment via the environment. The shipped local configs use the well-known
 public anvil keys on purpose: they are worthless, and they must never appear in
 anything that touches a real network.
+
+`profile` decides which of those is allowed:
+
+| | `dev` | `production` |
+| --- | --- | --- |
+| inline `private_key` / `keystore_password` | allowed, with a warning listing each one | **refused** |
+| `private_key_env` | passed to that one service from `.env` | same |
+| `keystore` / `keystore_password_file` | used as-is (host run); staged under `keys/` (compose) | same |
+
+Under `--compose`, both profiles give every service **only its own files**
+(audit round 7, H7-1): its own TOML, its own staged keystore/password file and
+its own signer env vars. The stack used to mount the whole `configs/` directory
+into every container — the internet-facing `graphql-api` included — so one file
+read anywhere yielded every validator key, a full signing quorum. graphql-api
+now sees `chains.json` and nothing else.
+
+Signer env vars are never generated: `--compose` keeps the value already in
+`.env`, else takes it from the shell that ran the script, else leaves it empty
+and warns. Compose refuses to start a service whose `${VAR:?}` is empty.
 
 ## docker
 

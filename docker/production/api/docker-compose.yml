@@ -61,7 +61,9 @@ services:
       GRAPHQL_MAX_BLOCK_RANGE: "${GRAPHQL_MAX_BLOCK_RANGE:-1000}"
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:
-      - ./configs:/configs:ro
+      # The registry file only, not the directory (audit round 7, H7-1): this
+      # is the internet-facing container, so it sees nothing it does not read.
+      - ./configs/chains.json:/configs/chains.json:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
       interval: 10s

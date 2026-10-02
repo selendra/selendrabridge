@@ -110,11 +110,28 @@ config_problems() {
         | "bind \(tojson) must be host:port (or [ipv6]:port)" ),
       ( .frontend.host | select(. != null and (type != "string"
             or (test("^([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\])$") | not)))
-        | "frontend.host \(tojson) must be a plain host" )
+        | "frontend.host \(tojson) must be a plain host" ),
+      ( .profile | select(. != null and (["dev", "local", "production"] | index(.)) == null)
+        | "profile \(tojson) must be \"dev\" or \"production\"" ),
+      # Audit round 7 H7-1: a signer env var becomes a compose environment KEY
+      # and a .env line, so it must be a plain identifier, and it must not shadow
+      # a variable the generator already owns.
+      ( [.validators[]?, .keepers[]?, .solana.relayers[]?, .price_keeper // empty]
+        | .[] | .signer // {} | (.private_key_env, .keystore_password_env)
+        | select(. != null and (type != "string"
+            or (test("^[A-Za-z_][A-Za-z0-9_]{0,62}$") | not)
+            or test("^(POSTGRES_PASSWORD|DATABASE_URL|RUST_LOG|SIG_STORE_[A-Z_]+|RPC_[0-9]+|GRAPHQL_[A-Z_]+)$")))
+        | "signer env var \(tojson) must be a plain identifier and not a reserved name" )
   ' "$CONFIG"
 }
 
 NAME="$(j '.name')"
+# dev        : inline `private_key` is allowed (anvil keys, throwaway testnets).
+# production : every signing secret must come from `private_key_env` or a
+#              `keystore` (+ `keystore_password_file` / `_env`); an inline key
+#              anywhere is refused. See config/README.md (audit round 7, H7-1).
+PROFILE="$(jr '.profile')"; PROFILE="${PROFILE:-dev}"
+[[ "$PROFILE" == "local" ]] && PROFILE=dev
 # Not /tmp (M-11): the generated TOMLs carry private keys and the validator
 # cursors live here; systemd-tmpfiles sweeps /tmp daily. Same root as run.sh.
 RUN_DIR="$(jr '.runtime.run_dir')"
@@ -208,13 +225,42 @@ select_chains() { # $1 jq path to the selector, $2 role field
     else jq -e --argjson c "$cid" 'index($c) != null' <<<"$sel" >/dev/null && echo "$cid"; fi
   done
 }
+# Per-service key material for the compose stack (audit round 7, H7-1).
+# Every service used to mount the whole configs/ directory — the public
+# graphql-api included — so one file read anywhere was every validator key.
+# Now each service mounts its own TOML only, and whatever its signer needs
+# beyond that is recorded here, keyed by compose service name:
+#   SVC_ENV[svc]   : env var names passed through from .env (one per line)
+#   SVC_FILES[svc] : "<host path>\t<staged name under keys/>" (one per line)
+declare -A SVC_ENV=() SVC_FILES=()
+INLINE_KEYS=()
+# Validates one inline secret against the profile.
+inline_secret() { # $1 where, $2 field
+  [[ "$PROFILE" == "production" ]] && die "$1: $2 is an inline secret, refused under profile \"production\" — use private_key_env or keystore + keystore_password_file/_env"
+  INLINE_KEYS+=("$1.$2")
+}
 # [signer] / [keeper] body from a JSON signer object
-emit_signer() { # $1 jq path
-  local any=false k
+emit_signer() { # $1 jq path, $2 compose service name
+  local any=false k svc="$2"
   for k in private_key private_key_env keystore keystore_password keystore_password_env keystore_password_file; do
     local v; v="$(jq -r "$1.$k // empty" "$CONFIG")"
     [[ -n "$v" ]] || continue
-    echo "$k = $(tstr "$v")"; any=true
+    any=true
+    case "$k" in
+      private_key|keystore_password) inline_secret "$svc" "signer.$k" ;;
+      private_key_env|keystore_password_env) SVC_ENV[$svc]+="$v"$'\n' ;;
+      keystore|keystore_password_file)
+        if [[ "$MODE" == "compose" ]]; then
+          # Staged under keys/ with the service name in front, and mounted into
+          # that one service only — the path in the TOML is the container's.
+          local src="$v"; [[ "$src" = /* ]] || src="$ROOT/$src"
+          [[ -f "$src" ]] || die "$1.$k not found: $src"
+          local staged; staged="$svc-$(basename "$src")"
+          SVC_FILES[$svc]+="$src"$'\t'"$staged"$'\n'
+          v="$KEYS_DIR/$staged"
+        fi ;;
+    esac
+    echo "$k = $(tstr "$v")"
   done
   $any || die "signer at $1 has no key source (private_key / private_key_env / keystore)"
 }
@@ -386,7 +432,7 @@ for idx in $(j '[.validators[] | select(.enabled != false)] | to_entries[].key')
       echo
     done
     echo "[signer]"
-    emit_signer "($vjson).signer"
+    emit_signer "($vjson).signer" "validator-$vname"
     echo
     echo "[store]"
     echo "url = $(tstr "$STORE_URL")"
@@ -479,7 +525,7 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
       echo
     done
     echo "[keeper]"
-    emit_signer "($kjson).signer"
+    emit_signer "($kjson).signer" "keeper-$kname"
     echo
     echo "[store]"
     echo "url = $(tstr "$STORE_URL")"
@@ -527,8 +573,12 @@ if [[ "$SOLANA_ON" == "true" ]]; then
       # relayer only reads `private_key` / `private_key_env`.
       kenv="$(jq -r "($rjson).signer.private_key_env // empty" "$CONFIG")"
       key="$(jq -r "($rjson).signer.private_key // empty" "$CONFIG")"
-      if [[ -n "$kenv" ]]; then echo "private_key_env = $(tstr "$kenv")"
-      elif [[ -n "$key" ]]; then echo "private_key = $(tstr "$key")"
+      if [[ -n "$kenv" ]]; then
+        echo "private_key_env = $(tstr "$kenv")"
+        SVC_ENV[solana-relayer-$rname]+="$kenv"$'\n'
+      elif [[ -n "$key" ]]; then
+        inline_secret "solana-relayer-$rname" signer.private_key
+        echo "private_key = $(tstr "$key")"
       else die "solana relayer $rname has no signing key"; fi
       echo
       deliver="$(jq -r "($rjson).deliver // false" "$CONFIG")"
@@ -675,7 +725,7 @@ if [[ "$(j '.price_keeper.enabled // false')" == "true" ]]; then
       echo "refresh_margin_secs = $PK_MARGIN"
       echo
       echo "[oracle]"
-      emit_signer ".price_keeper.signer"
+      emit_signer ".price_keeper.signer" "price-keeper"
       printf '%s' "$pools_toml"
     } > "$PK_CFG"
     info "price keeper -> $PK_CFG"
@@ -797,7 +847,7 @@ if [[ "$MODE" == "compose" ]]; then
   # mount is resolved by the daemon, so the container still reads the file.
   # (The same reasoning covers configs/, which hold validator private keys.)
   chmod 700 "$COMPOSE_DIR"
-  if (( ${#SOL_FILES[@]} )) || [[ -n "$SPK_CFG" ]]; then
+  if (( ${#SOL_FILES[@]} )) || [[ -n "$SPK_CFG" ]] || (( ${#SVC_FILES[@]} )); then
     # 0755 on the directory itself: a DIRECTORY bind mount keeps its own mode
     # inside the container, so 0700 here would stop the container uid at the
     # traversal even with a readable file inside. Other host users are still
@@ -809,7 +859,36 @@ if [[ "$MODE" == "compose" ]]; then
       install -m 0644 "$kp" "$COMPOSE_DIR/keys/$(basename "$kp")"
       info "staged $(basename "$kp") -> keys/ (readable by the container uid)"
     done
+    # EVM signer keystores and password files, one copy per service that uses
+    # them (H7-1): the service name prefix keeps two services' files apart.
+    for svc in "${!SVC_FILES[@]}"; do
+      while IFS=$'\t' read -r src staged; do
+        [[ -n "$staged" ]] || continue
+        install -m 0644 "$src" "$COMPOSE_DIR/keys/$staged"
+        info "staged $staged -> keys/ (mounted into $svc only)"
+      done <<<"${SVC_FILES[$svc]}"
+    done
   fi
+  # Audit round 7, H7-1: what a service may see is its own TOML plus its own
+  # signer material, never the directory. These print the extra lines.
+  svc_env() { # $1 service — its signer env vars, passed through from .env
+    local v
+    while read -r v; do
+      [[ -n "$v" ]] && printf '      %s: "${%s:?set %s in .env}"\n' "$v" "$v" "$v"
+    done <<<"${SVC_ENV[$1]:-}"
+    return 0
+  }
+  svc_keys() { # $1 service — one read-only mount per staged signer file
+    local src staged
+    while IFS=$'\t' read -r src staged; do
+      [[ -n "$staged" ]] && printf '      - ./keys/%s:/keys/%s:ro\n' "$staged" "$staged"
+    done <<<"${SVC_FILES[$1]:-}"
+    return 0
+  }
+  own_cfg() { # $1 generated file — mounted alone, at the path its command names
+    local b; b="$(basename "$1")"
+    printf '      - ./configs/%s:/configs/%s:ro\n' "$b" "$b"
+  }
   # Every service is built from the repo root, so the context is two levels up.
   CTX="../.."
 
@@ -819,8 +898,9 @@ if [[ "$MODE" == "compose" ]]; then
     printf '# Regenerate after any config change; hand edits are overwritten.\n#\n'
     printf '#   cp .env.example .env && edit it   (tokens + Postgres password)\n'
     printf '#   docker compose up -d --build\n#\n'
-    printf '# The configs in ./configs are generated too, and they carry the validator\n'
-    printf '# and keeper PRIVATE KEYS — treat this directory as secret material.\n\n'
+    printf '# The configs in ./configs are generated too. Under profile "dev" they carry\n'
+    printf '# the validator and keeper PRIVATE KEYS — treat this directory as secret\n'
+    printf '# material. Each service mounts ONLY its own file (audit round 7, H7-1).\n\n'
     printf 'x-restart: &restart\n  restart: unless-stopped\n\nservices:\n'
 
     # --- postgres ---
@@ -850,9 +930,13 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  validator-%s:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["validator", "/configs/validator-%s.toml"]\n' "$n"
       printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      svc_env "validator-$n"
       # Its own volume: the cursor file is per validator, and sharing one would
       # make each resume from the other's position.
-      printf '    volumes:\n      - ./configs:/configs:ro\n      - validator-%s-state:/data\n' "$n"
+      printf '    volumes:\n'
+      own_cfg "validator-$n.toml"
+      svc_keys "validator-$n"
+      printf '      - validator-%s-state:/data\n' "$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
     done
 
@@ -861,7 +945,10 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  keeper-%s:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["keeper", "/configs/keeper-%s.toml"]\n' "$n"
       printf '    environment:\n      SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN}"\n'
-      printf '    volumes: ["./configs:/configs:ro"]\n'
+      svc_env "keeper-$n"
+      printf '    volumes:\n'
+      own_cfg "keeper-$n.toml"
+      svc_keys "keeper-$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
     done
 
@@ -870,7 +957,11 @@ if [[ "$MODE" == "compose" ]]; then
     if [[ -n "$PK_CFG" ]]; then
       printf '  price-keeper:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
       printf '    command: ["price-keeper", "/configs/price-keeper.toml"]\n'
-      printf '    volumes: ["./configs:/configs:ro"]\n\n'
+      [[ -n "${SVC_ENV[price-keeper]:-}" ]] && { printf '    environment:\n'; svc_env price-keeper; }
+      printf '    volumes:\n'
+      own_cfg "$PK_CFG"
+      svc_keys price-keeper
+      printf '\n'
     fi
     if [[ -n "$SPK_CFG" ]]; then
       printf '  solana-price-keeper:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$CTX"
@@ -879,7 +970,9 @@ if [[ "$MODE" == "compose" ]]; then
       # directory also holds the relayer payer, and on a stack where the oracle
       # is still the gate owner, one mount of it hands every service governance.
       k="$(basename "$SPK_KEYPAIR")"
-      printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys/%s:/keys/%s:ro\n\n' "$k" "$k"
+      printf '    volumes:\n'
+      own_cfg "$SPK_CFG"
+      printf '      - ./keys/%s:/keys/%s:ro\n\n' "$k" "$k"
     fi
 
     # --- solana relayers ---
@@ -898,9 +991,11 @@ if [[ "$MODE" == "compose" ]]; then
       for cid in "${CHAIN_IDS[@]}"; do
         printf '      RPC_%s: "${RPC_%s:?set RPC_%s in .env}"\n' "$cid" "$cid" "$cid"
       done
+      svc_env "solana-relayer-$n"
       # Only this relayer's own payer (a signing-only relayer mounts no key):
       # the keys/ directory also holds the price keeper's oracle key.
-      printf '    volumes:\n      - ./configs:/configs:ro\n'
+      printf '    volumes:\n'
+      own_cfg "solana-relayer-$n.toml"
       [[ -n "${SOL_KEYS[$i]}" ]] && printf '      - ./keys/%s:/keys/%s:ro\n' "${SOL_KEYS[$i]}" "${SOL_KEYS[$i]}"
       printf '      - solana-%s-state:/data\n' "$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
@@ -911,7 +1006,8 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  indexer:\n    build: { context: %s, dockerfile: Dockerfile }\n    <<: *restart\n' "$CTX"
       printf '    command: ["indexer", "/configs/indexer.toml"]\n'
       printf '    environment:\n      DATABASE_URL: "%s"\n' "$DATABASE_URL"
-      printf '    volumes: ["./configs:/configs:ro"]\n'
+      printf '    volumes:\n'
+      own_cfg "$IDX_CFG"
       # Behind sig-store, not just postgres: both run the same idempotent
       # migration, and two simultaneous first-creates race on pg_type.
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n      postgres: { condition: service_healthy }\n\n'
@@ -932,7 +1028,10 @@ if [[ "$MODE" == "compose" ]]; then
     # internet, so it holds nothing that can write and no database URL at all.
     printf '    environment:\n      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"\n'
     printf '      GRAPHQL_MAX_BLOCK_RANGE: "%s"\n' "$(j '.defaults.max_block_range')"
-    printf '    volumes: ["./configs:/configs:ro"]\n'
+    # The registry only: this container faces the internet, and it used to
+    # mount every validator's key along with it (H7-1).
+    printf '    volumes:\n'
+    own_cfg "$REG_JSON"
     printf '    depends_on:\n      sig-store: { condition: service_healthy }\n'
     printf '    healthcheck:\n      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]\n'
     printf '      interval: 5s\n      timeout: 3s\n      retries: 30\n\n'
@@ -960,6 +1059,7 @@ if [[ "$MODE" == "compose" ]]; then
   # file. Secrets already in an existing .env are KEPT (regenerating must not
   # rotate the Postgres password out from under a live volume); the RPC lines
   # are refreshed from the config on every run.
+  SIGNER_ENVS="$(printf '%s' "${SVC_ENV[@]}" | sed '/^$/d' | sort -u)"
   {
     echo "# Template. Every secret must be a fresh random value:  openssl rand -hex 32"
     echo "# One token per role, so a leak from one component cannot act as another."
@@ -968,9 +1068,14 @@ if [[ "$MODE" == "compose" ]]; then
     for role in VALIDATOR KEEPER READER ADMIN INDEXER; do echo "SIG_STORE_${role}_TOKEN="; done
     echo "# EVM RPC endpoints for the relayers' [[refund.evm]] readers (rpc_env); may carry provider keys"
     for cid in "${CHAIN_IDS[@]}"; do echo "RPC_$cid="; done
+    if [[ -n "$SIGNER_ENVS" ]]; then
+      echo "# Signing keys (private_key_env / keystore_password_env), each passed to its own service only"
+      while read -r v; do echo "$v="; done <<<"$SIGNER_ENVS"
+    fi
   } > "$COMPOSE_DIR/.env.example"
   env_prev() { [[ -f "$COMPOSE_DIR/.env" ]] && sed -n "s/^$1=//p" "$COMPOSE_DIR/.env" | head -1 || true; }
   kept=false; [[ -f "$COMPOSE_DIR/.env" ]] && kept=true
+  missing_keys=()
   umask 077
   tmp_env="$(mktemp)"
   {
@@ -983,13 +1088,26 @@ if [[ "$MODE" == "compose" ]]; then
     for cid in "${CHAIN_IDS[@]}"; do
       echo "RPC_$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
     done
+    # Signing keys are NEVER generated: kept from the existing .env, else taken
+    # from this shell's environment, else left empty — and compose refuses to
+    # start a service whose `${VAR:?}` is empty, which is the point.
+    while read -r k; do
+      [[ -n "$k" ]] || continue
+      v="$(env_prev "$k")"; [[ -n "$v" ]] || v="${!k:-}"
+      [[ -n "$v" ]] || missing_keys+=("$k")
+      echo "$k=$v"
+    done <<<"$SIGNER_ENVS"
   } > "$tmp_env"
   mv "$tmp_env" "$COMPOSE_DIR/.env"; chmod 600 "$COMPOSE_DIR/.env"
   if $kept; then info "secrets      : $COMPOSE_DIR/.env secrets kept, RPC lines refreshed"
   else info "secrets      : $COMPOSE_DIR/.env written (fresh random values)"; fi
 
+  (( ${#missing_keys[@]} )) && warn "signing keys not set — fill them in $COMPOSE_DIR/.env before 'up': ${missing_keys[*]}"
+  info "profile      : $PROFILE"
+  (( ${#INLINE_KEYS[@]} )) && warn "inline keys in configs/ (dev profile only): ${INLINE_KEYS[*]}"
   info "compose file : $yml"
-  info "configs      : $CFG_DIR ($(ls "$CFG_DIR" | wc -l) files, they hold PRIVATE KEYS)"
+  if (( ${#INLINE_KEYS[@]} )); then info "configs      : $CFG_DIR ($(ls "$CFG_DIR" | wc -l) files, some hold PRIVATE KEYS)"
+  else info "configs      : $CFG_DIR ($(ls "$CFG_DIR" | wc -l) files, no inline keys)"; fi
   echo
   info "  cd $COMPOSE_DIR && docker compose up -d --build"
   exit 0

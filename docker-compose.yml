@@ -113,6 +113,9 @@ services:
       timeout: 3s
       retries: 20
 
+  # Each service mounts ONLY its own file from docker/configs (audit round 7,
+  # H7-1): val*.toml and keeper.toml carry private keys, and graphql-api — the
+  # internet-facing one — used to mount all of them along with chains.json.
   validator1:
     build: .
     <<: *restart
@@ -120,7 +123,7 @@ services:
     environment:
       SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/val1.toml:/configs/val1.toml:ro
       - val1-state:/data
     depends_on:
       sig-store:
@@ -135,7 +138,7 @@ services:
     environment:
       SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/val2.toml:/configs/val2.toml:ro
       - val2-state:/data
     depends_on:
       sig-store:
@@ -150,7 +153,7 @@ services:
     environment:
       SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/val3.toml:/configs/val3.toml:ro
       - val3-state:/data
     depends_on:
       sig-store:
@@ -165,7 +168,7 @@ services:
     environment:
       SIG_STORE_KEEPER_TOKEN: "${SIG_STORE_KEEPER_TOKEN:?set SIG_STORE_KEEPER_TOKEN, e.g. $(openssl rand -hex 32)}"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/keeper.toml:/configs/keeper.toml:ro
     depends_on:
       sig-store:
         condition: service_healthy
@@ -183,7 +186,7 @@ services:
       DATABASE_URL: "postgres://bridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a random secret}@postgres:5432/bridge"
       RUST_LOG: "indexer=info,bridge_db=info"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/indexer.toml:/configs/indexer.toml:ro
     depends_on:
       # Also wait for sig-store: it runs the (idempotent) schema migration first,
       # so the indexer's migrate() finds the tables already present. Postgres's
@@ -233,7 +236,7 @@ services:
       SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN, e.g. $(openssl rand -hex 32)}"
       RUST_LOG: "graphql_api=info"
     volumes:
-      - ./docker/configs:/configs:ro
+      - ./docker/configs/chains.json:/configs/chains.json:ro
     ports: ["127.0.0.1:8088:8088"]
     depends_on:
       sig-store:
