@@ -303,6 +303,53 @@ fn hex_bytes(field: &'static str, s: &str) -> Result<Vec<u8>, StoreError> {
     hex::decode(s).map_err(|_| StoreError::BadField(field))
 }
 
+// ---------------------------------------------------------------------------
+// Storable size bounds (audit 2026-09-16 LOW; shared since round 7, H7-2).
+//
+// The sig-store refuses any record whose free-form params exceed these, and
+// that refusal is PERMANENT — the same record is refused on every retry. The
+// scanners used to treat it like any other store error and re-read the window
+// forever, so one public `send` with an oversized payload halted every
+// validator and the indexer on that source chain. Both sides now read the
+// bounds from here: the store to refuse, a scanner to recognise ahead of time
+// that a genuine on-chain transfer can never be stored, and skip it loudly.
+// ---------------------------------------------------------------------------
+
+/// `receiver` / `native_sender`: 20 bytes (EVM) or 32 bytes (Solana). Both gates
+/// refuse any other receiver width at `send`.
+pub const MAX_ACCOUNT_BYTES: usize = 32;
+/// `auto_params`, raw bytes. Gates built since round 7 refuse more than
+/// `Gate.MAX_AUTO_PARAMS_LENGTH` (4096) at `send`; older gates have no bound, so
+/// this stays generous — a real swap-and-bridge payload is a few hundred bytes.
+pub const MAX_AUTO_PARAMS_BYTES: usize = 32 * 1024;
+/// `uint256` in decimal is at most 78 digits.
+pub const MAX_UINT256_DECIMAL_LEN: usize = 78;
+
+/// `0x`-hex no longer than `max_bytes` bytes. Well-formedness is left to the
+/// binding check; this is only the size gate in front of it.
+fn bounded_hex(field: &'static str, s: &str, max_bytes: usize) -> Result<(), StoreError> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.len() > 2 * max_bytes {
+        return Err(StoreError::BadField(field));
+    }
+    Ok(())
+}
+
+/// Whether the store's size bounds admit this record. `Err` is deterministic:
+/// no retry will ever store it. Says nothing about whether the record is valid.
+pub fn check_storable(r: &SubmissionRecord) -> Result<(), StoreError> {
+    bounded_hex("receiver", &r.receiver, MAX_ACCOUNT_BYTES)?;
+    bounded_hex("native_sender", &r.native_sender, MAX_ACCOUNT_BYTES)?;
+    bounded_hex("auto_params", &r.auto_params, MAX_AUTO_PARAMS_BYTES)?;
+    bounded_hex("bridge_domain", &r.bridge_domain, 32)?;
+    bounded_hex("debridge_id", &r.debridge_id, 32)?;
+    bounded_hex("token", &r.token, 20)?;
+    if r.amount.len() > MAX_UINT256_DECIMAL_LEN {
+        return Err(StoreError::BadField("amount"));
+    }
+    Ok(())
+}
+
 /// Recompute the canonical `submissionId` from a record's parameters, exactly as
 /// the Gate contract would on `claim()`. This is THE check that binds an id to its
 /// params: if the record's `submission_id` doesn't equal this, the record is forged.
@@ -487,6 +534,9 @@ pub fn upsert_signature(
     if !is_valid_submission_id(&record.submission_id) {
         return Err(StoreError::BadField("submission_id"));
     }
+    // The same size bounds the sig-store enforces, so the two backings agree on
+    // what is storable (round 7, H7-2).
+    check_storable(&record)?;
     ensure_dir(dir)?;
 
     // (1) Bind id <-> params, and (3) authenticate the incoming signature.
@@ -630,6 +680,17 @@ mod tests {
     }
 
     // Build a well-formed record (id == keccak(params)) for a plain transfer.
+    /// Round 7, H7-2: the bound the scanners consult is exactly the one the
+    /// store enforces — the widest legal payload passes, one byte more fails.
+    #[test]
+    fn check_storable_is_the_store_bound() {
+        let mut r = make_record();
+        r.auto_params = format!("0x{}", "ee".repeat(MAX_AUTO_PARAMS_BYTES));
+        assert!(check_storable(&r).is_ok());
+        r.auto_params = format!("0x{}", "ee".repeat(MAX_AUTO_PARAMS_BYTES + 1));
+        assert!(matches!(check_storable(&r), Err(StoreError::BadField("auto_params"))));
+    }
+
     fn make_record() -> SubmissionRecord {
         let debridge_id = crate::debridge_id(U256::from(1337u64), token());
         let amount = U256::from(100u64);

@@ -903,6 +903,29 @@ async fn handle_log(
         return Ok(false);
     }
 
+    // A genuine, corroborated transfer the store can never hold (audit round 7,
+    // H7-2). The store's size bounds refuse it on every retry, and a failed
+    // upsert keeps this window from advancing — so anyone could halt the whole
+    // fleet on this source chain with one oversized `send`. Checked locally,
+    // against the store's own bounds, rather than inferred from a 4xx: a store
+    // that refuses an IN-bounds record is still retried, so a faulty or hostile
+    // store cannot use this path to make validators drop real transfers.
+    if let Err(e) = bridge_core::store::check_storable(&record) {
+        error!(
+            submission_id = %emitted_id,
+            chain_from,
+            chain_to,
+            nonce,
+            reason = %e,
+            "UNSTORABLE transfer — exceeds the signature store's size bounds, so no \
+             signature for it can ever be stored. Skipping it (nonce advanced, scanner \
+             NOT paused; audit H7-2). The deposit cannot be claimed or refunded through \
+             the store: recovering it needs an operator."
+        );
+        runtime.lock().await.accept_nonce(chain_from, chain_to, nonce);
+        return Ok(true);
+    }
+
     // Allowlist enforcement: refuse to attest a non-whitelisted token or chain
     // pair. We still consume the nonce (the transfer really happened on-chain) so
     // the sequence stays intact — we just withhold our signature, so it can never
@@ -1051,6 +1074,61 @@ mod tests {
         drop(rt);
         let stored = std::fs::read_dir(dir.join("sigs")).map(|d| d.count()).unwrap_or(0);
         assert_eq!(stored, 0, "nothing was signed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit round 7, H7-2. A genuine `Sent` (its id recomputes) carrying more
+    /// `autoParams` than the store will ever hold used to fail the upsert on
+    /// every retry, so the window never advanced and the fleet stopped signing
+    /// that source chain. Now: skipped, not paused, nonce consumed — and the
+    /// NEXT transfer in the sequence is still signed.
+    #[tokio::test]
+    async fn an_unstorable_genuine_transfer_is_skipped_and_the_chain_keeps_moving() {
+        use alloy::sol_types::SolValue;
+        let dir = scratch("h72");
+        let sigs = dir.join("sigs");
+        let sink = StoreBackend::file(sigs.clone()).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&dir.join("state.json"), 0).unwrap()));
+        let signer = PrivateKeySigner::random();
+        let guard = scale::ScaleGuard::new(
+            vec![scale::Destination::connected(2, Address::ZERO, vec![], 1)],
+            vec![],
+        );
+        let genuine = |nonce: u64, data_len: usize| {
+            let auto = bridge_core::abi::AutoParamsTo {
+                executionFee: U256::ZERO,
+                flags: U256::ZERO,
+                fallbackAddress: Default::default(),
+                data: vec![0xEE; data_len].into(),
+            }
+            .abi_encode();
+            let mut ev = Gate::Sent::decode_log(&sent_log(auto, B256::ZERO).inner).unwrap().data;
+            ev.debridgeId = bridge_core::debridge_id(U256::from(1u64), ev.token);
+            ev.nonce = U256::from(nonce);
+            ev.submissionId = Submission::from_sent_event(&ev, B256::ZERO).unwrap().compute_id();
+            let id = ev.submissionId;
+            let log = alloy::rpc::types::Log {
+                inner: alloy::primitives::Log { address: Address::repeat_byte(0x6A), data: ev.encode_log_data() },
+                ..Default::default()
+            };
+            (log, ev.debridgeId, id)
+        };
+        let (big, debridge, big_id) = genuine(0, bridge_core::store::MAX_AUTO_PARAMS_BYTES);
+        guard.seed_destination_scale(2, debridge, 6).await;
+        let (next, _, next_id) = genuine(1, 32);
+
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &big, None, B256::ZERO, &guard, &mut Default::default()).await;
+        assert!(matches!(r, Ok(true)), "skipped, not an error that holds the window: {r:?}");
+        {
+            let rt = runtime.lock().await;
+            assert!(!rt.paused(), "an unstorable transfer must not pause the scanner");
+            assert_eq!(rt.last_nonce(1, 2), Some(0), "its nonce is consumed");
+        }
+        assert!(sink.load(&format!("{big_id:#x}")).await.unwrap().is_none(), "nothing was stored for it");
+
+        let r = handle_log(&signer, signer.address(), &sink, &runtime, &next, None, B256::ZERO, &guard, &mut Default::default()).await;
+        assert!(matches!(r, Ok(true)), "{r:?}");
+        assert!(sink.load(&format!("{next_id:#x}")).await.unwrap().is_some(), "the next transfer is signed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

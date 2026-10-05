@@ -36,7 +36,7 @@ use bridge_core::scan::clamp_scan_window;
 use bridge_core::store::SubmissionRecord;
 use bridge_db::Db;
 use config::{ChainCfg, Config};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -435,6 +435,21 @@ async fn handle_gate_log(
             return Ok(());
         };
         let id = record.submission_id.clone();
+        // A genuine transfer the store's size bounds will refuse on every retry
+        // (audit round 7, H7-2). Returning the error would hold the cursor on
+        // this block for good — one oversized `send` stopping all indexing of
+        // this chain. Checked against the store's own bounds, so any OTHER
+        // write failure is still retried.
+        if let Err(e) = bridge_core::store::check_storable(&record) {
+            error!(
+                chain_id,
+                submission_id = %id,
+                reason = %e,
+                "UNSTORABLE Sent — exceeds the store's size bounds; skipping it so the \
+                 cursor can advance (audit H7-2). No history row is written for it."
+            );
+            return Ok(());
+        }
         db.observe_submission(record).await?;
         info!(chain_id, submission_id = %id, "observed Sent");
         return Ok(());
@@ -692,5 +707,74 @@ mod tests {
         assert_eq!(advance_to(&[Some(199), Some(150), Some(199)], 199), Some(150), "lowest wins");
         assert_eq!(advance_to(&[Some(199), None, Some(199)], 199), None, "one lagging scanner pins it");
         assert_eq!(advance_to(&[], 199), Some(199), "no contracts configured: nothing to miss");
+    }
+
+    /// A genuine `Sent` (its id recomputes) whose `autoParams` blob is
+    /// `data_len` + 192 bytes long.
+    fn sent_log(data_len: usize, nonce: u64, domain: B256) -> (Log, String) {
+        use alloy_sol_types::SolValue;
+        let auto = bridge_core::abi::AutoParamsTo {
+            executionFee: U256::ZERO,
+            flags: U256::ZERO,
+            fallbackAddress: Default::default(),
+            data: vec![0xee; data_len].into(),
+        }
+        .abi_encode();
+        let token = Address::repeat_byte(0x33);
+        let mut rec = SubmissionRecord {
+            submission_id: String::new(),
+            bridge_domain: format!("{domain:#x}"),
+            debridge_id: format!("{:#x}", bridge_core::debridge_id(U256::from(1u64), token)),
+            amount: "1".into(),
+            bridge_decimals: Some(6),
+            chain_id_from: 1,
+            chain_id_to: 2,
+            nonce,
+            receiver: format!("0x{}", "ab".repeat(20)),
+            auto_params: format!("0x{}", hex::encode(&auto)),
+            native_sender: format!("0x{}", "cd".repeat(20)),
+            token: format!("{token:#x}"),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        };
+        let id = bridge_core::store::canonical_submission_id(&rec).unwrap();
+        rec.submission_id = format!("{id:#x}");
+        let ev = Gate::Sent {
+            submissionId: id,
+            debridgeId: B256::from_str(&rec.debridge_id).unwrap(),
+            amount: U256::from(1u64),
+            bridgeDecimals: 6,
+            chainIdFrom: U256::from(1u64),
+            chainIdTo: U256::from(2u64),
+            receiver: vec![0xab; 20].into(),
+            nonce: U256::from(nonce),
+            autoParams: auto.into(),
+            nativeSender: vec![0xcd; 20].into(),
+            token,
+        };
+        let inner = alloy::primitives::Log { address: Address::repeat_byte(0x11), data: ev.encode_log_data() };
+        (Log { inner, block_number: Some(120), log_index: Some(0), ..Default::default() }, rec.submission_id)
+    }
+
+    /// Audit round 7, H7-2. One public `send` with more `autoParams` than the
+    /// store will hold used to make `handle_gate_log` fail on every tick, so the
+    /// cursor never left that block and indexing of the chain stopped for good.
+    /// It is now skipped (no row, no error) and the next transfer still lands.
+    #[tokio::test]
+    async fn an_unstorable_sent_is_skipped_not_retried_forever() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.expect("connect");
+        let domain = B256::repeat_byte(0xd0);
+        let base = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+
+        let (bad, bad_id) = sent_log(bridge_db::MAX_AUTO_PARAMS_BYTES, base, domain);
+        handle_gate_log(db.clone(), 1, bad, domain).await.expect("skipped, not an error that holds the cursor");
+        assert!(db.load(&bad_id).await.unwrap().is_none(), "nothing stored for it");
+
+        let (ok, ok_id) = sent_log(100, base + 1, domain);
+        handle_gate_log(db.clone(), 1, ok, domain).await.expect("an ordinary Sent is indexed");
+        assert!(db.load(&ok_id).await.unwrap().is_some());
     }
 }

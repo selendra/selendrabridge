@@ -348,6 +348,14 @@ for cid in "${CHAIN_IDS[@]}"; do
     GATE[$cid]="$(fc src/GateProxy.sol:GateProxy "${RPC[$cid]}" --constructor-args "${IMPL[$cid]}" "$initdata")"
     [[ "${GATE[$cid]}" =~ ^0x ]] || die "gate proxy deploy failed on chain $cid"
     info "${CNAME[$cid]} ($cid) gate=${GATE[$cid]} (implementation ${IMPL[$cid]})"
+    # `gate.guardian` used to be honoured only by DeployProd, so a local-profile
+    # gate came up with none (found on the mesh12 live run) — and after seal()
+    # nobody can cancel a scheduled upgrade or governance action. Appointed now,
+    # inside the setup phase, where it is instant.
+    if [[ "$GUARDIAN" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+      csend "${GATE[$cid]}" 'setGuardian(address)' "$GUARDIAN" --rpc-url "${RPC[$cid]}"
+      info "  guardian $GUARDIAN"
+    fi
   fi
 done
 

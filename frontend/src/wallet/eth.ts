@@ -28,6 +28,7 @@ const SEL = {
   remoteRouter: "a6b18e64", // remoteRouter(uint256)
   gate: "7a0ebc88", // gate() — SwapRouter's immutable Gate
   bridgeUnit: "4e3ff796", // bridgeUnit(address) — Gate
+  minSendAmount: "5c05a5db", // minSendAmount(address) — Gate (audit round 7, M7-12)
   bridgeDecimalsFor: "93b06e9d", // bridgeDecimalsFor(bytes32) — Gate (H-2)
   tokenOf: "bae667bc", // tokenOf(bytes32) — Gate; the pre-H-2 fallback path
 } as const;
@@ -281,6 +282,19 @@ export async function readBridgeUnit(req: Eip1193Request, gate: string, token: s
   const unit = hexToBigInt(await ethCall(req, gate, "0x" + SEL.bridgeUnit + encAddress(token)));
   if (unit <= 0n) throw new Error("gate reports no bridge unit for this token");
   return unit;
+}
+
+/**
+ * The smallest amount (local units) the Gate's `send` accepts for `token`
+ * (audit round 7, M7-12). A gate built before M7-12 has no such getter and
+ * reverts — it has no minimum, so that reads as 0.
+ */
+export async function readMinSendAmount(req: Eip1193Request, gate: string, token: string): Promise<bigint> {
+  try {
+    return hexToBigInt(await ethCall(req, gate, "0x" + SEL.minSendAmount + encAddress(token)));
+  } catch {
+    return 0n;
+  }
 }
 
 /**
@@ -703,6 +717,10 @@ export function errMsg(e: unknown): string {
   const code = (e as { code?: number })?.code;
   const msg = e instanceof Error ? e.message : String(e);
   if (code === 4001 || /reject|denied/i.test(msg)) return "Rejected in wallet";
+  // Gate guards a user can trip (audit round 7, M7-12): name them, not the
+  // calldata the RPC echoes back with them.
+  if (/BelowMinSendAmount/.test(msg)) return "Amount is below this Gate's minimum send";
+  if (/AutoParamsTooLong/.test(msg)) return "Execution payload is too long for this Gate";
   // trim revert noise
   const m = msg.match(/reverted[^:]*:?\s*(.*)/i);
   return (m?.[1] || msg).slice(0, 160);

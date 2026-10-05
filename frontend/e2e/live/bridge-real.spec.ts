@@ -28,6 +28,12 @@ const APP = process.env.LIVE_APP ?? "http://127.0.0.1:5173";
 const SOLANA_CHAIN_ID = 7565164;
 /** How long a leg may take end to end: confirmations + quorum + keeper claim. */
 const ARRIVAL_MS = Number(process.env.LIVE_ARRIVAL_MS ?? 15 * 60_000);
+/**
+ * Whole TST sent by the EVM → EVM test. 1 by default: since M7-12 a gate may
+ * set a per-token minimum (mesh12 sets 1 TST), and the UI refuses anything below
+ * it — the next test checks exactly that.
+ */
+const EVM_AMOUNT = process.env.LIVE_BRIDGE_AMOUNT ?? "1";
 
 type Chain = { chainId: number; name: string; gate: string | null; tokens: { symbol: string; address: string }[] };
 
@@ -129,10 +135,30 @@ test("the bridge form re-targets the Gate when the wallet changes chain", async 
   await expect(gateInput).toHaveValue(new RegExp(dst.gate!, "i"), { timeout: 10_000 });
 });
 
+test("an amount below the gate's minimum send is refused before signing (M7-12)", async ({ page }) => {
+  // minSendAmount(address) — absent on a pre-M7-12 gate, which has no minimum.
+  const url = env!.rpcs[String(src.chainId)];
+  const data = "0x5c05a5db" + tst(src).slice(2).toLowerCase().padStart(64, "0");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: src.gate, data }, "latest"] }),
+  });
+  const body = (await res.json()) as { result?: string };
+  const min = body.result && body.result !== "0x" ? BigInt(body.result) : 0n;
+  test.skip(min === 0n, `${src.name} gate sets no TST minimum`);
+
+  await openBridge(page, src.chainId);
+  await page.locator(".fields input[inputmode=decimal]").fill(String(Number(min / 10n ** 12n) / 1e6 / 4));
+  const button = page.locator(".review-btn");
+  await expect(button).toHaveText(/^Minimum send is /, { timeout: 60_000 });
+  await expect(button).toBeDisabled();
+});
+
 test("EVM → EVM: a transfer sent from the UI arrives on the destination", async ({ page }) => {
   test.setTimeout(ARRIVAL_MS + 5 * 60_000);
   const receiver = freshEvmAddress();
-  const amount = "0.25";
+  const amount = EVM_AMOUNT;
   await openBridge(page, src.chainId);
   await bridgeFromEvm(page, dst, amount, receiver);
 
@@ -140,7 +166,8 @@ test("EVM → EVM: a transfer sent from the UI arrives on the destination", asyn
     const b = await erc20Balance(env!.rpcs[String(dst.chainId)], tst(dst), receiver);
     return b > 0n ? b : null;
   });
-  expect(arrived).toBe(250000000000000000n);
+  // The destination TST has 18 decimals (both ends deploy the same TestToken).
+  expect(arrived).toBe(BigInt(Math.round(Number(amount) * 1e6)) * 10n ** 12n);
 
   // And the API reports it as executed, from live chain state.
   const status = await waitFor(

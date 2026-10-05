@@ -26,6 +26,7 @@ import {
   readAllowance,
   readBalance,
   readBridgeDecimalsFor,
+  readMinSendAmount,
   readBridgeUnit,
   readDecimals,
   readRemoteRouter,
@@ -193,6 +194,8 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // because amounts cross the bridge in the asset's bridge decimals. `null` =
   // unknown, or the gate has no bridge decimals for this token at all.
   const [bridgeUnit, setBridgeUnit] = useState<bigint | null>(null);
+  // The Gate's per-token minimum send, local units; 0 = none (M7-12).
+  const [minSend, setMinSend] = useState<bigint>(0n);
   // H-2: the scale the DESTINATION gate would pay this asset out in. The
   // submissionId does not commit to it — the source gate divides by ITS
   // registered scale and the destination multiplies by ITS OWN — so two gates
@@ -335,6 +338,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     setBalance(null);
     setAllowance(null);
     setBridgeUnit(null);
+    setMinSend(0n);
     try {
       // No guessed 18 on failure (audit round 5, LOW): `decimals` scales the
       // typed amount into base units, so a token that is really 6 decimals would
@@ -343,17 +347,19 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
       const dec = await readDecimals(wallet.request, token);
       if (!current()) return;
       if (!Number.isInteger(dec) || dec < 0 || dec > 36) throw new Error(`implausible decimals() = ${dec}`);
-      const [b, a, unit] = await Promise.all([
+      const [b, a, unit, min] = await Promise.all([
         readBalance(wallet.request, token, wallet.address),
         spenderOk ? readAllowance(wallet.request, token, wallet.address, spender) : Promise.resolve(0n),
         // A revert here means the gate cannot convert this token's amounts.
         gateOk ? readBridgeUnit(wallet.request, gate, token).catch(() => null) : Promise.resolve(null),
+        gateOk ? readMinSendAmount(wallet.request, gate, token) : Promise.resolve(0n),
       ]);
       if (!current()) return;
       setDecimals(dec);
       setBalance(b);
       setAllowance(a);
       setBridgeUnit(unit);
+      setMinSend(min);
       setReadFor(readKey);
     } catch {
       if (!current()) return;
@@ -860,6 +866,9 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
     button = { label: "Bridge decimals mismatch — refusing to send", disabled: true };
   else if (inexact)
     button = { label: `Too precise — this asset bridges at most ${bridgeDecimalsOfToken} decimals`, disabled: true };
+  else if (!crossSwap && minSend > 0n && amountBase < minSend)
+    // M7-12: the Gate refuses it on-chain; say so before the user signs.
+    button = { label: `Minimum send is ${formatUnits(minSend, decimals)} ${srcSymbol || "tokens"}`, disabled: true };
   else if (amountTooWide) button = { label: "Amount too large for a Solana receiver", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
   else if (crossSwap && !corridorSet) button = { label: "Corridor not configured", disabled: true };

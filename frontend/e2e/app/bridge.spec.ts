@@ -224,6 +224,26 @@ test.describe("approve → bridge", () => {
   });
 });
 
+test.describe("gate minimum send (audit round 7, M7-12)", () => {
+  // The gate refuses anything under 1 token on-chain; the UI must say so first.
+  const MIN_1 = { ...APPROVED, "5c05a5db": (10n ** 18n).toString(16) };
+
+  test("refuses an amount below the gate's minimum, before any transaction", async ({ page }) => {
+    await openBridge(page, MIN_1);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("0.25");
+    await expect(primaryButton(page)).toHaveText(/^Minimum send is 1 /);
+    await expect(primaryButton(page)).toBeDisabled();
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
+
+  test("allows the minimum itself", async ({ page }) => {
+    await openBridge(page, MIN_1);
+    await page.locator(".field").filter({ hasText: "Amount" }).locator("input").fill("1");
+    await expect(primaryButton(page)).not.toHaveText(/Minimum send/);
+    await expect(primaryButton(page)).toBeEnabled();
+  });
+});
+
 test.describe("bridge decimals", () => {
   // An 18-decimal token bridged at 6 decimals: the gate's unit is 10^12.
   const UNIT_1E12 = { ...APPROVED, "4e3ff796": (10n ** 12n).toString(16) };

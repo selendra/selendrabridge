@@ -84,46 +84,23 @@ fn checked_id(submission_id: &str) -> Result<String, DbError> {
 // a legitimate write can never be refused by one.
 // ---------------------------------------------------------------------------
 
-/// `receiver` and `native_sender` are 20 bytes (EVM) or 32 bytes (Solana). Both
-/// gates refuse any other receiver width at `send`, so nothing longer can ever be
-/// a real transfer.
-const MAX_ACCOUNT_BYTES: usize = 32;
-/// `auto_params` has no on-chain bound, so this is generous: it is paid for in
-/// source-chain calldata by the sender, and a real swap-and-bridge payload is a
-/// few hundred bytes.
-pub const MAX_AUTO_PARAMS_BYTES: usize = 32 * 1024;
+// The submission-record bounds live in bridge-core, so the scanners can tell a
+// permanently unstorable record from a transient store failure (round 7, H7-2).
+pub use bridge_core::store::{MAX_ACCOUNT_BYTES, MAX_AUTO_PARAMS_BYTES, MAX_UINT256_DECIMAL_LEN};
 /// A transaction reference: an EVM hash (`0x` + 64 hex) or a Solana signature
 /// (base58, at most 88 characters).
 pub const MAX_TX_REF_LEN: usize = 128;
 /// A chain account as text: an EVM address (42) or a base58 Solana key (≤ 44).
 pub const MAX_ACCOUNT_TEXT_LEN: usize = 128;
-/// `uint256` in decimal is at most 78 digits.
-const MAX_UINT256_DECIMAL_LEN: usize = 78;
 /// An allowlist symbol is a human label.
 pub const MAX_SYMBOL_LEN: usize = 32;
 
-/// `0x`-hex no longer than `max_bytes` bytes. Well-formedness is left to the
-/// binding check that follows; this is only the size gate in front of it.
-fn bounded_hex(field: &'static str, s: &str, max_bytes: usize) -> Result<(), DbError> {
-    let digits = s.strip_prefix("0x").unwrap_or(s);
-    if digits.len() > 2 * max_bytes {
-        return Err(DbError::BadField(field));
-    }
-    Ok(())
-}
-
 /// Size-bound the free-form params of a submission before anything hashes them.
 fn bounded_record(r: &SubmissionRecord) -> Result<(), DbError> {
-    bounded_hex("receiver", &r.receiver, MAX_ACCOUNT_BYTES)?;
-    bounded_hex("native_sender", &r.native_sender, MAX_ACCOUNT_BYTES)?;
-    bounded_hex("auto_params", &r.auto_params, MAX_AUTO_PARAMS_BYTES)?;
-    bounded_hex("bridge_domain", &r.bridge_domain, 32)?;
-    bounded_hex("debridge_id", &r.debridge_id, 32)?;
-    bounded_hex("token", &r.token, 20)?;
-    if r.amount.len() > MAX_UINT256_DECIMAL_LEN {
-        return Err(DbError::BadField("amount"));
-    }
-    Ok(())
+    store::check_storable(r).map_err(|e| match e {
+        StoreError::BadField(f) => DbError::BadField(f),
+        other => DbError::Store(other),
+    })
 }
 
 /// A transaction reference: empty (the indexer writes `""` for a log with no
