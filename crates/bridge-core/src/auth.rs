@@ -177,7 +177,13 @@ impl Auth {
 
 /// Extract the bearer token from a request, or `""` when absent/malformed.
 fn bearer(req: &Request) -> &str {
-    req.headers()
+    bearer_token(req.headers())
+}
+
+/// The bearer token in `headers`, or `""` when absent/malformed. For handlers
+/// that need to know WHICH credential called (see [`Auth::identity`]).
+pub fn bearer_token(headers: &axum::http::HeaderMap) -> &str {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))

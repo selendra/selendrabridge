@@ -117,6 +117,35 @@ async fn attestation_signers_are_capped_per_domain() {
     assert_eq!(r.cancel_signatures.len(), MAX_SIGNATURES_PER_SUBMISSION);
 }
 
+/// Audit round 7, H7-3: the cap was first-come-first-served, so 64 junk signers
+/// posted before the real ones froze a transfer in all three domains. A member
+/// of the configured validator set is never refused, even onto a full record.
+#[tokio::test]
+async fn a_configured_validator_is_never_refused_by_a_junk_filled_record() {
+    let Some((db, _g)) = live_db().await else { return };
+    let validator = PrivateKeySigner::random();
+    let db = db.with_validator_set([format!("{:#x}", validator.address())]);
+    let rec = record(1338);
+    let id = rec.submission_id.clone();
+    for _ in 0..MAX_SIGNATURES_PER_SUBMISSION {
+        let junk = PrivateKeySigner::random();
+        db.upsert_signature(rec.clone(), sign(&junk, &id, SigKind::Transfer)).await.unwrap();
+        db.upsert_attestation(&id, SigKind::Cancel, sign(&junk, &id, SigKind::Cancel)).await.unwrap();
+        db.upsert_attestation(&id, SigKind::Refund, sign(&junk, &id, SigKind::Refund)).await.unwrap();
+    }
+    // A stranger is still capped...
+    let extra = PrivateKeySigner::random();
+    let err = db.upsert_signature(rec.clone(), sign(&extra, &id, SigKind::Transfer)).await.unwrap_err();
+    assert!(is_cap(&err, "transfer"), "{err}");
+    // ...the validator is not, in any domain.
+    let r = db.upsert_signature(rec.clone(), sign(&validator, &id, SigKind::Transfer)).await.unwrap();
+    assert_eq!(r.signatures.len(), MAX_SIGNATURES_PER_SUBMISSION + 1);
+    let r = db.upsert_attestation(&id, SigKind::Cancel, sign(&validator, &id, SigKind::Cancel)).await.unwrap();
+    assert_eq!(r.cancel_signatures.len(), MAX_SIGNATURES_PER_SUBMISSION + 1);
+    let r = db.upsert_attestation(&id, SigKind::Refund, sign(&validator, &id, SigKind::Refund)).await.unwrap();
+    assert_eq!(r.refund_signatures.len(), MAX_SIGNATURES_PER_SUBMISSION + 1);
+}
+
 // --- M-1 + park semantics -----------------------------------------------------
 
 #[tokio::test]

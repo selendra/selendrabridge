@@ -55,7 +55,7 @@
 //!   DELETE /allowed/chains/:from/:to     -> remove
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -63,11 +63,13 @@ use bridge_core::allow::{
     AddTokenRequest, AllowedChain, AllowedToken, AttestationRequest, ClaimedRequest,
     ObservedCancelledRequest, ObservedRefundedRequest, SubmissionHistory, SwapRecord,
 };
-use bridge_core::auth::{require_scope, Auth, Scope};
+use bridge_core::auth::{bearer_token, require_scope, Auth, Scope};
 use bridge_core::ratelimit::{enforce as rate_limit, RateLimit};
-use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
+use bridge_core::store::{SigKind, SignerSig, SubmissionRecord, MAX_SIGNATURES_PER_SUBMISSION};
 use bridge_db::{Db, DbError};
 use clap::Parser;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -101,6 +103,18 @@ struct Args {
     /// tokens never. A token containing `:` must be labelled.
     #[arg(long, env = "SIG_STORE_VALIDATOR_TOKENS")]
     validator_tokens: Option<String>,
+    /// The validator set, bound to the Sign tokens (audit round 7, H7-3).
+    /// Entries `label:0xaddress`, separated like `SIG_STORE_VALIDATOR_TOKENS`;
+    /// `label` is a label from that list, and may repeat to bind one holder to
+    /// several addresses. Not a secret: addresses are public.
+    ///
+    /// When set, a signature or attestation is accepted only if its signer is
+    /// bound to the presenting token (a token with no label — the legacy shared
+    /// ones — may post only for a member of the set), and a member is never
+    /// refused by the per-submission signer cap. Unset, any Sign holder may post
+    /// for any address, and 64 junk signers can freeze a transfer.
+    #[arg(long, env = "SIG_STORE_VALIDATOR_SIGNERS")]
+    validator_signers: Option<String>,
     /// Keeper: read + record a claim tx. Cannot deposit signatures.
     #[arg(long, env = "SIG_STORE_KEEPER_TOKEN")]
     keeper_token: Option<String>,
@@ -189,6 +203,115 @@ impl Args {
         }
         Ok(Auth::new(entries).with_identities(per_validator.into_iter().map(|(l, t)| (t, l))))
     }
+
+    /// The validator set bound to the Sign tokens (H7-3). Startup errors are
+    /// for configurations that would silently refuse an honest validator: a
+    /// binding naming no token label (a typo), or a labelled token left unbound
+    /// while others are bound.
+    fn signer_policy(&self) -> anyhow::Result<SignerPolicy> {
+        let labels: Vec<String> = parse_validator_tokens(self.validator_tokens.as_deref().unwrap_or(""))?
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        let policy = SignerPolicy::parse(self.validator_signers.as_deref().unwrap_or(""), &labels)?;
+        if policy.is_enforced() {
+            info!(
+                members = policy.members.len(),
+                "validator set configured: each Sign token posts only for its own signer (H7-3)"
+            );
+        } else {
+            warn!(
+                "SIG_STORE_VALIDATOR_SIGNERS is unset: any Sign-token holder can post signatures \
+                 for any address, and 64 junk signers freeze a transfer for every validator \
+                 (audit round 7, H7-3). Bind each token to its validator address."
+            );
+        }
+        Ok(policy)
+    }
+}
+
+/// Which signers each Sign credential may post for (audit round 7, H7-3).
+///
+/// The M-2 signer cap was first-come-first-served: a holder of ANY Sign token
+/// could mint 64 throwaway keys and fill a submission's transfer, cancel and
+/// refund domains before the real validators signed, freezing the transfer and
+/// — through the validators' failed batch — the whole source chain's scan. The
+/// cap cannot tell a stranger from a validator; this can. A labelled token posts
+/// only for the addresses bound to its label, so a leaked validator token can
+/// add at most that validator's own signature; an unlabelled token (the legacy
+/// shared or all-scopes one) posts only for a member. Nothing outside the set
+/// is ever stored, and the store exempts members from the cap
+/// ([`Db::with_validator_set`]), so a configured validator is never refused.
+#[derive(Clone, Debug, Default)]
+struct SignerPolicy {
+    /// token label -> the lowercase addresses it may sign as.
+    by_label: HashMap<String, HashSet<String>>,
+    /// Every bound address: the validator set.
+    members: HashSet<String>,
+}
+
+impl SignerPolicy {
+    /// Parse `label:0xaddr` entries against the configured token `labels`.
+    fn parse(raw: &str, labels: &[String]) -> anyhow::Result<SignerPolicy> {
+        let mut policy = SignerPolicy::default();
+        for entry in raw.split(|c: char| c == ',' || c.is_whitespace()).map(str::trim).filter(|e| !e.is_empty()) {
+            let (label, addr) = entry
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("SIG_STORE_VALIDATOR_SIGNERS entry {entry:?} is not label:0xaddress"))?;
+            let (label, addr) = (label.trim(), addr.trim().to_ascii_lowercase());
+            anyhow::ensure!(
+                addr.len() == 42 && addr.starts_with("0x") && addr[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+                "SIG_STORE_VALIDATOR_SIGNERS: {label:?} binds {addr:?}, which is not a 0x-prefixed 20-byte address"
+            );
+            anyhow::ensure!(
+                labels.iter().any(|l| l == label),
+                "SIG_STORE_VALIDATOR_SIGNERS: {label:?} is not a label in SIG_STORE_VALIDATOR_TOKENS"
+            );
+            policy.by_label.entry(label.to_string()).or_default().insert(addr.clone());
+            policy.members.insert(addr);
+        }
+        if policy.is_enforced() {
+            let unbound: Vec<&String> = labels.iter().filter(|l| !policy.by_label.contains_key(*l)).collect();
+            anyhow::ensure!(
+                unbound.is_empty(),
+                "SIG_STORE_VALIDATOR_SIGNERS binds no address to {unbound:?}: with a validator set \
+                 configured, those tokens could post nothing"
+            );
+            anyhow::ensure!(
+                policy.members.len() <= MAX_SIGNATURES_PER_SUBMISSION,
+                "SIG_STORE_VALIDATOR_SIGNERS lists {} addresses, more than the {MAX_SIGNATURES_PER_SUBMISSION} \
+                 signers one submission can hold",
+                policy.members.len()
+            );
+        }
+        Ok(policy)
+    }
+
+    fn is_enforced(&self) -> bool {
+        !self.members.is_empty()
+    }
+
+    /// May the credential labelled `identity` post a signature by `signer`?
+    fn permits(&self, identity: Option<&str>, signer: &str) -> Result<(), (StatusCode, String)> {
+        if !self.is_enforced() {
+            return Ok(());
+        }
+        let signer = signer.to_ascii_lowercase();
+        let ok = match identity {
+            Some(label) => self.by_label.get(label).is_some_and(|set| set.contains(&signer)),
+            None => self.members.contains(&signer),
+        };
+        if ok {
+            return Ok(());
+        }
+        Err((
+            StatusCode::FORBIDDEN,
+            match identity {
+                Some(label) => format!("signer {signer} is not bound to this credential ({label})"),
+                None => format!("signer {signer} is not in the configured validator set"),
+            },
+        ))
+    }
 }
 
 /// Parse `SIG_STORE_VALIDATOR_TOKENS` into (label, token) pairs (M7-11).
@@ -229,6 +352,28 @@ fn parse_validator_tokens(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
 #[derive(Clone)]
 struct AppState {
     db: Db,
+    /// Set by [`build_app`] from the same `Auth` the scope layers use, so a
+    /// handler can tell which credential called.
+    auth: Auth,
+    signers: Arc<SignerPolicy>,
+}
+
+impl AppState {
+    fn new(db: Db) -> AppState {
+        AppState { db, auth: Auth::default(), signers: Arc::default() }
+    }
+
+    fn with_signers(mut self, policy: SignerPolicy) -> AppState {
+        self.db = self.db.with_validator_set(policy.members.iter().cloned());
+        self.signers = Arc::new(policy);
+        self
+    }
+
+    /// H7-3: refuse a signer the presenting credential is not bound to.
+    fn permit_signer(&self, headers: &HeaderMap, signer: &str) -> Result<(), (StatusCode, String)> {
+        let identity = self.auth.identity(bearer_token(headers));
+        self.signers.permits(identity.as_deref(), signer)
+    }
 }
 
 #[tokio::main]
@@ -239,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let auth = args.auth()?;
+    let signers = args.signer_policy()?;
     let db = Db::connect(&args.database_url).await?;
     info!("connected to Postgres and applied schema");
 
@@ -260,7 +406,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let state = AppState { db };
+    let state = AppState::new(db).with_signers(signers);
 
     // FAIL CLOSED. `Auth::new` drops empty tokens, so an unset (or wiped) secret
     // leaves nothing configured — and an unconfigured `Auth` grants every scope to
@@ -287,7 +433,8 @@ async fn main() -> anyhow::Result<()> {
 /// The whole HTTP surface: every route group under its scope and (for writers)
 /// the per-credential rate limit. Split from `main` so tests can drive the REAL
 /// handlers through the REAL auth layering with `oneshot`.
-fn build_app(state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usize) -> Router {
+fn build_app(mut state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usize) -> Router {
+    state.auth = auth.clone();
     // L-5: each route group demands the NARROWEST scope that lets it work, so a
     // credential leaked from one component cannot act as another.
     //
@@ -449,6 +596,7 @@ fn page(limit: Option<u64>, offset: Option<u64>) -> (i64, i64) {
 /// by signer. Returns the merged record.
 async fn post_submission(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(record): Json<SubmissionRecord>,
 ) -> Result<Json<SubmissionRecord>, (StatusCode, String)> {
     if record.signatures.len() > MAX_SIGS_PER_POST {
@@ -460,6 +608,10 @@ async fn post_submission(
                 record.signatures.len()
             ),
         ));
+    }
+    // H7-3: every signer is checked before any is stored.
+    for sig in &record.signatures {
+        s.permit_signer(&headers, &sig.signer)?;
     }
     let sigs = record.signatures.clone();
     let mut base = record;
@@ -599,11 +751,13 @@ async fn get_swaps(
 async fn post_attestation(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<AttestationRequest>,
 ) -> Result<Json<SubmissionRecord>, (StatusCode, String)> {
     let kind = SigKind::parse(&req.kind)
         .filter(|k| *k != SigKind::Transfer)
         .ok_or((StatusCode::BAD_REQUEST, format!("unknown attestation kind {:?}", req.kind)))?;
+    s.permit_signer(&headers, &req.signer)?;
 
     let rec = s
         .db
@@ -1009,6 +1163,7 @@ mod tests {
             auth_token: None,
             validator_token: None,
             validator_tokens: Some(list.into()),
+            validator_signers: None,
             keeper_token: Some(KEEP.into()),
             reader_token: None,
             admin_token: None,
@@ -1090,6 +1245,7 @@ mod tests {
             auth_token: None,
             validator_token: Some(VAL.into()),
             validator_tokens: None,
+            validator_signers: None,
             keeper_token: Some(KEEP.into()),
             reader_token: Some(READ.into()),
             admin_token: Some(ADMIN.into()),
@@ -1151,7 +1307,7 @@ mod tests {
     /// A `Db` that never connects: these tests must be refused BEFORE the handler
     /// reaches the database.
     fn lazy_state() -> AppState {
-        AppState { db: Db::connect_lazy("postgres://nobody@127.0.0.1:1/never").unwrap() }
+        AppState::new(Db::connect_lazy("postgres://nobody@127.0.0.1:1/never").unwrap())
     }
 
     fn dummy_record(n_sigs: usize) -> SubmissionRecord {
@@ -1199,6 +1355,87 @@ mod tests {
         let app = Router::new().route("/submissions", post(post_submission)).with_state(lazy_state());
         let res = post_json(app, "/submissions", None, &dummy_record(MAX_SIGS_PER_POST + 1)).await;
         assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // --- round 7 H7-3: the validator set is bound to the Sign tokens -----------
+
+    const V1: &str = "0x1111111111111111111111111111111111111111";
+    const V2: &str = "0x2222222222222222222222222222222222222222";
+    const STRANGER: &str = "0x9999999999999999999999999999999999999999";
+
+    fn labels(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_signer_binding_parses_and_refuses_what_would_lock_a_validator_out() {
+        let p = SignerPolicy::parse(
+            &format!("val-1:{V1}, val-2:{}\nval-2:{STRANGER}", V2.to_ascii_uppercase().replace("0X", "0x")),
+            &labels(&["val-1", "val-2"]),
+        )
+        .unwrap();
+        assert!(p.is_enforced());
+        assert_eq!(p.members.len(), 3);
+        assert!(p.permits(Some("val-1"), V1).is_ok());
+        assert!(p.permits(Some("val-2"), &V2.to_ascii_uppercase().replace("0X", "0x")).is_ok(), "case-insensitive");
+        assert!(p.permits(Some("val-2"), STRANGER).is_ok(), "a label may hold several addresses");
+        assert_eq!(p.permits(Some("val-1"), V2).unwrap_err().0, StatusCode::FORBIDDEN, "not val-1's address");
+        assert_eq!(p.permits(Some("ghost"), V1).unwrap_err().0, StatusCode::FORBIDDEN);
+        // Unset: the old behaviour, everything passes (and startup warns).
+        let open = SignerPolicy::parse("", &labels(&["val-1"])).unwrap();
+        assert!(!open.is_enforced() && open.permits(Some("val-1"), STRANGER).is_ok());
+        // Typo'd label, a labelled token left unbound, a bad address: all startup errors.
+        assert!(SignerPolicy::parse(&format!("val-l:{V1}"), &labels(&["val-1"])).is_err());
+        assert!(SignerPolicy::parse(&format!("val-1:{V1}"), &labels(&["val-1", "val-2"])).is_err());
+        assert!(SignerPolicy::parse("val-1:0x1234", &labels(&["val-1"])).is_err());
+        assert!(SignerPolicy::parse(&format!("val-1{V1}"), &labels(&["val-1"])).is_err());
+        let too_many: String = (0..=MAX_SIGNATURES_PER_SUBMISSION).map(|i| format!("val-1:0x{:040x},", i + 1)).collect();
+        assert!(SignerPolicy::parse(&too_many, &labels(&["val-1"])).is_err());
+    }
+
+    /// The legacy shared and all-scopes tokens carry no label: they may post
+    /// only for a member of the set.
+    #[test]
+    fn an_unlabelled_credential_may_post_only_for_a_member() {
+        let p = SignerPolicy::parse(&format!("val-1:{V1},val-2:{V2}"), &labels(&["val-1", "val-2"])).unwrap();
+        assert!(p.permits(None, V1).is_ok() && p.permits(None, V2).is_ok());
+        assert_eq!(p.permits(None, STRANGER).unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    /// The real handlers through the real auth layering, with no database in
+    /// reach: a token posting a signer it is not bound to is refused 403 on
+    /// both write routes, BEFORE any query (so the junk never reaches the cap).
+    /// Its own signer gets past the check (and then fails the id binding, 400).
+    #[tokio::test]
+    async fn a_sign_token_cannot_post_another_signers_signature() {
+        let args = args_with_validator_tokens("val-1:tok-one,val-2:tok-two");
+        let args = Args { validator_signers: Some(format!("val-1:{V1},val-2:{V2}")), ..args };
+        let state = lazy_state().with_signers(args.signer_policy().unwrap());
+        let app = build_app(state, args.auth().unwrap(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+
+        let with_signer = |signer: &str| {
+            let mut r = dummy_record(1);
+            r.signatures[0].signer = signer.into();
+            r
+        };
+        for (tok, signer, refused) in
+            [("tok-one", STRANGER, true), ("tok-one", V2, true), ("tok-two", V1, true), ("tok-one", V1, false)]
+        {
+            let res = post_json(app.clone(), "/submissions", Some(tok), &with_signer(signer)).await;
+            assert_eq!(res.status() == StatusCode::FORBIDDEN, refused, "{tok} posting {signer}: {}", res.status());
+            let att = AttestationRequest {
+                kind: "cancel".into(),
+                signer: signer.into(),
+                signature: format!("0x{}", "00".repeat(65)),
+            };
+            let res = post_json(app.clone(), &format!("/submissions/0x{}/attestations", "ab".repeat(32)), Some(tok), &att).await;
+            assert_eq!(res.status() == StatusCode::FORBIDDEN, refused, "{tok} attesting as {signer}: {}", res.status());
+        }
+        // One bad signer in a multi-signature POST refuses the whole request.
+        let mut mixed = with_signer(V1);
+        mixed.signatures.push(SignerSig { signer: STRANGER.into(), signature: format!("0x{}", "00".repeat(65)) });
+        let res = post_json(app.clone(), "/submissions", Some("tok-one"), &mixed).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     /// Sanity on the constant: an honest client sends one, so the cap must admit
@@ -1316,7 +1553,7 @@ mod tests {
         let Some(url) = live_db_url() else { return };
         let _serial = LIVE_DB.lock().await;
         let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
-        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+        let app = build_app(AppState::new(db.clone()), test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
 
         // A fresh chain_to per run keeps the pending-claims queue we inspect small.
         let chain_to = 900_000 + (std::process::id() as u64 % 90_000);
@@ -1387,7 +1624,7 @@ mod tests {
         let Some(url) = live_db_url() else { return };
         let _serial = LIVE_DB.lock().await;
         let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
-        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+        let app = build_app(AppState::new(db.clone()), test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
 
         let chain_to = 700_000 + (std::process::id() as u64 % 90_000);
         // Three transfers the attacker knows are coming but that nobody has
@@ -1440,7 +1677,7 @@ mod tests {
         let Some(url) = live_db_url() else { return };
         let _serial = LIVE_DB.lock().await;
         let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
-        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+        let app = build_app(AppState::new(db.clone()), test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
 
         let chain_to = 800_000 + (std::process::id() as u64 % 90_000);
         let rec = signed_record(chain_to);
@@ -1528,7 +1765,7 @@ mod tests {
         let Some(url) = live_db_url() else { return };
         let _serial = LIVE_DB.lock().await;
         let db = Db::connect(&url).await.unwrap();
-        let app = build_app(AppState { db }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+        let app = build_app(AppState::new(db), test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
         for _ in 0..3 {
             let res = post_json(app.clone(), "/submissions", Some(VAL), &signed_record(1338)).await;
             assert_eq!(res.status(), StatusCode::OK);

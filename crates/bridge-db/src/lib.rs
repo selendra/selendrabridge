@@ -11,7 +11,9 @@
 //! must equal the keccak of its own params, params are immutable once stored,
 //! and every signature must recover to its claimed signer.
 
+use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
 use bridge_core::allow::{AllowedChain, AllowedToken, SubmissionHistory, SwapBridgeInfo, SwapRecord};
@@ -468,6 +470,10 @@ async fn refuse_if_emptied(
 /// locked out of a submission that junk has filled: the cap bounds distinct
 /// signers, not requests. `count_sql`/`present_sql` are literals at every call
 /// site, parameterised on `$1 = id` (and `$2 = signer` for the latter).
+///
+/// A configured validator (`member`, see [`Db::with_validator_set`]) is never
+/// refused (audit round 7, H7-3): the cap was first-come-first-served, so 64
+/// junk signers posted before the real ones froze the transfer for good.
 async fn enforce_signature_cap(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     count_sql: &str,
@@ -475,7 +481,11 @@ async fn enforce_signature_cap(
     id: &str,
     signer_lc: &str,
     kind: &'static str,
+    member: bool,
 ) -> Result<(), DbError> {
+    if member {
+        return Ok(());
+    }
     let (count,): (i64,) = sqlx::query_as(count_sql).bind(id).fetch_one(&mut **tx).await?;
     if count < store::MAX_SIGNATURES_PER_SUBMISSION as i64 {
         return Ok(());
@@ -534,6 +544,12 @@ impl Marker<'static> {
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
+    /// The configured validator set, lowercase `0x` addresses (audit round 7,
+    /// H7-3). A member is never refused by the per-submission signer cap: the
+    /// cap exists to bound strangers, and a record filled with junk before the
+    /// validator-set check was configured must not lock a real validator out.
+    /// Empty = no set configured, every signer is capped alike (the old rule).
+    validator_set: Arc<HashSet<String>>,
 }
 
 impl Db {
@@ -545,7 +561,7 @@ impl Db {
         for attempt in 1..=30 {
             match PgPoolOptions::new().max_connections(10).connect(url).await {
                 Ok(pool) => {
-                    let db = Db { pool };
+                    let db = Db { pool, validator_set: Arc::default() };
                     db.migrate().await?;
                     return Ok(db);
                 }
@@ -565,7 +581,16 @@ impl Db {
     /// database (body caps, scope checks): they need an `AppState` but must never
     /// need Postgres. Not for services — use [`Db::connect`], which migrates.
     pub fn connect_lazy(url: &str) -> Result<Db, DbError> {
-        Ok(Db { pool: PgPoolOptions::new().max_connections(1).connect_lazy(url)? })
+        Ok(Db { pool: PgPoolOptions::new().max_connections(1).connect_lazy(url)?, validator_set: Arc::default() })
+    }
+
+    /// Exempt these signers from the per-submission signer cap (H7-3). The
+    /// sig-store passes the validator set it enforces at the HTTP layer, so the
+    /// only signers that can reach the cap at all are its members, and they are
+    /// let through even onto a record a stranger filled before.
+    pub fn with_validator_set(mut self, signers: impl IntoIterator<Item = String>) -> Db {
+        self.validator_set = Arc::new(signers.into_iter().map(|s| s.to_ascii_lowercase()).collect());
+        self
     }
 
     /// Apply the idempotent schema. Safe to call on every startup.
@@ -648,6 +673,7 @@ impl Db {
             &id,
             &signer_lc,
             "transfer",
+            self.validator_set.contains(&signer_lc),
         )
         .await?;
 
@@ -828,7 +854,16 @@ impl Db {
             }
             SigKind::Transfer => unreachable!("rejected above"),
         };
-        enforce_signature_cap(&mut tx, count_sql, present_sql, &id, &signer_lc, kind.as_str()).await?;
+        enforce_signature_cap(
+            &mut tx,
+            count_sql,
+            present_sql,
+            &id,
+            &signer_lc,
+            kind.as_str(),
+            self.validator_set.contains(&signer_lc),
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO attestations (submission_id, kind, signer, signature) \

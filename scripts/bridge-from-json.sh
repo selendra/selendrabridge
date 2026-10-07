@@ -123,7 +123,11 @@ config_problems() {
         | select(. != null and (type != "string"
             or (test("^[A-Za-z_][A-Za-z0-9_]{0,62}$") | not)
             or test("^(POSTGRES_PASSWORD|DATABASE_URL|RUST_LOG|SIG_STORE_[A-Z_]+|RPC_[0-9]+|GRAPHQL_[A-Z_]+)$")))
-        | "signer env var \(tojson) must be a plain identifier and not a reserved name" )
+        | "signer env var \(tojson) must be a plain identifier and not a reserved name" ),
+      # H7-3: the address a Sign-token holder is bound to in the sig-store.
+      ( [.validators[]?, .solana.relayers[]?] | .[] | .signer // {} | .address
+        | select(. != null and (type != "string" or (test("^0x[0-9a-fA-F]{40}$") | not)))
+        | "signer.address \(tojson) must be a 0x-prefixed 20-byte address" )
   ' "$CONFIG"
 }
 
@@ -681,13 +685,50 @@ if [[ "$SOLANA_ON" == "true" ]]; then
 fi
 
 # M7-11: every Sign-token holder — label (what the sig-store logs it as, and
-# what H7-3 will map to a validator address) and the env var carrying its own
+# what H7-3 maps to a validator address) and the env var carrying its own
 # token. Two names that sanitise to one variable would share a token again.
 SIGN_LABELS=() SIGN_VARS=()
 for n in "${VAL_NAMES[@]}"; do SIGN_LABELS+=("validator-$n"); SIGN_VARS+=("$(sign_tok_var VALIDATOR "$n")"); done
 for n in "${SOL_NAMES[@]}"; do SIGN_LABELS+=("solana-relayer-$n"); SIGN_VARS+=("$(sign_tok_var SOLANA_RELAYER "$n")"); done
 dup_var="$(printf '%s\n' "${SIGN_VARS[@]}" | sort | uniq -d | head -1)"
 [[ -z "$dup_var" ]] || die "two validators/relayers map to one sig-store token variable ($dup_var) — rename one"
+
+# H7-3: bind each Sign token to the address its holder signs as, so the
+# sig-store refuses a signature by anyone else (SIG_STORE_VALIDATOR_SIGNERS).
+# Without it any Sign holder can post 64 junk signers and freeze a transfer.
+# The address is public, so it comes from config — `signer.address`, else a
+# keystore's own `address` field — and never from decrypting a key: a raw key
+# would have to reach `cast` on argv to be converted (see deploy-from-json.sh).
+signer_addr() { # $1 jq path to a signer object -> 0x address, or nothing
+  local a ks
+  a="$(jq -r "$1.address // empty" "$CONFIG")"
+  ks="$(jq -r "$1.keystore // empty" "$CONFIG")"
+  if [[ -n "$ks" ]]; then
+    [[ "$ks" = /* ]] || ks="$ROOT/$ks"
+    local ka; ka="$(jq -r '.address // empty' "$ks" 2>/dev/null || true)"
+    [[ -z "$ka" || "$ka" == 0x* ]] || ka="0x$ka"
+    if [[ -n "$a" && -n "$ka" ]]; then
+      [[ "${a,,}" == "${ka,,}" ]] || die "$1.address ($a) is not the keystore's address ($ka)"
+    fi
+    a="${a:-$ka}"
+  fi
+  [[ -n "$a" ]] && echo "${a,,}"
+  return 0
+}
+SIGNER_BINDINGS="" unbound=()
+for n in "${VAL_NAMES[@]}"; do
+  a="$(signer_addr "(first(.validators[] | select(.enabled != false and .name == $(jq -Rn --arg n "$n" '$n'))) | .signer)")"
+  if [[ -n "$a" ]]; then SIGNER_BINDINGS+="${SIGNER_BINDINGS:+,}validator-$n:$a"; else unbound+=("validators[$n]"); fi
+done
+for n in "${SOL_NAMES[@]}"; do
+  a="$(signer_addr "(first(.solana.relayers[] | select(.enabled != false and .name == $(jq -Rn --arg n "$n" '$n'))) | .signer)")"
+  if [[ -n "$a" ]]; then SIGNER_BINDINGS+="${SIGNER_BINDINGS:+,}solana-relayer-$n:$a"; else unbound+=("solana.relayers[$n]"); fi
+done
+if (( ${#unbound[@]} )) && (( ${#SIGN_VARS[@]} )); then
+  [[ "$PROFILE" == "production" ]] && die "no signer address for ${unbound[*]}: set signer.address (audit round 7, H7-3 — without it any Sign-token holder can freeze transfers)"
+  warn "no signer address for ${unbound[*]}: the sig-store will accept signatures for any address from any Sign token (H7-3). Set signer.address."
+  SIGNER_BINDINGS=""
+fi
 
 IDX_CFG=""
 if [[ "$(j '.indexer.enabled')" == "true" ]]; then
@@ -961,6 +1002,8 @@ if [[ "$MODE" == "compose" ]]; then
       sign_list+="${sign_list:+,}${SIGN_LABELS[$i]}:\${${SIGN_VARS[$i]}:?set ${SIGN_VARS[$i]}}"
     done
     printf '      SIG_STORE_VALIDATOR_TOKENS: "%s"\n' "$sign_list"
+    # H7-3: which address each of those tokens may sign as. Public, so inline.
+    [[ -n "$SIGNER_BINDINGS" ]] && printf '      SIG_STORE_VALIDATOR_SIGNERS: "%s"\n' "$SIGNER_BINDINGS"
     for role in KEEPER READER ADMIN INDEXER; do
       printf '      SIG_STORE_%s_TOKEN: "${SIG_STORE_%s_TOKEN:?set SIG_STORE_%s_TOKEN}"\n' "$role" "$role" "$role"
     done
@@ -1305,6 +1348,7 @@ if [[ "$(j '.sig_store.enabled')" == "true" ]]; then
   # The Sign tokens reach the sig-store alone, through a subshell (M7-11).
   (
     export SIG_STORE_VALIDATOR_TOKENS="$SIGN_LIST"
+    [[ -n "$SIGNER_BINDINGS" ]] && export SIG_STORE_VALIDATOR_SIGNERS="$SIGNER_BINDINGS"
     [[ -n "$LEGACY_VALIDATOR_TOKEN" ]] && export SIG_STORE_VALIDATOR_TOKEN="$LEGACY_VALIDATOR_TOKEN"
     spawn sig-store.log sig-store "sig-store --bind $STORE_BIND" -- "$BIN_DIR/sig-store" --bind "$STORE_BIND"
   )
