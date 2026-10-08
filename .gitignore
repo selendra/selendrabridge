@@ -40,6 +40,7 @@ sig-*
 /.xswap-logs
 /.swap-logs
 /.refund-e2e-logs
+/.xswap-refund-logs
 /validator.toml
 /validator-p6.toml
 /val1-p7.toml

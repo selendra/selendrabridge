@@ -154,6 +154,24 @@ contract SwapRouter is ReentrancyGuard {
     ///         refills the amount, and the sweep takes it.
     uint256 public stableSettledOut;
 
+    /// @notice Who a refunded swap-and-bridge belongs to, and how much stable it
+    ///         returns (audit 2026-10-02, H7-4).
+    ///
+    /// @dev    The router calls `Gate.send`, so the gate's `sentBy` is the ROUTER,
+    ///         and a cancelled transfer's two-phase refund pays the stable back
+    ///         into this contract, not to the user. Nothing recorded the user, so
+    ///         the funds sat here (excluded from {owedStable}, refused by
+    ///         {rescue}) until the owner's 48 h stable rescue, while the UI showed
+    ///         "refunded". Written at send time from `msg.sender` and the exact
+    ///         amount locked; {forwardRefund} pays it out once the gate shows the
+    ///         refund, to this address and nowhere else.
+    struct RefundClaim {
+        address to;
+        uint256 amount;
+    }
+
+    mapping(bytes32 submissionId => RefundClaim) public refundOf;
+
     /// @notice How long a blocked destination swap is retried before the router
     ///         may deliver the carrier stable instead.
     ///
@@ -283,6 +301,8 @@ contract SwapRouter is ReentrancyGuard {
     event StableRescueScheduled(uint256 amount, address indexed to, uint256 readyAt);
     event StableRescueCancelled(address indexed by);
     event StableRescued(uint256 amount, address indexed to);
+    /// @dev a refunded swap-and-bridge's stable was returned to its sender (H7-4).
+    event RefundForwarded(bytes32 indexed submissionId, address indexed to, uint256 amount);
 
     // --- errors ---
     error NotOwner();
@@ -307,6 +327,11 @@ contract SwapRouter is ReentrancyGuard {
     error StableRescueNotScheduled();
     error StableRescueNotReady(uint256 readyAt);
     error StableRescueExpired(uint256 readyAt);
+    /// @dev {forwardRefund}: this router recorded no refund for the id, or it was
+    ///      already forwarded.
+    error NoRefundOwed(bytes32 submissionId);
+    /// @dev {forwardRefund}: the gate has not refunded the id (yet).
+    error NotRefunded(bytes32 submissionId);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -417,6 +442,10 @@ contract SwapRouter is ReentrancyGuard {
         // Leg 2: bridge the stable to the peer router on the destination chain.
         IERC20(stable).forceApprove(address(gate), stableOut);
         submissionId = gate.send(stable, stableOut, chainIdTo, receiver, abi.encode(ap));
+        // H7-4: if this transfer is cancelled on the destination, the gate's
+        // refund pays THIS router (its `sentBy`). Record whose it is. `stableOut`
+        // is a whole number of bridge units, so the refund returns exactly it.
+        refundOf[submissionId] = RefundClaim({to: msg.sender, amount: stableOut});
 
         emit SwapBridged(
             submissionId, msg.sender, tokenIn, amountIn, stableOut, chainIdTo, finalToken, finalReceiver
@@ -467,7 +496,8 @@ contract SwapRouter is ReentrancyGuard {
         // stranded transfer so it can be refunded on the source chain. In that
         // case no stable ever reached this router, so settling would pay the
         // receiver out of another transfer's in-flight liquidity — while the
-        // source chain separately refunds the original sender. Both legs must be
+        // source router forwards the refund to the original sender (H7-4,
+        // {forwardRefund}). Both legs must be
         // checked together.
         if (!gate.executed(submissionId) || gate.cancelled(submissionId)) {
             revert NotDelivered(submissionId);
@@ -562,6 +592,54 @@ contract SwapRouter is ReentrancyGuard {
         } else if (owedAlready == 0) {
             owedStable += amount;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Source leg, refunded: return the stable to the user (H7-4)
+    // ---------------------------------------------------------------------
+
+    /// @notice Pay a refunded swap-and-bridge's stable to the address that sent
+    ///         it. Permissionless: the payee and amount were fixed at
+    ///         {swapAndBridge}, and the refund is proven by `Gate.refunded`.
+    /// @dev    The user gets the carrier stable back, not their original
+    ///         `tokenIn`: the source swap already ran, and re-swapping at today's
+    ///         price would hand them a different risk than the one refunded.
+    function forwardRefund(bytes32 submissionId) public nonReentrant {
+        _forwardRefund(submissionId);
+    }
+
+    /// @notice Run the gate's refund for a swap-and-bridge sent through this
+    ///         router and forward the stable in the same transaction, so it never
+    ///         rests here. Same arguments as `Gate.refund`, without `token` (it is
+    ///         always the stable). Anyone may call it; the gate checks the quorum.
+    function refundAndForward(
+        bytes32 debridgeId,
+        uint256 amount,
+        uint8 bridgeDecimals,
+        uint256 chainIdTo,
+        uint256 nonce,
+        bytes calldata receiver,
+        bytes calldata autoParams,
+        bytes calldata nativeSender,
+        bytes[] calldata signatures
+    ) external nonReentrant returns (bytes32 submissionId) {
+        submissionId = gate.refund(
+            stable, debridgeId, amount, bridgeDecimals, chainIdTo, nonce, receiver, autoParams, nativeSender, signatures
+        );
+        _forwardRefund(submissionId);
+    }
+
+    function _forwardRefund(bytes32 submissionId) internal {
+        RefundClaim memory r = refundOf[submissionId];
+        if (r.to == address(0)) revert NoRefundOwed(submissionId);
+        if (!gate.refunded(submissionId)) revert NotRefunded(submissionId);
+        delete refundOf[submissionId];
+        // M7-2 invariant (see {stableSettledOut}): stable leaving on a user's
+        // behalf debits a pending rescue's cap, or a later arrival could refill
+        // what this took out and be swept.
+        stableSettledOut += r.amount;
+        IERC20(stable).safeTransfer(r.to, r.amount);
+        emit RefundForwarded(submissionId, r.to, r.amount);
     }
 
     // ---------------------------------------------------------------------

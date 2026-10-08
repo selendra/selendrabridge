@@ -250,5 +250,23 @@ sol! {
             address finalToken,
             uint256 retryAfter
         );
+
+        // --- source leg, refunded (used by the keeper's refund loop, H7-4) ---
+        // The gate refunds a swap-and-bridge to its `sentBy` (the router); the
+        // router forwards it to the user it recorded at send time.
+        function refundAndForward(
+            bytes32 debridgeId,
+            uint256 amount,
+            uint8 bridgeDecimals,
+            uint256 chainIdTo,
+            uint256 nonce,
+            bytes receiver,
+            bytes autoParams,
+            bytes nativeSender,
+            bytes[] signatures
+        ) external returns (bytes32 submissionId);
+        function forwardRefund(bytes32 submissionId) external;
+        function refundOf(bytes32 submissionId) external view returns (address to, uint256 amount);
+        event RefundForwarded(bytes32 indexed submissionId, address indexed to, uint256 amount);
     }
 }

@@ -56,6 +56,12 @@ pub struct ChainCfg {
     /// rescue's 48 h notice — and nothing did that except the user's browser.
     /// Listed explicitly rather than guessed from `autoParams`, because a
     /// finalize is a call into the receiver contract at the keeper's expense.
+    ///
+    /// On a `[[sources]]` block: the SwapRouters on this chain whose refunded
+    /// swap-and-bridges this keeper returns to the user (audit round 7, H7-4).
+    /// The gate refunds such a transfer to its `sentBy`, which is the router;
+    /// the keeper refunds through `SwapRouter.refundAndForward` instead, so the
+    /// stable reaches the user it was recorded for in the same transaction.
     #[serde(default)]
     pub routers: Vec<String>,
     /// `[[targets]]` only: skip claiming transfers smaller than this, per asset
@@ -110,11 +116,16 @@ impl Config {
                     .ok_or_else(|| anyhow::anyhow!("target {}: min_claim {id} = {min:?} is not a decimal amount", t.chain_id))?;
             }
         }
-        // The two keys only mean something on a claim target; on a refund
-        // source they would be silently ignored, which is the M-4 failure mode.
+        // `min_claim` only means something on a claim target; on a refund
+        // source it would be silently ignored, which is the M-4 failure mode.
+        // `routers` means something on both (finalize there, forward refunds
+        // here, H7-4).
         for s in &cfg.sources {
-            if !s.routers.is_empty() || !s.min_claim.is_empty() {
-                anyhow::bail!("source {}: `routers` and `min_claim` belong on a [[targets]] block", s.chain_id);
+            for r in &s.routers {
+                parse_router(r).map_err(|e| anyhow::anyhow!("source {}: routers: {e}", s.chain_id))?;
+            }
+            if !s.min_claim.is_empty() {
+                anyhow::bail!("source {}: `min_claim` belongs on a [[targets]] block", s.chain_id);
             }
         }
 
@@ -269,15 +280,20 @@ mod tests {
         }
     }
 
+    /// H7-4: `routers` on a refund source names the routers whose refunds the
+    /// keeper forwards; `min_claim` there would be ignored, so it is refused.
     #[test]
-    fn routers_on_a_source_are_rejected_not_ignored() {
-        let body = format!(
-            "{TARGET}\n[[sources]]\n\
+    fn routers_on_a_source_load_and_min_claim_there_is_rejected() {
+        let src = "\n[[sources]]\n\
              chain_id = 1337\n\
              rpc = \"http://127.0.0.1:8545\"\n\
-             gate = \"0x0000000000000000000000000000000000000002\"\n\
-             routers = [\"0x00000000000000000000000000000000000000Ab\"]\n"
-        );
+             gate = \"0x0000000000000000000000000000000000000002\"\n";
+        let body = format!("{TARGET}{src}routers = [\"0x00000000000000000000000000000000000000Ab\"]\n");
+        let c = Config::from_toml(&cfg(&body)).expect("routers on a source load");
+        assert_eq!(c.sources[0].router_addresses().len(), 1);
+        let bad = format!("{TARGET}{src}routers = [\"0xnope\"]\n");
+        assert!(Config::from_toml(&cfg(&bad)).is_err());
+        let body = format!("{TARGET}{src}[sources.min_claim]\n\"{DID}\" = \"1\"\n");
         let err = Config::from_toml(&cfg(&body)).unwrap_err().to_string();
         assert!(err.contains("[[targets]]"), "{err}");
     }

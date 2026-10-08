@@ -1262,4 +1262,123 @@ contract SwapRouterTest is Test {
         routerB.executeStableRescue();
         assertEq(usdB.balanceOf(address(this)), before + 5e6, "dust still sweepable");
     }
+
+    // ------------------------------------------------------------------
+    // H7-4: a refunded swap-and-bridge reaches the user, not the router
+    // ------------------------------------------------------------------
+
+    /// Cancel `leg` on B, return its refund-attestation signatures for A.
+    function _cancelOnB(Leg memory leg) internal returns (bytes[] memory refundSigs) {
+        vm.chainId(CHAIN_B);
+        gateB.cancel(
+            leg.debridgeId, leg.amount, 6, CHAIN_A, leg.nonce, leg.receiver, leg.autoParams,
+            leg.nativeSender, _sign(v1pk, BridgeHash.getCancelId(leg.id))
+        );
+        refundSigs = _sign(v1pk, BridgeHash.getRefundId(leg.id));
+        vm.chainId(CHAIN_A);
+    }
+
+    function _gateRefund(Leg memory leg, bytes[] memory sigs) internal {
+        gateA.refund(
+            address(usdA), leg.debridgeId, leg.amount, 6, CHAIN_B, leg.nonce,
+            leg.receiver, leg.autoParams, leg.nativeSender, sigs
+        );
+    }
+
+    /// The finding, now fixed: `Gate.refund` still pays its `sentBy` (the
+    /// router), and anyone can then forward it to the user who sent it.
+    function test_H7_4_APlainGateRefundIsForwardedToTheSender() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        (address to, uint256 owed) = routerA.refundOf(leg.id);
+        assertEq(to, user, "payee is the swap-and-bridge caller");
+        assertEq(owed, leg.amount, "exactly the stable locked");
+        assertEq(gateA.sentBy(leg.id), address(routerA), "the gate's sender is the router");
+
+        bytes[] memory sigs = _cancelOnB(leg);
+        // Not refunded yet: nothing to forward.
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.NotRefunded.selector, leg.id));
+        routerA.forwardRefund(leg.id);
+
+        _gateRefund(leg, sigs);
+        assertEq(usdA.balanceOf(address(routerA)), leg.amount, "the gate refunded into the router");
+
+        vm.prank(address(0xCAFE)); // permissionless
+        routerA.forwardRefund(leg.id);
+        assertEq(usdA.balanceOf(user), leg.amount, "user got the stable back");
+        assertEq(usdA.balanceOf(address(routerA)), 0, "nothing rests at the router");
+        assertEq(routerA.stableSettledOut(), leg.amount, "M7-2: the payout debits a rescue cap");
+
+        // Once only.
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.NoRefundOwed.selector, leg.id));
+        routerA.forwardRefund(leg.id);
+    }
+
+    /// The keeper's path: refund and forward in one transaction.
+    function test_H7_4_RefundAndForwardIsAtomic() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        bytes[] memory sigs = _cancelOnB(leg);
+        bytes32 got = routerA.refundAndForward(
+            leg.debridgeId, leg.amount, 6, CHAIN_B, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, sigs
+        );
+        assertEq(got, leg.id);
+        assertTrue(gateA.refunded(leg.id));
+        assertEq(usdA.balanceOf(user), leg.amount, "user repaid");
+        assertEq(usdA.balanceOf(address(routerA)), 0);
+        (address to,) = routerA.refundOf(leg.id);
+        assertEq(to, address(0), "claim consumed");
+    }
+
+    /// A forward needs a real refund: a stable balance at the router (another
+    /// transfer's, or donated) is not one, and an unknown id owes nothing.
+    function test_H7_4_NoForwardWithoutTheGatesRefund() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        usdA.mint(address(routerA), leg.amount);
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.NotRefunded.selector, leg.id));
+        routerA.forwardRefund(leg.id);
+        bytes32 stranger = keccak256("not a router send");
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.NoRefundOwed.selector, stranger));
+        routerA.forwardRefund(stranger);
+        // Without the quorum the gate refuses, and so does the wrapper.
+        bytes[] memory bad = _sign(0xBAD, BridgeHash.getRefundId(leg.id));
+        vm.expectRevert();
+        routerA.refundAndForward(
+            leg.debridgeId, leg.amount, 6, CHAIN_B, leg.nonce, leg.receiver, leg.autoParams, leg.nativeSender, bad
+        );
+    }
+
+    /// Two users' refunds go to each, not crossed, whatever the order.
+    function test_H7_4_EachRefundGoesToItsOwnSender() public {
+        address alice = address(0xA11);
+        address bob = address(0xB0B0);
+        Leg memory a = _legFor(alice, finalReceiver, 1e18, 0);
+        Leg memory b = _legFor(bob, finalReceiver, 2e18, 1);
+        bytes[] memory sa = _cancelOnB(a);
+        bytes[] memory sb = _cancelOnB(b);
+        routerA.refundAndForward(
+            b.debridgeId, b.amount, 6, CHAIN_B, b.nonce, b.receiver, b.autoParams, b.nativeSender, sb
+        );
+        _gateRefund(a, sa);
+        routerA.forwardRefund(a.id);
+        assertEq(usdA.balanceOf(alice), a.amount);
+        assertEq(usdA.balanceOf(bob), b.amount);
+        assertEq(usdA.balanceOf(address(routerA)), 0);
+    }
+
+    /// A refunded-but-unforwarded stable is not the owner's to sweep for free:
+    /// forwarding it inside the notice window debits the cap (M7-2), so the
+    /// matured rescue cannot then take a later arrival in its place.
+    function test_H7_4_ForwardingInsideARescueWindowDebitsTheCap() public {
+        Leg memory leg = _sourceLeg(1e18, address(tt), 0);
+        _gateRefund(leg, _cancelOnB(leg)); // stable now at routerA, reads as free
+        routerA.scheduleStableRescue(leg.amount, address(this));
+        (,, uint256 readyAt,,,) = routerA.pendingStableRescue();
+
+        routerA.forwardRefund(leg.id); // the user is paid inside the window
+        usdA.mint(address(routerA), leg.amount); // a later arrival refills the balance
+
+        vm.warp(readyAt);
+        vm.expectRevert(abi.encodeWithSelector(SwapRouter.RescueWouldTakeOwedFunds.selector, leg.amount, 0));
+        routerA.executeStableRescue();
+        assertEq(usdA.balanceOf(user), leg.amount);
+    }
 }

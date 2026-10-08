@@ -36,7 +36,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use bridge_core::abi::Gate;
+use bridge_core::abi::{Gate, SwapRouter};
 use bridge_core::allow::AllowlistPolicy;
 use bridge_core::backend::StoreBackend;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
@@ -662,6 +662,11 @@ async fn run_source_refunds(
     let mut pending = PendingTxs::default();
     // Reported-once memo, as in the claim loop.
     let mut stranded = StrandedLog::default();
+    // H7-4: routers on this chain whose refunds go back to the user they recorded.
+    let routers: HashSet<Address> = src.router_addresses().into_iter().collect();
+    if !routers.is_empty() {
+        info!(chain_id = src.chain_id, routers = ?routers, "refunding swap-and-bridges through these routers");
+    }
 
     loop {
         view.refresh_if_stale(&gate).await;
@@ -709,7 +714,7 @@ async fn run_source_refunds(
             if !pending.may_submit(&provider, &rec.submission_id, SigKind::Refund).await {
                 continue;
             }
-            match try_refund(&gate, &rec, &refund_sigs, &submitter).await {
+            match try_refund(&gate, &rec, &refund_sigs, &submitter, &routers).await {
                 // As with cancel, the indexer records `refund_status = refunded`
                 // from the observed on-chain `Refunded` event; the keeper does not
                 // report a state that gates the candidate list.
@@ -1637,21 +1642,41 @@ async fn try_cancel<P: Provider>(
 /// Submit `refund()` on the source. `None` if already refunded, if this gate
 /// never emitted the id, or if we don't know which token was locked.
 ///
+/// A transfer sent through one of `routers` (its `sentBy`) is refunded through
+/// `SwapRouter.refundAndForward`, so the stable reaches the user the router
+/// recorded rather than resting in the router (audit round 7, H7-4). One the
+/// gate already refunded straight into a router is forwarded.
+///
 /// `sigs` MUST already be validator-filtered — see [`try_claim`].
-async fn try_refund<P: Provider>(
+async fn try_refund<P: Provider + Clone>(
     gate: &Gate::GateInstance<P>,
     rec: &SubmissionRecord,
     sigs: &[SignerSig],
     submitter: &Submitter,
+    routers: &HashSet<Address>,
 ) -> anyhow::Result<Option<String>> {
     let submission_id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
     if gate.refunded(submission_id).call().await? {
-        return Ok(None);
+        // Someone refunded through the gate directly: if a router still holds
+        // the stable for its user, forward it. `sentBy` is cleared on refund, so
+        // the router is read from `native_sender` — the router's own `refundOf`
+        // is what decides whether anything is owed.
+        let Some(router) = Address::from_str(&rec.native_sender).ok().filter(|a| routers.contains(a)) else {
+            return Ok(None);
+        };
+        let r = SwapRouter::new(router, gate.provider().clone());
+        if r.refundOf(submission_id).call().await?.to == Address::ZERO {
+            return Ok(None);
+        }
+        info!(submission_id = %rec.submission_id, %router, "forwarding a refund the router is holding for its user");
+        let call = r.forwardRefund(submission_id);
+        return confirm(call, "forwardRefund", &rec.submission_id, "REFUND FORWARDED", submitter).await.map(Some);
     }
     // `sentBy` is the gate's own record that it locked these funds; zero means
     // there is nothing to return (and `refund()` would revert with NotSent).
-    if gate.sentBy(submission_id).call().await? == Address::ZERO {
+    let sent_by = gate.sentBy(submission_id).call().await?;
+    if sent_by == Address::ZERO {
         return Ok(None);
     }
 
@@ -1670,6 +1695,40 @@ async fn try_refund<P: Provider>(
     let debridge_id = B256::from_str(&rec.debridge_id).context("bad debridge_id")?;
     let amount = U256::from_str(&rec.amount).context("bad amount")?;
 
+    let bridge_decimals = rec.bridge_decimals.context("record has no bridge_decimals")?;
+    if routers.contains(&sent_by) {
+        info!(
+            submission_id = %rec.submission_id,
+            router = %sent_by,
+            sigs = sigs.len(),
+            "submitting refundAndForward() — returning a swap-and-bridge's stable to its sender"
+        );
+        let router = SwapRouter::new(sent_by, gate.provider().clone());
+        let call = router.refundAndForward(
+            debridge_id,
+            amount,
+            bridge_decimals,
+            U256::from(rec.chain_id_to),
+            U256::from(rec.nonce),
+            bytes_of(&rec.receiver)?,
+            bytes_of(&rec.auto_params)?,
+            bytes_of(&rec.native_sender)?,
+            sorted_signatures(sigs)?,
+        );
+        return confirm(call, "refundAndForward", &rec.submission_id, "REFUNDED", submitter).await.map(Some);
+    }
+    if !routers.is_empty() && is_contract_sender(gate.provider(), sent_by).await {
+        // Not ours to second-guess: refund as the gate says. But a contract
+        // sender we were not told about may be a router holding its user's
+        // funds — say so before the refund lands there.
+        warn!(
+            submission_id = %rec.submission_id,
+            sent_by = %sent_by,
+            "refunding to a contract that is not a configured router; if it is a SwapRouter, \
+             add it to this source's `routers` so the stable is forwarded to its user (H7-4)"
+        );
+    }
+
     info!(
         submission_id = %rec.submission_id,
         sigs = sigs.len(),
@@ -1680,7 +1739,7 @@ async fn try_refund<P: Provider>(
         token,
         debridge_id,
         amount,
-        rec.bridge_decimals.context("record has no bridge_decimals")?,
+        bridge_decimals,
         U256::from(rec.chain_id_to),
         U256::from(rec.nonce),
         bytes_of(&rec.receiver)?,
@@ -1689,6 +1748,12 @@ async fn try_refund<P: Provider>(
         sorted_signatures(sigs)?,
     );
     confirm(call, "refund", &rec.submission_id, "REFUNDED", submitter).await.map(Some)
+}
+
+/// Does `addr` hold code? A read failure counts as "no": this only decides
+/// whether to warn.
+async fn is_contract_sender<P: Provider>(provider: &P, addr: Address) -> bool {
+    provider.get_code_at(addr).await.map(|c| !c.is_empty()).unwrap_or(false)
 }
 
 /// The keeper's live view of one gate: the signature `threshold`, the

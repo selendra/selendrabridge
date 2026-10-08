@@ -567,6 +567,11 @@ for idx in $(j '[.keepers[] | select(.enabled != false)] | to_entries[].key'); d
         echo "rpc = $(tstr "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")")"
         echo "gate = $(tstr "$(cf "$cid" gate)")"
         echo "poll_interval_ms = $poll"
+        # H7-4: a refunded swap-and-bridge is paid to its `sentBy`, this
+        # chain's SwapRouter; the keeper refunds it through the router so the
+        # stable is forwarded to the user the router recorded.
+        router="$(jr ".chains[] | select(.chain_id == $cid) | .router")"
+        [[ -n "$router" ]] && echo "routers = [$(tstr "$router")]"
       done
     fi
   } > "$cfg"
