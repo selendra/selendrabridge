@@ -33,7 +33,11 @@ fn token() -> Address {
 
 /// A well-formed record with a run-unique nonce and no signatures.
 fn record(chain_to: u64) -> SubmissionRecord {
-    let debridge_id = bridge_core::debridge_id(U256::from(1337u64), token());
+    record_from(1337, chain_to)
+}
+
+fn record_from(chain_from: u64, chain_to: u64) -> SubmissionRecord {
+    let debridge_id = bridge_core::debridge_id(U256::from(chain_from), token());
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
     let receiver = Address::repeat_byte(0xAB).to_vec();
     let domain = B256::repeat_byte(0xD0);
@@ -42,7 +46,7 @@ fn record(chain_to: u64) -> SubmissionRecord {
         debridge_id,
         6,
         U256::from(100u64),
-        U256::from(1337u64),
+        U256::from(chain_from),
         U256::from(chain_to),
         U256::from(nonce),
         &receiver,
@@ -53,7 +57,7 @@ fn record(chain_to: u64) -> SubmissionRecord {
         debridge_id: format!("{debridge_id:#x}"),
         amount: "100".into(),
         bridge_decimals: Some(6),
-        chain_id_from: 1337,
+        chain_id_from: chain_from,
         chain_id_to: chain_to,
         nonce,
         receiver: format!("0x{}", hex::encode(&receiver)),
@@ -330,4 +334,77 @@ async fn oversized_or_hostile_text_is_refused_at_the_db_layer() {
     let mut wide = record(820_001);
     wide.auto_params = format!("0x{}", "ee".repeat(bridge_db::MAX_AUTO_PARAMS_BYTES + 1));
     assert!(db.observe_submission(wide).await.unwrap_err().is_client_error());
+}
+
+// --- H7-5: the refund queue ---------------------------------------------------
+
+async fn all_candidates(db: &Db) -> Vec<String> {
+    db.refund_candidates(1_000_000, 0, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.submission_id)
+        .collect()
+}
+
+/// A chain id no other test uses, so marking it indexed changes nothing else.
+fn private_chain() -> u64 {
+    8_000_000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1_000_000) as u64
+}
+
+#[tokio::test]
+async fn on_an_indexed_source_only_an_observed_sent_is_nominated_for_refund() {
+    let Some((db, _g)) = live_db().await else { return };
+    let indexed = private_chain();
+    db.set_cursor(indexed, 1).await.unwrap();
+    let stranger = PrivateKeySigner::random();
+
+    // Posted, never emitted: the junk H7-5 filled the queue with.
+    let junk = record_from(indexed, 1338);
+    db.upsert_signature(junk.clone(), sign(&stranger, &junk.submission_id, SigKind::Transfer)).await.unwrap();
+    // Posted by a validator, then seen on-chain by the indexer.
+    let real = record_from(indexed, 1338);
+    db.upsert_signature(real.clone(), sign(&stranger, &real.submission_id, SigKind::Transfer)).await.unwrap();
+    db.observe_submission(real.clone()).await.unwrap();
+    // From a chain no indexer reads (a Solana source): still refundable.
+    let unindexed = record_from(private_chain() + 1, 1338);
+    db.upsert_signature(unindexed.clone(), sign(&stranger, &unindexed.submission_id, SigKind::Transfer)).await.unwrap();
+
+    db.sweep_refund_eligible(chrono::Duration::seconds(-1)).await.unwrap();
+    let got = all_candidates(&db).await;
+    assert!(!got.contains(&junk.submission_id), "a row no chain emitted is never nominated");
+    assert!(got.contains(&real.submission_id), "an observed transfer is");
+    assert!(got.contains(&unindexed.submission_id), "a source no indexer reads keeps the old rule");
+
+    // Observed later — e.g. the indexer was behind — it joins the queue then.
+    db.observe_submission(junk.clone()).await.unwrap();
+    db.sweep_refund_eligible(chrono::Duration::seconds(-1)).await.unwrap();
+    assert!(all_candidates(&db).await.contains(&junk.submission_id));
+}
+
+#[tokio::test]
+async fn the_refund_queue_walks_by_keyset_from_the_last_id_seen() {
+    let Some((db, _g)) = live_db().await else { return };
+    let mut mine = Vec::new();
+    for _ in 0..3 {
+        let rec = record(1338);
+        db.observe_submission(rec.clone()).await.unwrap();
+        mine.push(rec.submission_id);
+    }
+    db.sweep_refund_eligible(chrono::Duration::seconds(-1)).await.unwrap();
+
+    let all = all_candidates(&db).await;
+    let pos: Vec<usize> = mine.iter().map(|id| all.iter().position(|c| c == id).expect("queued")).collect();
+    // Resuming after the first of ours yields exactly what follows it.
+    let after = db.refund_candidates(1_000_000, 0, Some(&all[pos[0]])).await.unwrap();
+    let after: Vec<String> = after.into_iter().map(|r| r.submission_id).collect();
+    assert_eq!(after, all[pos[0] + 1..].to_vec());
+    // One page of one, twice, walks the next two in order.
+    let next = db.refund_candidates(1, 0, Some(&all[pos[0]])).await.unwrap();
+    assert_eq!(next[0].submission_id, all[pos[0] + 1]);
+    let next2 = db.refund_candidates(1, 0, Some(&next[0].submission_id)).await.unwrap();
+    assert_eq!(next2[0].submission_id, all[pos[0] + 2]);
+    // An id the store has no row for ends the walk; the caller wraps.
+    let gone = format!("{:#x}", B256::repeat_byte(0xEE));
+    assert!(db.refund_candidates(10, 0, Some(&gone)).await.unwrap().is_empty());
 }

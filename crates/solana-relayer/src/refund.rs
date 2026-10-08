@@ -305,6 +305,12 @@ pub struct Attester {
     /// Corridors already warned about (no reader / no timeout), so the log says
     /// it once per submission rather than every poll.
     warned: Mutex<HashSet<String>>,
+    /// Where the next tick's walk of the candidate queue resumes (audit round 7,
+    /// H7-5): the last id the previous tick reached, `None` for the head. A walk
+    /// from the head every tick, capped at `MAX_REFUND_PAGES`, never reached a
+    /// row queued behind 10,000 that never leave. Mirrors
+    /// `bridge_core::backend::RefundCursor`.
+    cursor: Mutex<Option<String>>,
 }
 
 impl Attester {
@@ -340,6 +346,7 @@ impl Attester {
             timeout_secs: refund.map(|r| r.timeout_secs),
             evm,
             warned: Mutex::new(HashSet::new()),
+            cursor: Mutex::new(None),
         })
     }
 
@@ -374,17 +381,31 @@ impl Attester {
     }
 
     async fn tick(&self) -> anyhow::Result<()> {
-        // Walk the queue a page at a time (audit 2026-09-16, H-6); a short page
-        // is the end of it.
+        // Walk the queue a page at a time (audit 2026-09-16, H-6), from where
+        // the previous tick stopped (H7-5); a short page is the end of it, and
+        // the next tick starts again at the head. A failed page leaves the
+        // cursor where it was.
+        let mut after = self.cursor.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut candidates: Vec<SubmissionRecord> = Vec::new();
-        for p in 0..MAX_REFUND_PAGES {
-            let page = self.store.refund_candidates(REFUND_PAGE, p * REFUND_PAGE).await?;
+        let mut reached_end = false;
+        for _ in 0..MAX_REFUND_PAGES {
+            let page = self.store.refund_candidates(REFUND_PAGE, after.as_deref()).await?;
             let short = (page.len() as u64) < REFUND_PAGE;
+            if let Some(last) = page.last() {
+                after = Some(last.submission_id.clone());
+            }
             candidates.extend(page);
             if short {
+                reached_end = true;
                 break;
             }
         }
+        if !reached_end {
+            warn!(pages = MAX_REFUND_PAGES, page_size = REFUND_PAGE,
+                  "refund queue exceeds one tick's walk; resuming from here next tick");
+        }
+        *self.cursor.lock().unwrap_or_else(|p| p.into_inner()) =
+            if reached_end { None } else { after };
 
         for rec in candidates {
             // L7-7: the corridor below routes every read, so it must be the one

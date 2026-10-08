@@ -515,6 +515,17 @@ struct Marker<'a> {
     refund_status: Option<&'a str>,
 }
 
+/// The refund-queue filter for a submissions row aliased `s` (audit round 7,
+/// H7-5): the indexer saw its `Sent`, OR its source is a chain no indexer in
+/// this deployment reads.
+///
+/// The second arm keeps Solana-source transfers refundable — no EVM indexer
+/// reads Solana, so nothing can set `sent_observed_at` for them — and leaves a
+/// deployment without an indexer exactly as it was. A chain counts as indexed
+/// once the indexer has saved a cursor for it.
+const VOUCHED: &str = "(s.sent_observed_at IS NOT NULL OR NOT EXISTS \
+     (SELECT 1 FROM indexer_cursors c WHERE c.chain_id = s.chain_id_from))";
+
 /// What a lifecycle write does when it names a submission with no row yet.
 ///
 /// The two callers differ, and the difference is the whole of M-4. The EVM
@@ -1240,6 +1251,15 @@ impl Db {
 
         let id = norm_id(&record.submission_id);
         insert_submission_row(&self.pool, &id, &record).await?;
+        // H7-5: this is the only write that vouches the transfer exists on-chain.
+        // Set on the existing row too: a validator's POST usually creates it first.
+        sqlx::query(
+            "UPDATE submissions SET sent_observed_at = now() \
+             WHERE submission_id = $1 AND sent_observed_at IS NULL",
+        )
+        .bind(&id)
+        .execute(&self.pool)
+        .await?;
         // A `Claimed`/`Cancelled`/`Refunded` may have been observed on the other
         // chain before this row existed; fold it in now.
         self.apply_pending_lifecycle(&id).await?;
@@ -1491,12 +1511,15 @@ impl Db {
     /// A validator independently re-checks the destination gate (`executed` must
     /// still be false) before it will attest a cancel, so a wrong or manipulated
     /// timestamp here can at most cause a needless look, never a payout.
+    ///
+    /// Only [`VOUCHED`] rows are nominated (audit round 7, H7-5).
     pub async fn sweep_refund_eligible(&self, timeout: chrono::Duration) -> Result<u64, DbError> {
         let cutoff = chrono::Utc::now() - timeout;
-        let res = sqlx::query(
-            "UPDATE submissions SET refund_status = 'eligible', updated_at = now() \
-             WHERE status <> 'claimed' AND refund_status = 'none' AND created_at < $1",
-        )
+        let res = sqlx::query(&format!(
+            "UPDATE submissions s SET refund_status = 'eligible', updated_at = now() \
+             WHERE s.status <> 'claimed' AND s.refund_status = 'none' AND s.created_at < $1 \
+               AND {VOUCHED}"
+        ))
         .bind(cutoff)
         .execute(&self.pool)
         .await?;
@@ -1510,25 +1533,46 @@ impl Db {
     /// still verify both chains on-chain before signing anything.
     ///
     /// PAGED (audit 2026-09-16, H-6). This queue is polled by every validator's
-    /// refund loop on every tick, and the eligibility sweep adds to it any aged
-    /// row regardless of whether it describes a deliverable transfer. Unbounded,
-    /// one `Sign` credential could grow the response past the client's 8 MiB cap
-    /// and wedge every refund loop in the fleet permanently. `ORDER BY` is made
-    /// total with `submission_id` so a walk cannot skip or repeat a row when
-    /// timestamps collide.
+    /// refund loop on every tick. Unbounded, one `Sign` credential could grow the
+    /// response past the client's 8 MiB cap and wedge every refund loop in the
+    /// fleet permanently. `ORDER BY` is made total with `submission_id` so a walk
+    /// cannot skip or repeat a row when timestamps collide.
+    ///
+    /// ## Starvation (audit round 7, H7-5)
+    ///
+    /// Paging alone did not make the queue safe. Each loop walked from offset 0
+    /// and stopped after 10,000 rows, so 10,000 rows that no chain ever emitted —
+    /// posted with a `Sign` credential, aged past the timeout, never claimed,
+    /// never refunded — filled every walk, and no genuine stuck transfer created
+    /// after them was ever examined. Two changes close it:
+    ///
+    ///   * an `'eligible'` row is served only if it is [`VOUCHED`], so on an
+    ///     indexed source a row nobody sent never enters the queue at all;
+    ///   * `after` walks by keyset from the last id a caller saw, so a caller
+    ///     resumes where its previous tick stopped and wraps at the end, instead
+    ///     of re-reading the same head forever. `offset` is kept for older
+    ///     clients and applies after `after`.
+    ///
+    /// A `'cancelled'` row is served unconditionally: only an observed on-chain
+    /// burn puts it there, and that burn needed a cancel quorum.
     pub async fn refund_candidates(
         &self,
         limit: i64,
         offset: i64,
+        after: Option<&str>,
     ) -> Result<Vec<SubmissionRecord>, DbError> {
-        let rows: Vec<SubmissionRow> = sqlx::query_as(
-            "SELECT * FROM submissions \
-             WHERE status <> 'claimed' AND refund_status IN ('eligible','cancelled') \
-             ORDER BY created_at, submission_id \
-             LIMIT $1 OFFSET $2",
-        )
+        let rows: Vec<SubmissionRow> = sqlx::query_as(&format!(
+            "SELECT s.* FROM submissions s \
+             WHERE s.status <> 'claimed' \
+               AND (s.refund_status = 'cancelled' OR (s.refund_status = 'eligible' AND {VOUCHED})) \
+               AND ($3::TEXT IS NULL OR (s.created_at, s.submission_id) > \
+                    (SELECT a.created_at, a.submission_id FROM submissions a WHERE a.submission_id = $3)) \
+             ORDER BY s.created_at, s.submission_id \
+             LIMIT $1 OFFSET $2"
+        ))
         .bind(limit)
         .bind(offset)
+        .bind(after.map(norm_id))
         .fetch_all(&self.pool)
         .await?;
 

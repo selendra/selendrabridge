@@ -200,3 +200,29 @@ CREATE TABLE IF NOT EXISTS pending_finalize (
     finalize_fallback   BOOLEAN     NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Audit round 7, H7-5: when the indexer saw this transfer's `Sent` on-chain.
+--
+-- `submissions` has two writers: the indexer (from a `Sent` it read) and any
+-- `Sign`-scoped POST. The refund sweep used to nominate every aged unclaimed
+-- row from either, so rows no chain ever emitted sat in the refund queue for
+-- good, ahead of every genuine stuck transfer created after them. A row whose
+-- source chain this deployment indexes is now nominated only once this is set
+-- (see `Db::sweep_refund_eligible`).
+--
+-- Added once, and on that one run every EXISTING row is backfilled as observed:
+-- the indexer never rescans, so leaving them NULL would strand every stuck
+-- transfer written before the upgrade. Later runs never backfill, so a row a
+-- POST creates from here on is unobserved until the indexer sees its `Sent`.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'submissions' AND column_name = 'sent_observed_at'
+    ) THEN
+        ALTER TABLE submissions ADD COLUMN sent_observed_at TIMESTAMPTZ;
+        UPDATE submissions SET sent_observed_at = created_at;
+    END IF;
+END $$;
+-- The refund queue is walked by keyset on (created_at, submission_id).
+CREATE INDEX IF NOT EXISTS idx_submissions_created ON submissions (created_at, submission_id);

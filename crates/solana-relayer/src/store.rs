@@ -142,16 +142,19 @@ impl Store {
     /// Paged: the queue is unbounded and the store is untrusted, so an unpaged
     /// fetch can be grown until it fails on every tick (audit 2026-09-16, H-6).
     /// Callers walk pages — see [`REFUND_PAGE`].
+    ///
+    /// `after` is the keyset cursor — the last `submission_id` of the previous
+    /// page, `None` for the head (audit round 7, H7-5); see `refund::Attester`.
     pub async fn refund_candidates(
         &self,
         limit: u64,
-        offset: u64,
+        after: Option<&str>,
     ) -> anyhow::Result<Vec<SubmissionRecord>> {
-        let res = self
-            .client
-            .get(format!("{}/refund-candidates?limit={limit}&offset={offset}", self.base))
-            .send()
-            .await?;
+        let mut url = format!("{}/refund-candidates?limit={limit}", self.base);
+        if let Some(after) = after {
+            url.push_str(&format!("&after={after}"));
+        }
+        let res = self.client.get(url).send().await?;
         if !res.status().is_success() {
             anyhow::bail!("sig-store refund-candidates failed ({})", res.status());
         }

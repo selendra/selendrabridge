@@ -777,12 +777,28 @@ async fn post_attestation(
 /// Paged, like `/submissions` and `/history` (audit 2026-09-16, H-6): this queue
 /// is polled by every validator on every tick, and nothing bounds how many rows
 /// the eligibility sweep can put in it.
+///
+/// `after` is a keyset cursor (audit round 7, H7-5): the last `submission_id`
+/// the caller saw. A refund loop resumes from it instead of re-reading the head
+/// of the queue every tick.
 async fn get_refund_candidates(
     State(s): State<AppState>,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<CandidateQuery>,
 ) -> Result<Json<Vec<SubmissionRecord>>, (StatusCode, String)> {
     let (limit, offset) = page(q.limit, q.offset);
-    Ok(Json(s.db.refund_candidates(limit, offset).await.map_err(db_err)?))
+    if let Some(after) = &q.after {
+        if !bridge_core::store::is_valid_submission_id(after) {
+            return Err((StatusCode::BAD_REQUEST, "after must be a submission id".into()));
+        }
+    }
+    Ok(Json(s.db.refund_candidates(limit, offset, q.after.as_deref()).await.map_err(db_err)?))
+}
+
+#[derive(serde::Deserialize)]
+struct CandidateQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+    after: Option<String>,
 }
 
 // --- observed terminal states (Indexer scope) -----------------------------

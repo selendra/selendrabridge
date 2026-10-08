@@ -32,3 +32,7 @@ axum = { workspace = true, optional = true }
 [dev-dependencies]
 # Loopback mock server for the `remote` client's timeout/body-cap tests.
 tokio = { workspace = true }
+
+[[example]]
+name = "refund_flood"
+required-features = ["abi", "http"]

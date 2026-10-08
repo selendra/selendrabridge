@@ -37,6 +37,61 @@ pub const REFUND_PAGE: u64 = 500;
 /// than spending unbounded time and RPC budget before its first attestation.
 pub const MAX_REFUND_PAGES: u64 = 20;
 
+/// Where a refund loop's walk of the candidate queue resumes (audit round 7,
+/// H7-5).
+///
+/// A walk used to restart at the head of the queue every tick and stop after
+/// `REFUND_PAGE * MAX_REFUND_PAGES` rows, so whatever sat in the first 10,000
+/// rows was all any loop ever examined — and anything that never leaves the
+/// queue (a row no chain emitted) could hold that head for good. The cursor
+/// carries the last id a tick reached into the next one and wraps to the head
+/// once a walk reaches the end, so every row is examined within
+/// `ceil(len / (REFUND_PAGE * MAX_REFUND_PAGES))` ticks however the queue is
+/// filled.
+///
+/// Kept in memory: a restart begins one walk at the head, which costs a pass,
+/// not progress.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RefundCursor {
+    after: Option<String>,
+}
+
+/// What one tick of [`RefundCursor::walk`] produced.
+#[derive(Debug)]
+pub struct RefundWalk {
+    pub candidates: Vec<SubmissionRecord>,
+    /// The walk stopped at `MAX_REFUND_PAGES` with more queue left; the next
+    /// tick resumes there.
+    pub truncated: bool,
+}
+
+impl RefundCursor {
+    /// Walk up to [`MAX_REFUND_PAGES`] pages from where the last tick stopped.
+    /// `fetch(limit, after)` reads one page. On an error the cursor is left
+    /// where it was, so the failed page is retried next tick.
+    pub async fn walk<F, Fut, E>(&mut self, mut fetch: F) -> Result<RefundWalk, E>
+    where
+        F: FnMut(u64, Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<SubmissionRecord>, E>>,
+    {
+        let mut candidates = Vec::new();
+        for _ in 0..MAX_REFUND_PAGES {
+            let page = fetch(REFUND_PAGE, self.after.clone()).await?;
+            let short = (page.len() as u64) < REFUND_PAGE;
+            if let Some(last) = page.last() {
+                self.after = Some(last.submission_id.clone());
+            }
+            candidates.extend(page);
+            if short {
+                // The end of the queue: the next tick starts again at the head.
+                self.after = None;
+                return Ok(RefundWalk { candidates, truncated: false });
+            }
+        }
+        Ok(RefundWalk { candidates, truncated: true })
+    }
+}
+
 pub enum StoreBackend {
     /// File-per-id directory. The lock serializes the read-modify-write inside
     /// `store::upsert_signature`, so two concurrent upserts for one id cannot
@@ -157,32 +212,40 @@ impl StoreBackend {
         }
     }
 
-    /// One page of the submissions a refund loop should examine.
+    /// One page of the submissions a refund loop should examine, starting after
+    /// the `submission_id` `after` (keyset, audit round 7, H7-5), or at the head
+    /// of the queue for `None`.
     ///
     /// In file mode there is no server-side lifecycle, so every stored record is
     /// offered and the caller's own on-chain checks do all the filtering; the
-    /// page is applied client-side so both modes present the same interface.
+    /// records are ordered by id and the page applied client-side so both modes
+    /// present the same interface.
     ///
     /// Callers must WALK the pages (see [`REFUND_PAGE`]): the queue is unbounded
     /// and served by a component the design treats as untrusted, so a single
     /// unpaged fetch can be made to exceed the response cap forever (audit
-    /// 2026-09-16, H-6).
+    /// 2026-09-16, H-6). Use [`RefundCursor`] to do it.
     pub async fn refund_candidates(
         &self,
         limit: u64,
-        offset: u64,
+        after: Option<&str>,
     ) -> anyhow::Result<Vec<SubmissionRecord>> {
         match self {
             StoreBackend::File { dir, .. } => {
-                let all = store::load_all(dir)?;
+                let mut all = store::load_all(dir)?;
+                for r in &mut all {
+                    r.submission_id = r.submission_id.to_ascii_lowercase();
+                }
+                all.sort_by(|a, b| a.submission_id.cmp(&b.submission_id));
+                let after = after.map(str::to_ascii_lowercase);
                 Ok(all
                     .into_iter()
-                    .skip(offset as usize)
+                    .filter(|r| after.as_deref().is_none_or(|a| r.submission_id.as_str() > a))
                     .take(limit as usize)
                     .collect())
             }
             StoreBackend::Remote(remote) => {
-                Ok(remote.refund_candidates(limit, offset).await?)
+                Ok(remote.refund_candidates(limit, after).await?)
             }
         }
     }
@@ -270,4 +333,92 @@ pub struct StoreConfig {
     pub dir: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(n: usize) -> SubmissionRecord {
+        SubmissionRecord {
+            submission_id: format!("0x{n:064x}"),
+            bridge_domain: String::new(),
+            debridge_id: String::new(),
+            amount: "0".into(),
+            bridge_decimals: None,
+            chain_id_from: 0,
+            chain_id_to: 0,
+            nonce: 0,
+            receiver: String::new(),
+            auto_params: String::new(),
+            native_sender: String::new(),
+            token: String::new(),
+            signatures: vec![],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    /// A store serving `len` rows by keyset, like `/refund-candidates?after=`.
+    fn queue(len: usize) -> Vec<SubmissionRecord> {
+        (0..len).map(rec).collect()
+    }
+
+    async fn page(q: &[SubmissionRecord], limit: u64, after: Option<String>) -> Result<Vec<SubmissionRecord>, ()> {
+        Ok(q.iter()
+            .filter(|r| after.as_deref().is_none_or(|a| r.submission_id.as_str() > a))
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    /// H7-5: with more queue than one tick walks, the next tick resumes where
+    /// this one stopped, the walk wraps at the end, and every row is reached.
+    #[tokio::test]
+    async fn every_row_is_reached_however_long_the_queue_is() {
+        let per_tick = (REFUND_PAGE * MAX_REFUND_PAGES) as usize;
+        let q = queue(per_tick * 2 + 7);
+        let mut cursor = RefundCursor::default();
+
+        let t1 = cursor.walk(|l, a| page(&q, l, a)).await.unwrap();
+        assert!(t1.truncated);
+        assert_eq!(t1.candidates.len(), per_tick);
+        assert_eq!(t1.candidates[0].submission_id, q[0].submission_id);
+
+        let t2 = cursor.walk(|l, a| page(&q, l, a)).await.unwrap();
+        assert_eq!(t2.candidates[0].submission_id, q[per_tick].submission_id, "resumes, not restarts");
+
+        let t3 = cursor.walk(|l, a| page(&q, l, a)).await.unwrap();
+        assert!(!t3.truncated);
+        assert_eq!(t3.candidates.len(), 7, "the tail behind 2x a tick's worth is reached");
+
+        let t4 = cursor.walk(|l, a| page(&q, l, a)).await.unwrap();
+        assert_eq!(t4.candidates[0].submission_id, q[0].submission_id, "and the walk wraps to the head");
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_is_retried_from_the_same_place() {
+        let q = queue((REFUND_PAGE * MAX_REFUND_PAGES) as usize + 1);
+        let mut cursor = RefundCursor::default();
+        cursor.walk(|l, a| page(&q, l, a)).await.unwrap();
+        let before = cursor.clone();
+        let failed: Result<RefundWalk, ()> = cursor.walk(|_, _| async { Err(()) }).await;
+        assert!(failed.is_err());
+        assert_eq!(cursor, before);
+    }
+
+    #[tokio::test]
+    async fn file_mode_pages_by_id() {
+        let dir = std::env::temp_dir().join(format!("refund-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for r in queue(5) {
+            std::fs::write(dir.join(format!("{}.json", r.submission_id)), serde_json::to_string(&r).unwrap()).unwrap();
+        }
+        let b = StoreBackend::File { dir: dir.clone(), write_lock: Mutex::new(()) };
+        let first = b.refund_candidates(2, None).await.unwrap();
+        let rest = b.refund_candidates(10, Some(&first[1].submission_id)).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let ids: Vec<_> = first.iter().chain(&rest).map(|r| r.submission_id.clone()).collect();
+        assert_eq!(ids, queue(5).into_iter().map(|r| r.submission_id).collect::<Vec<_>>());
+    }
 }

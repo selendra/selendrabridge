@@ -312,13 +312,20 @@ impl RemoteStore {
     /// queue is unbounded: a full response could otherwise exceed
     /// [`MAX_RESPONSE_BYTES`] forever, which fails the loop closed on every tick
     /// with no way to make progress (audit 2026-09-16, H-6).
+    ///
+    /// `after` is the keyset cursor: the last `submission_id` of the previous
+    /// page, or `None` for the head of the queue (audit round 7, H7-5).
     pub async fn refund_candidates(
         &self,
         limit: u64,
-        offset: u64,
+        after: Option<&str>,
     ) -> Result<Vec<SubmissionRecord>, RemoteError> {
-        let url =
-            format!("{}/refund-candidates?limit={limit}&offset={offset}", self.base);
+        let mut url = format!("{}/refund-candidates?limit={limit}", self.base);
+        if let Some(after) = after {
+            // A submission id is hex, so it needs no escaping; the caller took it
+            // from a record whose id it has already validated.
+            url.push_str(&format!("&after={after}"));
+        }
         json_capped(self.client.get(url).send().await?).await
     }
 

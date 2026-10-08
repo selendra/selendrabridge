@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256};
@@ -38,7 +38,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::Context;
 use bridge_core::abi::Gate;
-use bridge_core::backend::{StoreBackend, MAX_REFUND_PAGES, REFUND_PAGE};
+use bridge_core::backend::{RefundCursor, StoreBackend, MAX_REFUND_PAGES, REFUND_PAGE};
 use bridge_core::signer::encode_signature;
 use bridge_core::store::{SigKind, SignerSig, SubmissionRecord};
 use tracing::{info, warn};
@@ -522,6 +522,57 @@ fn decide(
     Decision::AttestCancel
 }
 
+/// What [`handle_candidate`] concluded, beyond any attestation it posted.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    /// The source gate, read at a confirmed block, has no `sentBy` for this id.
+    NotSent,
+}
+
+/// First rest for a candidate the source gate says it never sent.
+const NOT_SENT_REST: Duration = Duration::from_secs(10 * 60);
+/// The longest rest: a mistaken memo can delay a refund by at most this.
+const NOT_SENT_MAX_REST: Duration = Duration::from_secs(24 * 60 * 60);
+/// Bound on the memo. Past it a not-sent row is simply re-read each tick, as
+/// before H7-5 — the memo saves RPC, it is never what keeps the loop live.
+const NOT_SENT_MAX_ENTRIES: usize = 100_000;
+
+/// Candidates the source chain says were never sent, rested with a doubling
+/// backoff (audit round 7, H7-5).
+///
+/// A row only the store has — no chain ever emitted it — stays a candidate for
+/// as long as the store keeps serving it, and used to cost every validator a
+/// source read plus the age search on every tick. "Not sent" is read at a
+/// confirmed block, but it is a fact about NOW: a row naming a future nonce
+/// becomes a real transfer if someone sends exactly it. So the memo rests a row
+/// instead of dropping it, and the rest is capped at [`NOT_SENT_MAX_REST`].
+#[derive(Default)]
+struct NotSentMemo {
+    /// id -> (do not re-read before, current rest)
+    rows: std::collections::HashMap<B256, (Instant, Duration)>,
+}
+
+impl NotSentMemo {
+    fn is_resting(&self, id: B256, now: Instant) -> bool {
+        self.rows.get(&id).is_some_and(|(until, _)| now < *until)
+    }
+
+    fn rest(&mut self, id: B256, now: Instant) {
+        let rest = match self.rows.get(&id) {
+            Some((_, prev)) => (*prev * 2).min(NOT_SENT_MAX_REST),
+            None if self.rows.len() >= NOT_SENT_MAX_ENTRIES => return,
+            None => NOT_SENT_REST,
+        };
+        self.rows.insert(id, (now + rest, rest));
+    }
+
+    /// Forget rows whose rest ran out long ago, so the memo tracks the queue.
+    fn prune(&mut self, now: Instant) {
+        self.rows.retain(|_, (until, _)| now < *until + NOT_SENT_MAX_REST);
+    }
+}
+
 /// Poll the store for stuck transfers and attest cancels/refunds for them.
 pub async fn run(
     cfg: RefundConfig,
@@ -553,6 +604,9 @@ pub async fn run(
         dest_readers.insert(dest.chain_id, LazyReader::new(dest.chain_id, dest.gate.clone(), endpoints));
     }
 
+    let mut cursor = RefundCursor::default();
+    let mut not_sent = NotSentMemo::default();
+
     info!(
         validator = %signer_addr,
         sources = source_readers.len(),
@@ -566,38 +620,36 @@ pub async fn run(
             r.ensure(cfg.block_confirmation, require_corroboration).await;
         }
 
-        // Walk the queue a page at a time (audit 2026-09-16, H-6). Unpaged, a
-        // queue grown past the client's response cap returned an error on every
-        // tick forever, so no refund could ever be attested again.
-        let mut candidates: Vec<SubmissionRecord> = Vec::new();
-        let mut failed = false;
-        for p in 0..MAX_REFUND_PAGES {
-            match sink.refund_candidates(REFUND_PAGE, p * REFUND_PAGE).await {
-                Ok(page) => {
-                    let short = (page.len() as u64) < REFUND_PAGE;
-                    candidates.extend(page);
-                    if short {
-                        break;
-                    }
-                    if p + 1 == MAX_REFUND_PAGES {
-                        warn!(
-                            pages = MAX_REFUND_PAGES,
-                            page_size = REFUND_PAGE,
-                            "refund queue exceeds one tick's walk; covering the rest next tick"
-                        );
-                    }
+        // Walk the queue a page at a time (audit 2026-09-16, H-6), resuming
+        // where the previous tick stopped (H7-5). Unpaged, a queue grown past
+        // the client's response cap returned an error on every tick forever; and
+        // walked from the head each tick, rows that never leave the queue hid
+        // every row behind them.
+        let walk = cursor
+            .walk(|limit, after| {
+                let sink = &sink;
+                async move { sink.refund_candidates(limit, after.as_deref()).await }
+            })
+            .await;
+        let candidates = match walk {
+            Ok(w) => {
+                if w.truncated {
+                    warn!(
+                        pages = MAX_REFUND_PAGES,
+                        page_size = REFUND_PAGE,
+                        "refund queue exceeds one tick's walk; resuming from here next tick"
+                    );
                 }
-                Err(e) => {
-                    warn!(error = %e, page = p, "fetching refund candidates failed; retrying");
-                    failed = true;
-                    break;
-                }
+                w.candidates
             }
-        }
-        if failed {
-            tokio::time::sleep(retry).await;
-            continue;
-        }
+            Err(e) => {
+                warn!(error = %e, "fetching refund candidates failed; retrying");
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+        };
+        let now = Instant::now();
+        not_sent.prune(now);
 
         for rec in candidates {
             // Cheap-skip before the 8-30 on-chain reads `handle_candidate` makes:
@@ -614,7 +666,10 @@ pub async fn run(
             if fully_attested_by_us(&rec, id, signer_addr) {
                 continue;
             }
-            if let Err(e) = handle_candidate(
+            if not_sent.is_resting(id, now) {
+                continue;
+            }
+            match handle_candidate(
                 &rec,
                 id,
                 &source_readers,
@@ -626,7 +681,11 @@ pub async fn run(
             )
             .await
             {
-                warn!(submission_id = %rec.submission_id, error = %e, "refund attestation failed");
+                Ok(Outcome::NotSent) => not_sent.rest(id, now),
+                Ok(Outcome::Done) => {}
+                Err(e) => {
+                    warn!(submission_id = %rec.submission_id, error = %e, "refund attestation failed");
+                }
             }
         }
 
@@ -645,7 +704,7 @@ async fn handle_candidate(
     signer_addr: Address,
     sink: &StoreBackend,
     timeout_secs: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Outcome> {
     // The DESTINATION must be readable: whether a transfer was delivered is the
     // one fact no attestation may take from the store. A destination we cannot
     // read — or cannot read YET (L7-13) — is a corridor we do not vote on.
@@ -654,9 +713,9 @@ async fn handle_candidate(
         Reader::NotReady => {
             tracing::debug!(submission_id = %rec.submission_id, chain = rec.chain_id_to,
                             "destination not connected yet; skipping this tick");
-            return Ok(());
+            return Ok(Outcome::Done);
         }
-        Reader::NotConfigured => return Ok(()),
+        Reader::NotConfigured => return Ok(Outcome::Done),
     };
     // The SOURCE may be unreadable (round 4, M-4: a Solana source). Then only the
     // refund leg is possible — `decide` enforces that — and the age is never
@@ -669,7 +728,7 @@ async fn handle_candidate(
         Reader::NotReady => {
             tracing::debug!(submission_id = %rec.submission_id, chain = rec.chain_id_from,
                             "source not connected yet; skipping this tick");
-            return Ok(());
+            return Ok(Outcome::Done);
         }
     };
 
@@ -678,6 +737,20 @@ async fn handle_candidate(
         Some(s) => Some(s.source_state(id).await.context("reading source gate")?),
         None => None,
     };
+
+    // H7-5: a source that says it never sent this, or already paid it back,
+    // settles it before the age search below — the 10-30 reads that made every
+    // junk row in the queue expensive on every tick. `decide` would skip it
+    // anyway; this only skips the reads that cannot change that.
+    if let Some(s) = &src_state {
+        if s.sent_by == Address::ZERO && !s.refunded {
+            tracing::debug!(submission_id = %rec.submission_id, "source gate never sent this; resting it");
+            return Ok(Outcome::NotSent);
+        }
+        if s.refunded {
+            return Ok(Outcome::Done);
+        }
+    }
 
     // H-2: establish the unclaimed timeout OURSELVES, from the source chain, and
     // never from the store's nomination. Only needed on the cancel leg — once the
@@ -709,7 +782,7 @@ async fn handle_candidate(
     let kind = match decision {
         Decision::Skip(reason) => {
             tracing::debug!(submission_id = %rec.submission_id, reason, "no attestation");
-            return Ok(());
+            return Ok(Outcome::Done);
         }
         Decision::AttestCancel => SigKind::Cancel,
         Decision::AttestRefund => SigKind::Refund,
@@ -733,7 +806,7 @@ async fn handle_candidate(
         dest_chain = dst.chain_id,
         "ATTESTED"
     );
-    Ok(())
+    Ok(Outcome::Done)
 }
 
 #[cfg(test)]
@@ -908,6 +981,31 @@ mod tests {
     }
 
     /// The pre-filter itself: both domains genuinely signed by us.
+    /// H7-5: a never-sent candidate is rested with a doubling backoff, capped,
+    /// and comes back once its rest is over.
+    #[test]
+    fn a_never_sent_candidate_rests_and_comes_back() {
+        let id = B256::repeat_byte(0x42);
+        let t0 = Instant::now();
+        let mut memo = NotSentMemo::default();
+        assert!(!memo.is_resting(id, t0));
+        memo.rest(id, t0);
+        assert!(memo.is_resting(id, t0 + NOT_SENT_REST - Duration::from_secs(1)));
+        assert!(!memo.is_resting(id, t0 + NOT_SENT_REST), "re-read once the rest is over");
+        let t1 = t0 + NOT_SENT_REST;
+        memo.rest(id, t1);
+        assert!(memo.is_resting(id, t1 + NOT_SENT_REST), "the second rest is twice as long");
+        assert!(!memo.is_resting(id, t1 + NOT_SENT_REST * 2));
+        let mut t = t1;
+        for _ in 0..20 {
+            memo.rest(id, t);
+            t += NOT_SENT_MAX_REST;
+        }
+        assert!(!memo.is_resting(id, t), "a rest never exceeds the cap");
+        memo.prune(t + NOT_SENT_MAX_REST * 2);
+        assert!(memo.rows.is_empty(), "long-expired rows are forgotten");
+    }
+
     #[test]
     fn fully_attested_needs_both_domains() {
         let me = PrivateKeySigner::random();
