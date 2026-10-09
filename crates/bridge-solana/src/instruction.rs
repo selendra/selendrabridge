@@ -88,7 +88,9 @@ pub enum GateInstruction {
     Pause,
     /// M-1: release it (owner only — a guardian may stop but not start).
     Unpause,
-    /// M-1: appoint or clear the pause guardian (owner only).
+    /// M-1: appoint or clear the pause guardian (owner only). M7-1: past the
+    /// setup phase, replacing or clearing a SET guardian consumes a matured
+    /// `["gov", set_guardian_action_id(new)]`; accounts `[config(w), owner(s), gov_pda(w)?]`.
     SetGuardian { guardian: [u8; 32] },
     /// M-2, DESTINATION side: burn a transfer so it can never be claimed,
     /// unlocking a source-chain refund. Moves no funds.
@@ -101,6 +103,9 @@ pub enum GateInstruction {
     /// lives in the PDA `["gov", action_id]`. Discriminant 12.
     ///
     /// Accounts: `[config, owner(s,w), gov_pda(w), system_program]`.
+    ///
+    /// M7-1: REMOVED from the program (always `UseTypedSchedule`, `Custom(30)`);
+    /// kept so discriminants stay put. Use [`GateInstruction::ScheduleAction`].
     ScheduleGovernance { action_id: [u8; 32] },
     /// H-2 (round 4): drop a queued action. Owner OR guardian. Discriminant 13.
     ///
@@ -112,6 +117,52 @@ pub enum GateInstruction {
     ///
     /// Accounts: `[config(w), owner(s)]`.
     Seal,
+    /// M7-1 (round 7): queue a delayed action by what it does — the program
+    /// derives the id, logs the decoded parameters, and refuses an action its
+    /// execution would refuse. Discriminant 15. Replaces `ScheduleGovernance`,
+    /// which the program now always refuses.
+    ///
+    /// Accounts: `[config, owner(s,w), gov_pda(w), system_program]`, and for
+    /// `RegisterAsset` also `[mint, vault, spl_token_program]`.
+    ScheduleAction(GovernanceAction),
+}
+
+/// Mirrors `solana_gate::GovernanceAction` (a `Pubkey` is its 32 bytes in Borsh).
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub enum GovernanceAction {
+    AddValidator { validator: [u8; 20] },
+    LowerThreshold { threshold: u32 },
+    RegisterAsset { debridge_id: [u8; 32], bridge_decimals: u8 },
+    SetGuardian { guardian: [u8; 32] },
+}
+
+impl GovernanceAction {
+    /// The id the program schedules for this action. `RegisterAsset` needs the
+    /// mint and vault it is scheduled with; the others ignore them.
+    pub fn action_id(&self, mint: &[u8; 32], vault: &[u8; 32]) -> [u8; 32] {
+        match self {
+            GovernanceAction::AddValidator { validator } => add_validator_action_id(validator),
+            GovernanceAction::LowerThreshold { threshold } => lower_threshold_action_id(*threshold),
+            GovernanceAction::RegisterAsset { debridge_id, bridge_decimals } => {
+                register_asset_action_id(debridge_id, mint, vault, *bridge_decimals)
+            }
+            GovernanceAction::SetGuardian { guardian } => set_guardian_action_id(guardian),
+        }
+    }
+}
+
+/// Leads every action id's preimage. Mirrors `solana_gate::ACTION_ID_VERSION`
+/// (M7-1): a schedule made under the old unversioned ids can never be consumed.
+pub const ACTION_ID_VERSION: &[u8] = b"gate-governance-v2:";
+
+/// `keccak(v2 ‖ "setGuardian" ‖ guardian)` — the id a post-setup guardian change
+/// consumes. Must equal the program's `set_guardian_action_id`.
+pub fn set_guardian_action_id(guardian: &[u8; 32]) -> [u8; 32] {
+    let mut p = Vec::with_capacity(ACTION_ID_VERSION.len() + 11 + 32);
+    p.extend_from_slice(ACTION_ID_VERSION);
+    p.extend_from_slice(b"setGuardian");
+    p.extend_from_slice(guardian);
+    crate::hash::keccak(&p)
 }
 
 /// The program's `GOVERNANCE_DELAY`, in seconds: how long a scheduled validator
@@ -132,7 +183,8 @@ pub const MAX_THRESHOLD: u32 = 8;
 /// `SetValidator { active: true }` will admit `v`. Must equal the program's
 /// `add_validator_action_id`; `solana-gate`'s account-level suite pins it.
 pub fn add_validator_action_id(v: &[u8; 20]) -> [u8; 32] {
-    let mut p = Vec::with_capacity(12 + 20);
+    let mut p = Vec::with_capacity(ACTION_ID_VERSION.len() + 12 + 20);
+    p.extend_from_slice(ACTION_ID_VERSION);
     p.extend_from_slice(b"addValidator");
     p.extend_from_slice(v);
     crate::hash::keccak(&p)
@@ -152,7 +204,8 @@ pub fn register_asset_action_id(
     vault: &[u8; 32],
     bridge_decimals: u8,
 ) -> [u8; 32] {
-    let mut p = Vec::with_capacity(13 + 32 * 3 + 1);
+    let mut p = Vec::with_capacity(ACTION_ID_VERSION.len() + 13 + 32 * 3 + 1);
+    p.extend_from_slice(ACTION_ID_VERSION);
     p.extend_from_slice(b"registerAsset");
     p.extend_from_slice(debridge_id);
     p.extend_from_slice(mint);
@@ -164,7 +217,8 @@ pub fn register_asset_action_id(
 /// `keccak("lowerThreshold" ‖ uint256(t))` — the action id a threshold DECREASE
 /// to exactly `t` must have scheduled.
 pub fn lower_threshold_action_id(t: u32) -> [u8; 32] {
-    let mut p = Vec::with_capacity(14 + 32);
+    let mut p = Vec::with_capacity(ACTION_ID_VERSION.len() + 14 + 32);
+    p.extend_from_slice(ACTION_ID_VERSION);
     p.extend_from_slice(b"lowerThreshold");
     let mut word = [0u8; 32];
     word[24..].copy_from_slice(&(t as u64).to_be_bytes());

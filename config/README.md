@@ -287,9 +287,10 @@ What differs from the host-run form, and why:
 - the Solana relayer gets its own image (`docker/Dockerfile.relayer`), because
   `solana-client` pins `zeroize <1.4` and alloy needs `^1.5` — the two cannot
   share a binary;
-- only the frontend publishes a port. nginx proxies `/graphql` and `/health` to
-  the API, so the browser talks to it same-origin and the API needs no public
-  port and no CORS.
+- only the frontend publishes a port, and only on `frontend.host` (default
+  `127.0.0.1`; set `"0.0.0.0"` to publish it on every interface, e.g. behind a
+  TLS reverse proxy). nginx proxies `/graphql` and `/health` to the API, so the
+  browser talks to it same-origin and the API needs no public port and no CORS.
 
 The generated `configs/` hold validator and keeper **private keys**. The
 directory is gitignored; treat it as secret material.

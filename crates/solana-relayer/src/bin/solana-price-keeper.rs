@@ -288,13 +288,10 @@ fn tick(
                 info!(symbol = %t.symbol, wait_secs = until - now, "reprice due but in cooldown");
                 soonest = Some(soonest.map_or(until - now, |s| s.min(until - now)));
             }
-            // KNOWN GAP (audit 2026-10-02, M7-4): the Solana program's SetPrice
-            // has no compare-and-set, so `from` cannot be bound into the
-            // instruction the way SwapPool.setPrice binds `expectedOld`. A lying
-            // RPC can still steer one capped step per interval here. The EVM
-            // side is closed; closing this one needs a new program instruction
-            // (SetPriceFrom { expected, price }) and a program upgrade.
-            Plan::Set { from: _, price, step } => {
+            // M7-4: `from` — the price this step was planned from — rides in the
+            // instruction, so a step planned from a lied read reverts
+            // `PriceChanged` on-chain instead of landing.
+            Plan::Set { from, price, step } => {
                 let ix = Instruction {
                     program_id: program,
                     accounts: vec![
@@ -302,7 +299,7 @@ fn tick(
                         AccountMeta::new_readonly(oracle.pubkey(), true),
                         AccountMeta::new(t.record, false),
                     ],
-                    data: SwapInstruction::SetPrice { price }.to_bytes(),
+                    data: SwapInstruction::SetPriceFrom { expected: from, price }.to_bytes(),
                 };
                 let blockhash = rpc.get_latest_blockhash()?;
                 let tx = Transaction::new_signed_with_payer(&[ix], Some(&oracle.pubkey()), &[oracle], blockhash);
@@ -348,11 +345,15 @@ mod tests {
         assert!(Config::from_toml(&OK.replace("poll_interval_secs", "x").replace("rpc =", "rpc_url =")).is_err());
     }
 
-    /// The instruction bytes the loop sends must be the program's own SetPrice.
+    /// The instruction the loop sends is the compare-and-set (M7-4): tag 14,
+    /// then the expected price, then the new one.
     #[test]
     fn set_price_instruction_matches_the_program_enum() {
-        let bytes = SwapInstruction::SetPrice { price: 3180 * math::PRICE_ONE }.to_bytes();
-        assert_eq!(bytes.len(), 1 + 16, "tag + u128");
+        let bytes = SwapInstruction::SetPriceFrom { expected: 3000 * math::PRICE_ONE, price: 3180 * math::PRICE_ONE }
+            .to_bytes();
+        assert_eq!(bytes.len(), 1 + 16 + 16, "tag + u128 + u128");
+        assert_eq!(bytes[0], 14);
+        assert_eq!(&bytes[1..17], &(3000 * math::PRICE_ONE).to_le_bytes());
     }
 
     /// Audit round 6, LOW: a system-owned, zero-data account at the TOKEN_SEED

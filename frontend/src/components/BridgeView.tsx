@@ -494,7 +494,11 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
 
   useEffect(() => {
     if (!crossSwap || !routerOk || !isAddress(srcStable)) {
-      setSrcUnitRead(null);
+      // Settled as UNKNOWN for this key, not left pending: `null` here used to
+      // read as "still checking" for ever whenever the pool's stable could not
+      // be learned (an RPC refusing the pool's history), so the button said
+      // "Checking…" with nothing being checked. Unknown still fails closed.
+      setSrcUnitRead({ key: srcUnitKey, unit: null });
       return;
     }
     let alive = true;
@@ -511,7 +515,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
 
   useEffect(() => {
     if (!crossSwap || destIsNonEvm || !isAddress(destGate) || !destRpcUrl || !isAddress(dstStable)) {
-      setDstUnitRead(null);
+      setDstUnitRead({ key: dstUnitKey, unit: null }); // unknown, not pending — see above
       return;
     }
     let alive = true;

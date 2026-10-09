@@ -1146,7 +1146,12 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  frontend:\n    build: { context: %s, dockerfile: docker/Dockerfile.frontend }\n    <<: *restart\n' "$CTX"
       # nginx proxies /graphql and /health to graphql-api, so the browser talks
       # to the API same-origin and no API port needs publishing.
-      printf '    ports: ["%s:8080"]\n' "$(j '.frontend.port')"
+      # Published on `frontend.host` (default loopback), as the local launcher
+      # already did. A bare "PORT:8080" binds every interface, and a docker
+      # publish writes its own DNAT rule past ufw/firewalld (M-9), so mesh12's
+      # UI was reachable from anywhere. Set `frontend.host: "0.0.0.0"` to mean it.
+      fe_host="$(jr '.frontend.host')"; fe_host="${fe_host:-127.0.0.1}"
+      printf '    ports: ["%s:%s:8080"]\n' "$fe_host" "$(j '.frontend.port')"
       printf '    depends_on:\n      graphql-api: { condition: service_healthy }\n\n'
     fi
 

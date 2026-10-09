@@ -249,13 +249,19 @@ export function encodeFinalize(
 /** An `Eip1193Request` backed by a plain JSON-RPC endpoint, for read-only calls
  *  (e.g. `readDecimals`) against a chain the user's wallet isn't connected to —
  *  the registry's `rpcUrl`, not `window.ethereum`, is the source of truth. */
-export function rpcRequest(url: string): Eip1193Request {
+/** How long a direct RPC read may take before it fails. Every caller treats a
+ *  failed read as unknown and fails closed; a fetch with no deadline instead
+ *  left the UI waiting on a hung endpoint for ever. */
+export const RPC_TIMEOUT_MS = 20_000;
+
+export function rpcRequest(url: string, timeoutMs = RPC_TIMEOUT_MS): Eip1193Request {
   let id = 0;
   return async ({ method, params }) => {
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params: params ?? [] }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const json = await res.json();
     if (json.error) throw new Error(json.error.message ?? "RPC error");

@@ -178,7 +178,10 @@ pub enum GateInstruction {
     /// M-1: release the circuit breaker (owner only — a guardian may stop but not
     /// start, exactly as in `Gate.sol`).
     Unpause,
-    /// M-1: appoint or clear the pause guardian (owner only).
+    /// M-1: appoint or clear the pause guardian (owner only). M7-1: once the
+    /// setup phase is over, REPLACING or clearing a set guardian consumes a
+    /// matured `["gov", set_guardian_action_id(new)]` schedule, which the current
+    /// guardian can cancel. Accounts: `[config(w), owner(s), gov_pda(w)?]`.
     SetGuardian { guardian: Pubkey },
     /// M-2, DESTINATION side: burn a transfer so it can never be claimed here,
     /// unlocking a source-chain refund. Moves no funds. Permissionless — the
@@ -195,6 +198,9 @@ pub enum GateInstruction {
     ///
     /// Accounts: `[config, owner(s,w), gov_pda(w), system_program]` where
     /// `gov_pda = ["gov", action_id]`.
+    ///
+    /// M7-1: REMOVED, kept only so later discriminants stay put. Always fails
+    /// [`GateError::UseTypedSchedule`]; use [`GateInstruction::ScheduleAction`].
     ScheduleGovernance { action_id: [u8; 32] },
     /// H-2: drop a queued governance action. Owner OR guardian, exactly as
     /// `Gate.cancelScheduledGovernance`: spotting a bad pending validator
@@ -210,6 +216,35 @@ pub enum GateInstruction {
     ///
     /// Accounts: `[config(w), owner(s)]`.
     Seal,
+    /// M7-1 (audit round 7): queue a delayed action BY WHAT IT DOES. Owner only.
+    /// Discriminant 15.
+    ///
+    /// Replaces [`GateInstruction::ScheduleGovernance`], which took an opaque
+    /// hash: the log said only that *something* was queued, so 48 hours in public
+    /// view showed nobody which validator, threshold, vault or guardian was
+    /// coming. This derives the action id itself, logs the decoded parameters,
+    /// and refuses an action its execution would refuse.
+    ///
+    /// Accounts: `[config, owner(s,w), gov_pda(w), system_program]`, and for
+    /// [`GovernanceAction::RegisterAsset`] also `[mint, vault, spl_token_program]`.
+    ScheduleAction(GovernanceAction),
+}
+
+/// What [`GateInstruction::ScheduleAction`] queues. One variant per delayed
+/// action; the id each one schedules is the id its execution consumes.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub enum GovernanceAction {
+    /// `SetValidator { validator, active: true }`.
+    AddValidator { validator: [u8; 20] },
+    /// `SetThreshold { threshold }` below the current one.
+    LowerThreshold { threshold: u32 },
+    /// `RegisterAsset { debridge_id, bridge_decimals }` on a sealed gate. The mint
+    /// and vault are the instruction's accounts, so the schedule names the very
+    /// accounts the binding will write — and they must already exist.
+    RegisterAsset { debridge_id: [u8; 32], bridge_decimals: u8 },
+    /// `SetGuardian { guardian }` once the setup phase is over and a guardian is
+    /// set. Clearing it (the default key) is a change like any other.
+    SetGuardian { guardian: Pubkey },
 }
 
 // ---------------------------------------------------------------------------
@@ -266,14 +301,26 @@ const GOVERNANCE_LEN: usize = 8;
 /// only — so the two encodings need not be byte-identical, only equally
 /// specific: a schedule commits to THIS validator, never to "some validator".
 pub fn add_validator_action_id(v: &[u8; 20]) -> [u8; 32] {
-    keccak::hashv(&[b"addValidator", v]).to_bytes()
+    keccak::hashv(&[ACTION_ID_VERSION, b"addValidator", v]).to_bytes()
+}
+
+/// Leads every action id's preimage (M7-1). A schedule queued through the removed
+/// opaque `ScheduleGovernance` sits at the PDA of an UNVERSIONED id, which no
+/// execution derives any more, so it can never be consumed — exactly as
+/// `Gate.sol` versioned its ids for the same change.
+pub const ACTION_ID_VERSION: &[u8] = b"gate-governance-v2:";
+
+/// The action id for making `guardian` the pause guardian once the setup phase
+/// is over: `keccak(v2 ‖ "setGuardian" ‖ guardian)` (M7-1).
+pub fn set_guardian_action_id(guardian: &Pubkey) -> [u8; 32] {
+    keccak::hashv(&[ACTION_ID_VERSION, b"setGuardian", guardian.as_ref()]).to_bytes()
 }
 
 /// The action id for lowering the threshold to exactly `t`:
 /// `keccak("lowerThreshold" ‖ uint256(t))`. A matured approval for `t = 2`
 /// cannot be spent on `t = 1`.
 pub fn lower_threshold_action_id(t: u32) -> [u8; 32] {
-    keccak::hashv(&[b"lowerThreshold", &be32(t as u64)]).to_bytes()
+    keccak::hashv(&[ACTION_ID_VERSION, b"lowerThreshold", &be32(t as u64)]).to_bytes()
 }
 
 /// How long after [`process_init`] a brand-new gate may register assets
@@ -305,6 +352,7 @@ pub fn register_asset_action_id(
     bridge_decimals: u8,
 ) -> [u8; 32] {
     keccak::hashv(&[
+        ACTION_ID_VERSION,
         b"registerAsset",
         debridge_id,
         mint.as_ref(),
@@ -329,6 +377,13 @@ pub fn register_asset_action_id(
 /// the delayed path. Fail-closed.
 fn in_setup_phase(sealed: bool, setup_deadline: i64, now: i64) -> bool {
     !sealed && setup_deadline != 0 && now <= setup_deadline
+}
+
+/// Pure M7-1 rule (host-testable): does changing the guardian away from
+/// `current` have to wait out the timelock? Only past the setup phase, and only
+/// when there IS a guardian whose veto the change would remove.
+fn guardian_change_needs_schedule(sealed: bool, setup_deadline: i64, now: i64, current: &Pubkey) -> bool {
+    !in_setup_phase(sealed, setup_deadline, now) && current != &Pubkey::default()
 }
 
 /// Pure timelock rule (host-testable): may a schedule with `ready_at` be
@@ -1440,6 +1495,14 @@ pub enum GateError {
     /// the gate could never claim, cancel or refund again. `Custom(29)`.
     #[error("threshold exceeds MAX_THRESHOLD (its signatures would not fit in one transaction)")]
     ThresholdTooHigh,
+    /// M7-1: the opaque `ScheduleGovernance` was called. `Custom(30)`.
+    #[error("ScheduleGovernance is removed — schedule with the typed ScheduleAction")]
+    UseTypedSchedule,
+    /// M7-1: `ScheduleAction` for something its execution would refuse or that
+    /// would change nothing (a validator already in the set, a threshold that is
+    /// not a decrease). `Custom(31)`.
+    #[error("this action cannot be executed, so it may not be scheduled")]
+    NotSchedulable,
 }
 
 /// The largest threshold a gate may be configured with (audit L7-4).
@@ -1699,8 +1762,12 @@ pub fn process_instruction(
         }
         GateInstruction::Cancel(args) => process_cancel(program_id, accounts, args),
         GateInstruction::Refund(args) => process_refund(program_id, accounts, args),
-        GateInstruction::ScheduleGovernance { action_id } => {
-            process_schedule_governance(program_id, accounts, action_id)
+        GateInstruction::ScheduleGovernance { .. } => {
+            msg!("ScheduleGovernance is removed (M7-1): use ScheduleAction");
+            Err(GateError::UseTypedSchedule.into())
+        }
+        GateInstruction::ScheduleAction(action) => {
+            process_schedule_action(program_id, accounts, action)
         }
         GateInstruction::CancelScheduledGovernance { action_id } => {
             process_cancel_scheduled_governance(program_id, accounts, action_id)
@@ -1709,21 +1776,20 @@ pub fn process_instruction(
     }
 }
 
-/// Accounts: [config, owner(s,w), gov_pda(w), system_program]
+/// Accounts: [config, owner(s,w), gov_pda(w), system_program,
+///            (RegisterAsset only) mint, vault, spl_token_program]
 ///
-/// H-2 (round 4): queue a validator addition or threshold decrease. Re-scheduling
-/// RESTARTS the delay rather than keeping the earliest deadline, for the reason
-/// `Gate.scheduleGovernance` gives: otherwise one matured schedule would be an
-/// indefinitely re-usable instant-change right against that action.
-///
-/// The schedule lives in its own PDA rather than in `Config` so the config
-/// account — sized once at init and unable to grow (H-3) — never has to hold an
-/// unbounded map. Created through [`create_pda_account`], so pre-funding the
-/// address cannot block governance (M-5).
-fn process_schedule_governance(
+/// M7-1: queue a delayed action by what it does. The action id is derived here,
+/// never taken from the caller, and the decoded parameters go to the log next to
+/// `ready_at`, so the 48 hours are spent in public view of WHAT is coming. An
+/// action its execution would refuse is refused now, rather than sitting in the
+/// queue looking legitimate: a validator already in the set, a threshold that is
+/// not a decrease, and an asset whose mint or vault is not (yet) a real SPL
+/// account — the Solana form of the EVM gate's `TokenHasNoCode`.
+fn process_schedule_action(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    action_id: [u8; 32],
+    action: GovernanceAction,
 ) -> ProgramResult {
     let it = &mut accounts.iter();
     let config_ai = next_account_info(it)?;
@@ -1735,7 +1801,95 @@ fn process_schedule_governance(
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let (expected, bump) = Pubkey::find_program_address(&[b"gov", &action_id], program_id);
+    let mut asset_keys: Option<(Pubkey, Pubkey)> = None;
+    let action_id = match &action {
+        GovernanceAction::AddValidator { validator } => {
+            if validator == &[0u8; 20] {
+                return Err(GateError::ZeroValidator.into());
+            }
+            if cfg.is_validator(validator) {
+                msg!("schedule: validator is already in the set");
+                return Err(GateError::NotSchedulable.into());
+            }
+            if cfg.validators.len() as u32 >= cfg.max_validators {
+                return Err(GateError::AtCapacity.into());
+            }
+            add_validator_action_id(validator)
+        }
+        GovernanceAction::LowerThreshold { threshold } => {
+            if *threshold == 0 || *threshold >= cfg.threshold {
+                msg!("schedule: threshold {} is not a decrease from {}", threshold, cfg.threshold);
+                return Err(GateError::NotSchedulable.into());
+            }
+            lower_threshold_action_id(*threshold)
+        }
+        GovernanceAction::RegisterAsset { debridge_id, bridge_decimals } => {
+            let mint = next_account_info(it)?;
+            let vault = next_account_info(it)?;
+            let token_program = next_account_info(it)?;
+            check_asset_accounts(program_id, mint, vault, token_program, *bridge_decimals)?;
+            asset_keys = Some((*mint.key, *vault.key));
+            register_asset_action_id(debridge_id, mint.key, vault.key, *bridge_decimals)
+        }
+        GovernanceAction::SetGuardian { guardian } => set_guardian_action_id(guardian),
+    };
+    let ready_at = write_schedule(program_id, owner, gov_ai, system_program, &action_id)?;
+    match &action {
+        GovernanceAction::AddValidator { validator } => {
+            msg!("governance scheduled: addValidator 0x{} ready_at {}", hex_str(validator), ready_at)
+        }
+        GovernanceAction::LowerThreshold { threshold } => {
+            msg!("governance scheduled: lowerThreshold {} ready_at {}", threshold, ready_at)
+        }
+        GovernanceAction::RegisterAsset { debridge_id, bridge_decimals } => {
+            let (mint, vault) = asset_keys.unwrap_or_default();
+            msg!(
+                "governance scheduled: registerAsset debridge_id 0x{} mint {} vault {} bridge_decimals {} ready_at {}",
+                hex_str(debridge_id),
+                mint,
+                vault,
+                bridge_decimals,
+                ready_at
+            )
+        }
+        GovernanceAction::SetGuardian { guardian } => {
+            msg!("governance scheduled: setGuardian {} ready_at {}", guardian, ready_at)
+        }
+    }
+    msg!("governance action id 0x{}", hex_str(&action_id));
+    Ok(())
+}
+
+/// Lower-case hex, for the schedule log.
+fn hex_str(b: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Create (if needed) and set the `["gov", action_id]` schedule to mature after
+/// [`GOVERNANCE_DELAY`]. Returns `ready_at`.
+///
+/// Re-scheduling RESTARTS the delay rather than keeping the earliest deadline,
+/// for the reason `Gate.sol` gives: otherwise one matured schedule would be an
+/// indefinitely re-usable instant-change right against that action.
+///
+/// The schedule lives in its own PDA rather than in `Config` so the config
+/// account — sized once at init and unable to grow (H-3) — never has to hold an
+/// unbounded map. Created through [`create_pda_account`], so pre-funding the
+/// address cannot block governance (M-5).
+fn write_schedule<'a>(
+    program_id: &Pubkey,
+    owner: &AccountInfo<'a>,
+    gov_ai: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    action_id: &[u8; 32],
+) -> Result<i64, ProgramError> {
+    let (expected, bump) = Pubkey::find_program_address(&[b"gov", action_id], program_id);
     if gov_ai.key != &expected {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1749,7 +1903,7 @@ fn process_schedule_governance(
             owner,
             gov_ai,
             system_program,
-            &[b"gov", &action_id],
+            &[b"gov", action_id],
             bump,
             GOVERNANCE_LEN,
         )?;
@@ -1757,8 +1911,7 @@ fn process_schedule_governance(
     let now = solana_program::clock::Clock::get()?.unix_timestamp;
     let ready_at = now.checked_add(GOVERNANCE_DELAY).ok_or(ProgramError::ArithmeticOverflow)?;
     GovernanceSchedule { ready_at }.serialize(&mut &mut gov_ai.data.borrow_mut()[..])?;
-    msg!("governance scheduled: ready_at {}", ready_at);
-    Ok(())
+    Ok(ready_at)
 }
 
 /// Accounts: [config, signer(s), gov_pda(w)]
@@ -2180,7 +2333,21 @@ fn authorized_to_set_paused(is_owner: bool, is_guardian: bool, paused: bool) -> 
     }
 }
 
-/// Accounts: [config(w), owner(s)] — appoint or clear the pause guardian.
+/// Accounts: [config(w), owner(s), gov_pda(w)?] — appoint or clear the pause
+/// guardian.
+///
+/// M7-1: this was instant always, and the guardian is the one party that can
+/// cancel a scheduled action. So a stolen owner key queued a validator, cleared
+/// the guardian in the same transaction, and waited out 48 hours nobody could
+/// stop. Once the setup phase is over, REPLACING or clearing a set guardian now
+/// consumes a matured `["gov", set_guardian_action_id(new)]` schedule — which the
+/// current guardian can cancel. Appointing one where none is set stays instant
+/// (it only adds a veto), and so does any change during the setup phase, exactly
+/// as `Gate.setGuardian` does.
+///
+/// Trade-off, as on the EVM gate: a stolen GUARDIAN key can keep cancelling its
+/// own replacement and so freeze delayed governance. It still cannot move funds,
+/// unpause, or block the instant power-removing actions.
 fn process_set_guardian(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2193,6 +2360,15 @@ fn process_set_guardian(
     let mut cfg = load_config(program_id, config_ai)?;
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+    if guardian == cfg.guardian {
+        return Ok(()); // no-op: never burn a schedule on it
+    }
+    let now = solana_program::clock::Clock::get()?.unix_timestamp;
+    if guardian_change_needs_schedule(cfg.sealed, cfg.setup_deadline, now, &cfg.guardian) {
+        let gov_ai = next_account_info(it)
+            .map_err(|_| ProgramError::from(GateError::GovernanceNotScheduled))?;
+        consume_governance(program_id, gov_ai, &set_guardian_action_id(&guardian))?;
     }
     cfg.guardian = guardian;
     cfg.store(config_ai)?;
@@ -2559,6 +2735,64 @@ fn process_set_threshold(
     Ok(())
 }
 
+/// The mint and vault an asset binding names must be what `send`/`claim` can
+/// use: an SPL mint whose decimals admit `bridge_decimals`, and a token account
+/// of that mint controlled by the canonical vault-authority PDA and nobody else.
+/// Returns the mint's decimals.
+///
+/// Shared by `RegisterAsset` and, since M7-1, by `ScheduleAction`, so an asset
+/// that could never be bound cannot be scheduled either: in particular a mint or
+/// vault that does not exist YET, the Solana form of the EVM gate refusing a
+/// token with no code. A schedule is a public commitment to concrete accounts.
+fn check_asset_accounts(
+    program_id: &Pubkey,
+    mint: &AccountInfo,
+    vault: &AccountInfo,
+    token_program: &AccountInfo,
+    bridge_decimals: u8,
+) -> Result<u8, ProgramError> {
+    if token_program.key != &spl_token::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if mint.owner != token_program.key {
+        msg!("register: mint is not owned by the SPL token program");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mint_state = spl_token::state::Mint::unpack(&mint.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if bridge_unit(mint_state.decimals, bridge_decimals).is_none() {
+        msg!("register: bridge decimals {} invalid for a {}-decimal mint", bridge_decimals, mint_state.decimals);
+        return Err(GateError::InvalidBridgeDecimals.into());
+    }
+
+    // The vault must hold this mint and be controlled by the canonical
+    // vault-authority PDA (only then can `claim`'s invoke_signed release it).
+    let (vault_mint, vault_owner) = spl_mint_and_owner(vault, token_program.key)?;
+    if &vault_mint != mint.key {
+        msg!("register: vault mint != mint");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (auth, _auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
+    if vault_owner != auth {
+        msg!("register: vault is not owned by the canonical vault_authority PDA");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // M-6: owning the vault is not enough — nobody ELSE may be able to move it.
+    // A pre-set delegate or close authority drains liquidity outside the program
+    // entirely, past every check above.
+    let vault_state = spl_token::state::Account::unpack(&vault.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if !vault_is_exclusively_controlled(
+        vault_state.delegate.into(),
+        vault_state.close_authority.into(),
+    ) {
+        msg!("register: vault has a delegate or close authority set");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(mint_state.decimals)
+}
+
 /// Accounts: [config, owner(s,w), asset_pda(w), mint, vault, spl_token_program,
 ///            system_program, vault_binding_pda(w), gov_pda(w)?]
 ///
@@ -2606,45 +2840,7 @@ fn process_register_asset(
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if token_program.key != &spl_token::id() {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-    // The mint must be an SPL mint owned by the token program.
-    if mint.owner != token_program.key {
-        msg!("register: mint is not owned by the SPL token program");
-        return Err(ProgramError::IllegalOwner);
-    }
-    let mint_state = spl_token::state::Mint::unpack(&mint.data.borrow())
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-    if bridge_unit(mint_state.decimals, bridge_decimals).is_none() {
-        msg!("register: bridge decimals {} invalid for a {}-decimal mint", bridge_decimals, mint_state.decimals);
-        return Err(GateError::InvalidBridgeDecimals.into());
-    }
-
-    // The vault must hold this mint and be controlled by the canonical
-    // vault-authority PDA (only then can `claim`'s invoke_signed release it).
-    let (vault_mint, vault_owner) = spl_mint_and_owner(vault, token_program.key)?;
-    if &vault_mint != mint.key {
-        msg!("register: vault mint != mint");
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let (auth, _auth_bump) = Pubkey::find_program_address(&[b"vault_authority"], program_id);
-    if vault_owner != auth {
-        msg!("register: vault is not owned by the canonical vault_authority PDA");
-        return Err(ProgramError::InvalidAccountData);
-    }
-    // M-6: owning the vault is not enough — nobody ELSE may be able to move it.
-    // A pre-set delegate or close authority drains liquidity outside the program
-    // entirely, past every check above.
-    let vault_state = spl_token::state::Account::unpack(&vault.data.borrow())
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-    if !vault_is_exclusively_controlled(
-        vault_state.delegate.into(),
-        vault_state.close_authority.into(),
-    ) {
-        msg!("register: vault has a delegate or close authority set");
-        return Err(ProgramError::InvalidAccountData);
-    }
+    let local_decimals = check_asset_accounts(program_id, mint, vault, token_program, bridge_decimals)?;
 
     let (expected_asset, bump) =
         Pubkey::find_program_address(&[b"asset", &debridge_id], program_id);
@@ -2657,7 +2853,7 @@ fn process_register_asset(
         mint: *mint.key,
         vault: *vault.key,
         bridge_decimals,
-        local_decimals: mint_state.decimals,
+        local_decimals,
     };
     let space: usize = ASSET_CONFIG_LEN + ASSET_CONFIG_SLACK;
 
@@ -3861,6 +4057,23 @@ mod c1_tests {
             Err(GateError::ThresholdTooHigh.into())
         );
         assert_eq!(ProgramError::from(GateError::ThresholdTooHigh), ProgramError::Custom(29));
+        assert_eq!(ProgramError::from(GateError::UseTypedSchedule), ProgramError::Custom(30));
+        assert_eq!(ProgramError::from(GateError::NotSchedulable), ProgramError::Custom(31));
+    }
+
+    /// M7-1: only a change that would REMOVE a veto past the setup phase waits.
+    #[test]
+    fn a_guardian_change_waits_only_when_it_removes_a_veto_after_setup() {
+        let g = Pubkey::new_unique();
+        let none = Pubkey::default();
+        // sealed, or the window ran out: a set guardian is protected
+        assert!(guardian_change_needs_schedule(true, i64::MAX, 0, &g));
+        assert!(guardian_change_needs_schedule(false, 100, 101, &g));
+        assert!(guardian_change_needs_schedule(false, 0, 0, &g), "deadline 0 means expired");
+        // nobody to replace: appointing adds a veto, instant
+        assert!(!guardian_change_needs_schedule(true, 0, 0, &none));
+        // setup phase: instant
+        assert!(!guardian_change_needs_schedule(false, 100, 100, &g));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

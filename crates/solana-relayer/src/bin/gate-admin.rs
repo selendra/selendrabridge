@@ -31,11 +31,16 @@
 //!     set-threshold --threshold N            (a DECREASE needs a matured schedule)
 //!     set-validator --validator 0x.. --active <bool>
 //!                                            (an ADDITION needs a matured schedule)
-//!     schedule-governance (--add-validator 0x.. | --lower-threshold N | --action-id 0x..
+//!     set-guardian --guardian <pubkey|none>
+//!                    (past the setup phase, REPLACING or clearing a set guardian
+//!                    needs a matured schedule — M7-1)
+//!     schedule-governance (--add-validator 0x.. | --lower-threshold N | --set-guardian <pubkey|none>
 //!                          | --register-asset --debridge-id 0x.. --mint <pubkey>
 //!                            --vault <pubkey> --bridge-decimals N)
-//!     cancel-governance   (same selectors)
-//!     governance-status   (same selectors)
+//!                    (typed ScheduleAction: the program derives the id and logs
+//!                    what it schedules; the opaque --action-id form is gone, M7-1)
+//!     cancel-governance   (same selectors, or --action-id 0x..)
+//!     governance-status   (same selectors, or --action-id 0x..)
 //!     send --debridge-id 0x.. --amount N --chain-id-to N --receiver 0x..
 //!          --from-token-account <pubkey>
 //!     cancel --submission-id 0x.. --debridge-id 0x.. --wire-amount N --bridge-decimals N
@@ -111,7 +116,8 @@
 use std::str::FromStr;
 
 use bridge_solana::instruction::{
-    add_validator_action_id, lower_threshold_action_id, register_asset_action_id, GateInstruction,
+    add_validator_action_id, lower_threshold_action_id, register_asset_action_id, set_guardian_action_id,
+    GateInstruction, GovernanceAction,
     GovernanceSchedule, InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS, MAX_THRESHOLD,
 };
 use borsh::BorshDeserialize as _;
@@ -164,15 +170,37 @@ fn governance_action_id(args: &Args) -> anyhow::Result<[u8; 32]> {
     if args.has("--register-asset") {
         return Ok(register_asset_action(args)?.0);
     }
-    match (args.get("--add-validator"), args.get("--lower-threshold"), args.get("--action-id")) {
-        (Some(v), None, None) => Ok(add_validator_action_id(&hex20(&v)?)),
-        (None, Some(t), None) => Ok(lower_threshold_action_id(t.parse()?)),
-        (None, None, Some(a)) => hex32(&a),
+    if let Some(a) = args.get("--action-id") {
+        return hex32(&a);
+    }
+    let (action, _) = governance_action(args)?;
+    Ok(action.action_id(&[0; 32], &[0; 32]))
+}
+
+/// The typed action a `schedule-governance` call queues (M7-1), with the mint
+/// and vault a `--register-asset` names.
+fn governance_action(args: &Args) -> anyhow::Result<(GovernanceAction, Option<(Pubkey, Pubkey)>)> {
+    if args.has("--register-asset") {
+        let (_, debridge_id, mint, vault, bridge_decimals) = register_asset_action(args)?;
+        return Ok((GovernanceAction::RegisterAsset { debridge_id, bridge_decimals }, Some((mint, vault))));
+    }
+    match (args.get("--add-validator"), args.get("--lower-threshold"), args.get("--set-guardian")) {
+        (Some(v), None, None) => Ok((GovernanceAction::AddValidator { validator: hex20(&v)? }, None)),
+        (None, Some(t), None) => Ok((GovernanceAction::LowerThreshold { threshold: t.parse()? }, None)),
+        (None, None, Some(g)) => Ok((GovernanceAction::SetGuardian { guardian: guardian_arg(&g)?.to_bytes() }, None)),
         _ => anyhow::bail!(
             "name exactly one action: --add-validator 0x.. | --lower-threshold N | \
-             --action-id 0x.. | --register-asset (with --debridge-id/--mint/--vault/--bridge-decimals)"
+             --set-guardian <pubkey|none> | --register-asset (with --debridge-id/--mint/--vault/--bridge-decimals)"
         ),
     }
+}
+
+/// A guardian argument: a pubkey, or `none` to clear it.
+fn guardian_arg(g: &str) -> anyhow::Result<Pubkey> {
+    if g.eq_ignore_ascii_case("none") {
+        return Ok(Pubkey::default());
+    }
+    Ok(Pubkey::from_str(g)?)
 }
 
 /// The four values an asset binding commits to, and the action id over them
@@ -581,20 +609,46 @@ fn run() -> anyhow::Result<()> {
         }
         // H-2 (round 4): queue a validator addition / threshold decrease.
         "schedule-governance" => {
-            let action_id = governance_action_id(&args)?;
-            println!("scheduling action 0x{}", hex::encode(action_id));
+            anyhow::ensure!(
+                !args.has("--action-id"),
+                "the gate no longer schedules an opaque --action-id (M7-1); name the action"
+            );
+            let (action, asset) = governance_action(&args)?;
+            let (mint, vault) = asset.unwrap_or_default();
+            let action_id = action.action_id(&mint.to_bytes(), &vault.to_bytes());
+            println!("scheduling {action:?}");
+            println!("action id 0x{}", hex::encode(action_id));
             println!(
                 "matures {}h after this lands; execute within the following {}-day grace window",
                 GOVERNANCE_DELAY_SECS / 3600,
                 GOVERNANCE_GRACE_SECS / 86_400
             );
+            let mut accounts = vec![
+                AccountMeta::new_readonly(config_pda, false),
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(gov_pda(&program_id, &action_id), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ];
+            if let Some((mint, vault)) = asset {
+                accounts.push(AccountMeta::new_readonly(mint, false));
+                accounts.push(AccountMeta::new_readonly(vault, false));
+                accounts.push(AccountMeta::new_readonly(Pubkey::from_str(SPL_TOKEN)?, false));
+            }
+            (GateInstruction::ScheduleAction(action).to_bytes(), accounts)
+        }
+        // M7-1: past the setup phase, replacing or clearing a SET guardian
+        // consumes `["gov", set_guardian_action_id(new)]`; the account is always
+        // attached and the program reads it only when it has to.
+        "set-guardian" => {
+            let guardian = guardian_arg(&args.req("--guardian")?)?;
+            let action_id = set_guardian_action_id(&guardian.to_bytes());
+            println!("setGuardian action id: 0x{}", hex::encode(action_id));
             (
-                GateInstruction::ScheduleGovernance { action_id }.to_bytes(),
+                GateInstruction::SetGuardian { guardian: guardian.to_bytes() }.to_bytes(),
                 vec![
-                    AccountMeta::new_readonly(config_pda, false),
-                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(config_pda, false),
+                    AccountMeta::new_readonly(payer.pubkey(), true),
                     AccountMeta::new(gov_pda(&program_id, &action_id), false),
-                    AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
                 ],
             )
         }

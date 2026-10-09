@@ -381,7 +381,7 @@ async fn validator_set_is_capped_at_the_declared_capacity() {
     // scheduled and aged first — this test is about the CAPACITY rule, which
     // must still fire after the timelock is satisfied.
     for v in [4u8, 5] {
-        exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&[v; 20])), &[&owner])
+        exec(&mut ctx, schedule_governance(owner.pubkey(), add([v; 20])), &[&owner])
             .await
             .expect("schedule");
     }
@@ -409,7 +409,7 @@ async fn validator_set_is_capped_at_the_declared_capacity() {
 // timelock was only ever as strong as this program's owner key.
 // ---------------------------------------------------------------------------
 
-use solana_gate::{add_validator_action_id, lower_threshold_action_id, GOVERNANCE_DELAY, GOVERNANCE_GRACE};
+use solana_gate::{add_validator_action_id, lower_threshold_action_id, GovernanceAction, GOVERNANCE_DELAY, GOVERNANCE_GRACE};
 use solana_program::clock::Clock;
 
 const GOVERNANCE_NOT_SCHEDULED: u32 = 17;
@@ -421,9 +421,17 @@ fn gov_pda(action_id: &[u8; 32]) -> Pubkey {
     Pubkey::find_program_address(&[b"gov", action_id], &PROGRAM_ID).0
 }
 
-fn schedule_governance(owner: Pubkey, action_id: [u8; 32]) -> Instruction {
+/// M7-1: the typed `ScheduleAction`. The PDA is derived from the action the
+/// same way the program derives it.
+fn schedule_governance(owner: Pubkey, action: GovernanceAction) -> Instruction {
+    let action_id = match &action {
+        GovernanceAction::AddValidator { validator } => add_validator_action_id(validator),
+        GovernanceAction::LowerThreshold { threshold } => lower_threshold_action_id(*threshold),
+        GovernanceAction::SetGuardian { guardian } => solana_gate::set_guardian_action_id(guardian),
+        GovernanceAction::RegisterAsset { .. } => panic!("use schedule_asset: it needs the mint and vault"),
+    };
     ix(
-        GateInstruction::ScheduleGovernance { action_id },
+        GateInstruction::ScheduleAction(action),
         vec![
             AccountMeta::new_readonly(config_pda(), false),
             AccountMeta::new(owner, true),
@@ -431,6 +439,27 @@ fn schedule_governance(owner: Pubkey, action_id: [u8; 32]) -> Instruction {
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         ],
     )
+}
+
+/// `ScheduleAction(RegisterAsset)`, which names the mint and vault as accounts.
+fn schedule_asset(owner: Pubkey, debridge_id: [u8; 32], mint: Pubkey, vault: Pubkey, bridge_decimals: u8) -> Instruction {
+    let action_id = solana_gate::register_asset_action_id(&debridge_id, &mint, &vault, bridge_decimals);
+    ix(
+        GateInstruction::ScheduleAction(GovernanceAction::RegisterAsset { debridge_id, bridge_decimals }),
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(owner, true),
+            AccountMeta::new(gov_pda(&action_id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+    )
+}
+
+fn add(validator: [u8; 20]) -> GovernanceAction {
+    GovernanceAction::AddValidator { validator }
 }
 
 fn cancel_governance(who: Pubkey, action_id: [u8; 32]) -> Instruction {
@@ -520,7 +549,7 @@ async fn a_matured_schedule_admits_the_validator_exactly_once() {
     let v = [0x44u8; 20];
     let action = add_validator_action_id(&v);
 
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(v)), &[&owner]).await.expect("schedule");
     let gov = ctx.banks_client.get_account(gov_pda(&action)).await.unwrap().expect("gov PDA created");
     assert_eq!(gov.owner, PROGRAM_ID, "schedule must be program-owned");
 
@@ -544,7 +573,7 @@ async fn a_matured_schedule_admits_the_validator_exactly_once() {
 async fn an_immature_schedule_is_refused() {
     let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
     let v = [0x44u8; 20];
-    exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&v)), &[&owner])
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(v)), &[&owner])
         .await
         .expect("schedule");
 
@@ -566,8 +595,7 @@ async fn an_immature_schedule_is_refused() {
 async fn an_expired_schedule_is_refused_and_can_be_rescheduled() {
     let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
     let v = [0x44u8; 20];
-    let action = add_validator_action_id(&v);
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(v)), &[&owner]).await.expect("schedule");
 
     advance_clock(&mut ctx, GOVERNANCE_DELAY + GOVERNANCE_GRACE + 1).await;
     let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
@@ -577,7 +605,7 @@ async fn an_expired_schedule_is_refused_and_can_be_rescheduled() {
     assert_eq!(read_config(&mut ctx).await.validators.len(), 3);
 
     // Re-scheduling restarts the clock on the SAME PDA (no create_account brick).
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("re-schedule");
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(v)), &[&owner]).await.expect("re-schedule");
     let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
         .await
         .expect_err("fresh schedule is immature again");
@@ -599,7 +627,7 @@ async fn the_guardian_may_cancel_a_scheduled_action_but_a_stranger_may_not() {
 
     let v = [0x44u8; 20];
     let action = add_validator_action_id(&v);
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(v)), &[&owner]).await.expect("schedule");
 
     let err = exec(&mut ctx, cancel_governance(stranger.pubkey(), action), &[&stranger])
         .await
@@ -618,7 +646,7 @@ async fn the_guardian_may_cancel_a_scheduled_action_but_a_stranger_may_not() {
     assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
 
     // Only the owner may SCHEDULE — the guardian is a stop button, not a start one.
-    let err = exec(&mut ctx, schedule_governance(guardian.pubkey(), action), &[&guardian])
+    let err = exec(&mut ctx, schedule_governance(guardian.pubkey(), add(v)), &[&guardian])
         .await
         .expect_err("guardian cannot schedule");
     assert!(format!("{err:?}").contains("MissingRequiredSignature"), "got {err:?}");
@@ -630,7 +658,7 @@ async fn the_guardian_may_cancel_a_scheduled_action_but_a_stranger_may_not() {
 async fn a_schedule_for_one_validator_does_not_admit_another() {
     let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
     let (a, b) = ([0xAAu8; 20], [0xBBu8; 20]);
-    exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&a)), &[&owner])
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(a)), &[&owner])
         .await
         .expect("schedule A");
     advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
@@ -672,7 +700,7 @@ async fn raising_the_threshold_is_instant_but_lowering_it_waits() {
     assert_eq!(read_config(&mut ctx).await.threshold, 3, "unchanged");
 
     // Schedule a decrease to 2, mature it, then try to spend it on 1.
-    exec(&mut ctx, schedule_governance(owner.pubkey(), lower_threshold_action_id(2)), &[&owner])
+    exec(&mut ctx, schedule_governance(owner.pubkey(), GovernanceAction::LowerThreshold { threshold: 2 }), &[&owner])
         .await
         .expect("schedule t=2");
     advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
@@ -724,7 +752,7 @@ async fn a_pre_funded_governance_pda_does_not_block_scheduling() {
         }
         .into(),
     );
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner])
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add([0x44u8; 20])), &[&owner])
         .await
         .expect("a pre-funded PDA must not brick scheduling");
     let gov = ctx.banks_client.get_account(gov_pda(&action)).await.unwrap().unwrap();
@@ -2427,8 +2455,7 @@ async fn registering_an_asset_on_a_sealed_gate_needs_a_matured_schedule() {
     // 2. Scheduled, but the delay has not run. This is the window the finding
     //    removed entirely: 48 h in which anyone can read the pending action id
     //    off the chain and the guardian can cancel it.
-    let action = solana_gate::register_asset_action_id(&debridge_id, &mint, &vault, 6);
-    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    exec(&mut ctx, schedule_asset(owner.pubkey(), debridge_id, mint, vault, 6), &[&owner]).await.expect("schedule");
     let err = exec(&mut ctx, register_asset_ix(owner.pubkey(), debridge_id, mint, vault, 6), &[&owner])
         .await
         .expect_err("an immature schedule must not be spendable");
@@ -2585,8 +2612,7 @@ async fn re_registering_a_pre_h5_asset_backfills_its_vault_binding_with_no_sched
     //    matters, and why it must not itself cost 48 h.
     let evil = [0xE1u8; 32];
     let evil_scale = FIXTURE_BRIDGE_DECIMALS - 3;
-    let action = solana_gate::register_asset_action_id(&evil, &fx.mint, &fx.vault, evil_scale);
-    exec(&mut fx.ctx, schedule_governance(fx.owner.pubkey(), action), &[&owner]).await.unwrap();
+    exec(&mut fx.ctx, schedule_asset(fx.owner.pubkey(), evil, fx.mint, fx.vault, evil_scale), &[&owner]).await.unwrap();
     advance_clock(&mut fx.ctx, GOVERNANCE_DELAY + 1).await;
 
     // 2. THE MIGRATION: re-register the asset that is already there, byte for
@@ -2627,4 +2653,213 @@ async fn re_registering_a_pre_h5_asset_backfills_its_vault_binding_with_no_sched
     assert_eq!(asset.bridge_decimals, FIXTURE_BRIDGE_DECIMALS);
     let vault = fx.ctx.banks_client.get_account(fx.vault).await.unwrap().unwrap();
     assert_eq!(spl_balance(&vault), 400_000, "not one unit moved during the migration");
+}
+
+// ---------------------------------------------------------------------------
+// M7-1 (audit round 7): the post-seal timelock must leave a usable veto.
+//
+// `SetGuardian` was instant, and the guardian is the only party besides the
+// owner that can cancel a schedule. So a stolen owner key queued an action and
+// cleared the guardian in the same transaction; the 48 hours then ran with
+// nobody able to stop them. And `ScheduleGovernance` took an opaque hash, so the
+// public window showed nobody WHAT was queued.
+// ---------------------------------------------------------------------------
+
+const USE_TYPED_SCHEDULE: u32 = 30;
+const NOT_SCHEDULABLE: u32 = 31;
+
+/// `SetGuardian` with the governance PDA a post-setup change consumes.
+fn set_guardian_ix(owner: Pubkey, guardian: Pubkey) -> Instruction {
+    ix(
+        GateInstruction::SetGuardian { guardian },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(gov_pda(&solana_gate::set_guardian_action_id(&guardian)), false),
+        ],
+    )
+}
+
+/// The PoC, refused: schedule a validator, then try to remove the veto at once.
+#[tokio::test]
+async fn m7_1_a_stolen_owner_key_cannot_clear_the_guardian_before_its_action_matures() {
+    let guardian = Keypair::new();
+    let (mut ctx, owner) = setup(8, 4, guardian.pubkey()).await;
+    fund(&mut ctx, guardian.pubkey()).await;
+    let attacker = [0xEEu8; 20];
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add(attacker)), &[&owner]).await.expect("schedule");
+
+    let err = exec(&mut ctx, set_guardian_ix(owner.pubkey(), Pubkey::default()), &[&owner])
+        .await
+        .expect_err("clearing a set guardian past setup must wait");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+    let err = exec(&mut ctx, set_guardian_ix(owner.pubkey(), Pubkey::new_unique()), &[&owner])
+        .await
+        .expect_err("so must replacing it");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+    assert_eq!(read_config(&mut ctx).await.guardian, guardian.pubkey());
+
+    // The guardian still holds the veto, and uses it.
+    exec(&mut ctx, cancel_governance(guardian.pubkey(), add_validator_action_id(&attacker)), &[&guardian])
+        .await
+        .expect("guardian cancels");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY + 1).await;
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), attacker, true), &[&owner])
+        .await
+        .expect_err("the vetoed validator never joins");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+}
+
+/// The guardian change is itself a scheduled action: visible, cancellable by
+/// the CURRENT guardian, and spendable once matured.
+#[tokio::test]
+async fn m7_1_a_guardian_change_is_scheduled_cancellable_and_then_applied() {
+    let guardian = Keypair::new();
+    let (mut ctx, owner) = setup(8, 4, guardian.pubkey()).await;
+    fund(&mut ctx, guardian.pubkey()).await;
+    let next = Pubkey::new_unique();
+    let id = solana_gate::set_guardian_action_id(&next);
+    let sched = GovernanceAction::SetGuardian { guardian: next };
+
+    // Vetoed by the guardian it would replace.
+    exec(&mut ctx, schedule_governance(owner.pubkey(), sched.clone()), &[&owner]).await.expect("schedule");
+    exec(&mut ctx, cancel_governance(guardian.pubkey(), id), &[&guardian]).await.expect("veto");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY + 1).await;
+    let err = exec(&mut ctx, set_guardian_ix(owner.pubkey(), next), &[&owner]).await.expect_err("vetoed");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+
+    // Not vetoed: immature, then applied, exactly once.
+    exec(&mut ctx, schedule_governance(owner.pubkey(), sched), &[&owner]).await.expect("re-schedule");
+    let err = exec(&mut ctx, set_guardian_ix(owner.pubkey(), next), &[&owner]).await.expect_err("immature");
+    assert!(is_custom(&err, GOVERNANCE_NOT_READY), "got {err:?}");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY + 1).await;
+    exec(&mut ctx, set_guardian_ix(owner.pubkey(), next), &[&owner]).await.expect("matured");
+    assert_eq!(read_config(&mut ctx).await.guardian, next);
+}
+
+/// What stays instant, as on the EVM gate: appointing a guardian where there is
+/// none (it only adds a veto), and any change during the setup phase.
+#[tokio::test]
+async fn m7_1_appointing_a_first_guardian_and_setup_phase_changes_stay_instant() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let first = Pubkey::new_unique();
+    let bare = |g: Pubkey| {
+        ix(
+            GateInstruction::SetGuardian { guardian: g },
+            vec![AccountMeta::new(config_pda(), false), AccountMeta::new_readonly(owner.pubkey(), true)],
+        )
+    };
+    exec(&mut ctx, bare(first), &[&owner]).await.expect("no guardian yet: instant");
+    assert_eq!(read_config(&mut ctx).await.guardian, first);
+
+    edit_config(&mut ctx, |c| {
+        c.sealed = false;
+        c.setup_deadline = i64::MAX;
+    })
+    .await;
+    let second = Pubkey::new_unique();
+    exec(&mut ctx, bare(second), &[&owner]).await.expect("setup phase: instant");
+    assert_eq!(read_config(&mut ctx).await.guardian, second);
+}
+
+#[tokio::test]
+async fn m7_1_the_opaque_schedule_is_refused() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let action_id = add_validator_action_id(&[0x44; 20]);
+    let opaque = ix(
+        GateInstruction::ScheduleGovernance { action_id },
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(gov_pda(&action_id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    let err = exec(&mut ctx, opaque, &[&owner]).await.expect_err("removed");
+    assert!(is_custom(&err, USE_TYPED_SCHEDULE), "got {err:?}");
+}
+
+/// A schedule is refused when its execution would be: it must not sit in the
+/// public queue looking legitimate.
+#[tokio::test]
+async fn m7_1_an_action_its_execution_would_refuse_cannot_be_scheduled() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    // Already a validator.
+    let err = exec(&mut ctx, schedule_governance(owner.pubkey(), add([1u8; 20])), &[&owner])
+        .await
+        .expect_err("already in the set");
+    assert!(is_custom(&err, NOT_SCHEDULABLE), "got {err:?}");
+    // Not a decrease (threshold is 2).
+    for t in [0u32, 2, 3] {
+        let err = exec(&mut ctx, schedule_governance(owner.pubkey(), GovernanceAction::LowerThreshold { threshold: t }), &[&owner])
+            .await
+            .expect_err("not a decrease");
+        assert!(is_custom(&err, NOT_SCHEDULABLE), "t={t}: got {err:?}");
+    }
+    // An asset whose mint and vault do not exist yet: the Solana form of the EVM
+    // gate's `TokenHasNoCode` (a CREATE2 address with nothing at it).
+    let err = exec(
+        &mut ctx,
+        schedule_asset(owner.pubkey(), [0xC1; 32], Pubkey::new_unique(), Pubkey::new_unique(), 6),
+        &[&owner],
+    )
+    .await
+    .expect_err("nothing at the mint");
+    assert!(format!("{err:?}").contains("IllegalOwner"), "got {err:?}");
+}
+
+/// A schedule queued under the old, unversioned id can never be consumed: the
+/// execution derives the versioned id, whose PDA is a different address.
+#[tokio::test]
+async fn m7_1_a_pre_upgrade_schedule_is_never_consumable() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let v = [0x55u8; 20];
+    let legacy_id = solana_program::keccak::hashv(&[b"addValidator", &v]).to_bytes();
+    assert_ne!(legacy_id, add_validator_action_id(&v), "premise: the id is versioned");
+    // A matured schedule left behind at the legacy PDA.
+    let now: Clock = ctx.banks_client.get_sysvar().await.unwrap();
+    let mut data = vec![0u8; 8];
+    solana_gate::GovernanceSchedule { ready_at: now.unix_timestamp - 1 }
+        .serialize(&mut &mut data[..])
+        .unwrap();
+    ctx.set_account(
+        &gov_pda(&legacy_id),
+        &Account { lamports: 1_000_000, data, owner: PROGRAM_ID, executable: false, rent_epoch: 0 }.into(),
+    );
+    let via_legacy = ix(
+        GateInstruction::SetValidator { validator: v, active: true },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner.pubkey(), true),
+            AccountMeta::new(gov_pda(&legacy_id), false),
+        ],
+    );
+    let err = exec(&mut ctx, via_legacy, &[&owner]).await.expect_err("legacy schedule");
+    assert!(format!("{err:?}").contains("InvalidSeeds"), "got {err:?}");
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner]).await.expect_err("never scheduled");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+}
+
+/// The host mirror derives the same ids and encodes `ScheduleAction` at 15.
+#[test]
+fn m7_1_the_host_mirror_matches_the_typed_schedule() {
+    use bridge_solana::instruction as host;
+    let g = Pubkey::new_unique();
+    assert_eq!(solana_gate::set_guardian_action_id(&g), host::set_guardian_action_id(&g.to_bytes()));
+    assert_eq!(add_validator_action_id(&[7; 20]), host::add_validator_action_id(&[7; 20]));
+    assert_eq!(lower_threshold_action_id(3), host::lower_threshold_action_id(3));
+    let cases = [
+        (host::GovernanceAction::AddValidator { validator: [7; 20] }, GovernanceAction::AddValidator { validator: [7; 20] }),
+        (host::GovernanceAction::LowerThreshold { threshold: 3 }, GovernanceAction::LowerThreshold { threshold: 3 }),
+        (
+            host::GovernanceAction::RegisterAsset { debridge_id: [9; 32], bridge_decimals: 6 },
+            GovernanceAction::RegisterAsset { debridge_id: [9; 32], bridge_decimals: 6 },
+        ),
+        (host::GovernanceAction::SetGuardian { guardian: g.to_bytes() }, GovernanceAction::SetGuardian { guardian: g }),
+    ];
+    for (h, p) in cases {
+        let bytes = host::GateInstruction::ScheduleAction(h).to_bytes();
+        assert_eq!(bytes[0], 15);
+        assert_eq!(bytes, borsh::to_vec(&GateInstruction::ScheduleAction(p)).unwrap());
+    }
 }

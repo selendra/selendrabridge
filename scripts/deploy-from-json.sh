@@ -899,7 +899,7 @@ at $got hashes to an id no validator signed. Use a fresh debridgeId, or a new pr
     if [[ "$PROFILE" == "production" ]]; then die "$msg. Deploy a fresh program with the right payer."; else warn "$msg"; fi
   fi
   # Post-deploy governance on this gate (validator add / threshold lower):
-  #   gate-admin schedule-governance <action-id>   # the id set-validator/set-threshold print
+  #   gate-admin schedule-governance --add-validator 0x.. | --lower-threshold N   (typed, M7-1)
   #   (wait GOVERNANCE_DELAY, 48h)  gate-admin set-validator … / set-threshold …
   #   gate-admin governance-status | cancel-governance <action-id>   (guardian may cancel)
   # And move the program's UPGRADE AUTHORITY behind the same multisig/timelock:

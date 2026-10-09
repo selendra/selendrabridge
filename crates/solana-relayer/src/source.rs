@@ -48,7 +48,8 @@ use bridge_solana::account::{self, AssetAccount};
 use bridge_solana::gate::Sent;
 use bridge_solana::hash::{amount_word, submission_id, submission_id_with_auto};
 use bridge_solana::relayer::{
-    gate_program_data_lines, parse_sent_event_line, verify_sent_record, SentEvent, PROGRAM_DATA_PREFIX,
+    auto_to_wire, encode_evm_auto_params, gate_program_data_lines, parse_sent_event_line,
+    verify_sent_record, SentEvent, PROGRAM_DATA_PREFIX,
     SENT_EVENT_VERSION,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -62,7 +63,7 @@ use crate::config::SourceChain;
 use crate::evm::GateReader;
 use crate::gate::{commitment, decode_config_view, evm_address, sign};
 use crate::state::Cursor;
-use crate::store::{Allowlist, SignerSig, Store, SubmissionRecord};
+use crate::store::{Allowlist, SignerSig, Store, StoreRejected, SubmissionRecord};
 
 /// One entry from `getSignaturesForAddress`.
 type SignatureEntry = solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
@@ -146,6 +147,19 @@ fn signable(sent: &Sent, bridge_domain: &[u8; 32], chain_id: u64) -> Result<(), 
     }
     Ok(())
 }
+
+/// `Scanner::handle`'s signed record was refused by the store for what it is
+/// (see [`StoreRejected::is_permanent`]); `process_line` quarantines the event.
+#[derive(Debug)]
+struct PermanentRejection(String);
+
+impl std::fmt::Display for PermanentRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the store permanently refused the signed record: {}", self.0)
+    }
+}
+
+impl std::error::Error for PermanentRejection {}
 
 /// The version byte of a tagged `Program data:` payload, read WITHOUT decoding
 /// the rest — so it is available even when a future layout no longer
@@ -565,7 +579,13 @@ impl Scanner {
             self.quarantine(tx, &reason)?;
             return Ok(false);
         }
-        self.handle(&event, &sent, tx).await
+        match self.handle(&event, &sent, tx).await {
+            Err(e) if e.downcast_ref::<PermanentRejection>().is_some() => {
+                self.quarantine(tx, &e.to_string())?;
+                Ok(false)
+            }
+            other => other,
+        }
     }
 
     /// Record a never-signable event and move on (see [`Self::process_line`]).
@@ -650,7 +670,30 @@ impl Scanner {
             return Ok(false);
         }
 
-        let record = SubmissionRecord {
+        let record = self.signed_record(sent);
+
+        if let Err(e) = self.store.upsert(&record).await {
+            return match e.downcast_ref::<StoreRejected>() {
+                // A record the store refuses for what it IS will be refused on
+                // every retry; holding the cursor on it stops this validator
+                // attesting every Solana transfer after it (H7-6). Quarantined by
+                // the caller, exactly like an event that cannot be signed.
+                Some(r) if r.is_permanent() => Err(PermanentRejection(r.to_string()).into()),
+                _ => Err(e),
+            };
+        }
+        info!(
+            submission_id = %record.submission_id,
+            nonce = sent.nonce,
+            chain_to = sent.chain_id_to,
+            "SIGNED and stored"
+        );
+        Ok(true)
+    }
+
+    /// The record this validator posts for `sent`, carrying its signature.
+    fn signed_record(&self, sent: &Sent) -> SubmissionRecord {
+        SubmissionRecord {
             submission_id: format!("0x{}", hex::encode(sent.submission_id)),
             // The SAME domain this scanner recomputed the id under, so the store
             // re-derives the identical id. Reading it from `self` (which loaded it
@@ -666,9 +709,14 @@ impl Scanner {
             chain_id_to: sent.chain_id_to,
             nonce: sent.nonce,
             receiver: format!("0x{}", hex::encode(&sent.receiver)),
-            // Solana auto-params ride in the id, not as EVM-encoded bytes; the
-            // store treats an empty string as "no payload".
-            auto_params: "0x".to_string(),
+            // ABI-encoded exactly as an EVM `Sent` carries it, because that is
+            // what the store recomputes the id from (H7-6). This used to be "0x"
+            // always, so a with-auto transfer recomputed to the PLAIN id, was
+            // refused `IdMismatch`, and halted the scanner on every retry.
+            auto_params: match sent.auto.as_ref() {
+                None => "0x".to_string(),
+                Some(auto) => format!("0x{}", hex::encode(encode_evm_auto_params(&auto_to_wire(auto)))),
+            },
             native_sender: format!("0x{}", hex::encode(&sent.native_sender)),
             // `token` is the EVM-side ERC-20 for the refund relayer. A Solana
             // transfer's asset is the SPL mint, which does not hash to the same
@@ -681,16 +729,7 @@ impl Scanner {
             }],
             cancel_signatures: vec![],
             refund_signatures: vec![],
-        };
-
-        self.store.upsert(&record).await?;
-        info!(
-            submission_id = %record.submission_id,
-            nonce = sent.nonce,
-            chain_to = sent.chain_id_to,
-            "SIGNED and stored"
-        );
-        Ok(true)
+        }
     }
 
     /// The asset's `10^(local-bridge)` scale, from the gate's own
@@ -1147,6 +1186,84 @@ mod quarantine_tests {
 
     /// The event is refused, recorded (in memory AND in the state file), and the
     /// line reports "nothing signed" instead of an error — so `tick` advances.
+    /// A transfer WITH an execution payload, as a Solana `send` with
+    /// `auto: Some(..)` emits it.
+    fn with_auto() -> Sent {
+        use bridge_solana::instruction::AutoParamsWire;
+        let mut s = good();
+        let wire = AutoParamsWire {
+            execution_fee: 5_000,
+            flags: 2,
+            fallback_address: vec![0xFA; 20],
+            data: vec![0xDA; 33],
+        };
+        s.auto = Some(bridge_solana::relayer::wire_to_auto(&wire, &s.native_sender));
+        s.submission_id = recompute(&s, &DOMAIN);
+        s
+    }
+
+    /// H7-6: the stored record must carry the payload the id commits to, in
+    /// the EVM encoding the store recomputes from. It used to be "0x" always,
+    /// which recomputes to the plain id: a different hash, refused forever.
+    #[test]
+    fn a_with_auto_record_carries_the_payload_its_id_commits_to() {
+        use bridge_solana::relayer::{decode_evm_auto_params, wire_to_auto};
+        let sc = scanner("auto-record");
+        let sent = with_auto();
+        let rec = sc.signed_record(&sent);
+        let blob = hex::decode(rec.auto_params.trim_start_matches("0x")).unwrap();
+        let wire = decode_evm_auto_params(&blob).unwrap().expect("a payload, not none");
+        let native_sender = hex::decode(rec.native_sender.trim_start_matches("0x")).unwrap();
+        let mut again = sent.clone();
+        again.auto = Some(wire_to_auto(&wire, &native_sender));
+        assert_eq!(recompute(&again, &DOMAIN), sent.submission_id);
+        assert_ne!(
+            { let mut plain = sent.clone(); plain.auto = None; recompute(&plain, &DOMAIN) },
+            sent.submission_id,
+            "premise: the plain id is a different hash"
+        );
+        assert_eq!(sc.signed_record(&good()).auto_params, "0x", "no payload stays 0x");
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_record_itself_is_permanent() {
+        let r = |status| StoreRejected { status, body: String::new() };
+        for s in [400, 409, 413, 422] {
+            assert!(r(s).is_permanent(), "{s}");
+        }
+        // A bad token or an unbound signer would refuse EVERY record: scanning
+        // past it would drop every transfer, so it must halt instead.
+        for s in [401, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(!r(s).is_permanent(), "{s}");
+        }
+    }
+
+    /// Against a REAL sig-store (`SIG_STORE_TEST_URL`, an open local store):
+    /// the record this scanner now builds for a with-auto transfer is accepted,
+    /// and the record it used to build is refused in a way the scanner treats
+    /// as permanent. Skipped, passing, when the variable is unset.
+    #[tokio::test]
+    async fn a_real_sig_store_accepts_the_with_auto_record() {
+        let Ok(url) = std::env::var("SIG_STORE_TEST_URL") else {
+            eprintln!("SIG_STORE_TEST_URL unset — skipping live sig-store test");
+            return;
+        };
+        let mut sc = scanner("auto-live");
+        sc.store = Store::new(&url, None).unwrap();
+        let mut sent = with_auto();
+        sent.nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+        sent.submission_id = recompute(&sent, &DOMAIN);
+
+        let mut old = sc.signed_record(&sent);
+        old.auto_params = "0x".into();
+        let err = sc.store.upsert(&old).await.expect_err("the pre-fix record is refused");
+        let rej = err.downcast_ref::<StoreRejected>().expect("a store refusal, not a transport error");
+        assert!(rej.is_permanent(), "{rej}");
+        assert!(rej.body.contains("does not match the recomputed id"), "{rej}");
+
+        sc.store.upsert(&sc.signed_record(&sent)).await.expect("the fixed record is accepted");
+    }
+
     async fn assert_quarantined(sc: &mut Scanner, line: &str, reason_has: &str) {
         let signed = sc.process_line(line, "TX1").await.expect("quarantined, not a hard error");
         assert!(!signed, "an unsignable event must never be signed");

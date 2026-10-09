@@ -20,7 +20,7 @@
 //!          [--fee-bps N] [--deviation-bps N] [--min-price-interval SECS]
 //!          [--guardian <pubkey>] [--oracle <pubkey>]
 //!     list-token --mint <pubkey> --vault <pubkey> --price <PRICE_ONE-scaled>
-//!     set-price  --mint <pubkey> --price <PRICE_ONE-scaled>
+//!     set-price  --mint <pubkey> --price <PRICE_ONE-scaled> [--expected <current price>]
 //!     seed       --mint <pubkey> --amount N --from <token account>
 //!     withdraw   --mint <pubkey> --amount N --to <token account>
 //!     swap       --mint-in <pubkey> --mint-out <pubkey> --amount N
@@ -296,10 +296,21 @@ fn run() -> anyhow::Result<()> {
                 ],
             )
         }
+        // M7-4: a compare-and-set. `--expected` is the price you are moving
+        // FROM; without it the current on-chain price is read and shown, so an
+        // operator sees what the step is measured from.
         "set-price" => {
             let mint = args.key("--mint")?;
+            let expected: u128 = match args.get("--expected") {
+                Some(e) => e.parse()?,
+                None => {
+                    let rec = TokenRec::deserialize(&mut &rpc.get_account(&token_pda(&mint))?.data[..])?;
+                    println!("current on-chain price {} (pass --expected to pin it)", rec.price);
+                    rec.price
+                }
+            };
             (
-                SwapInstruction::SetPrice { price: args.req("--price")?.parse()? }.to_bytes(),
+                SwapInstruction::SetPriceFrom { expected, price: args.req("--price")?.parse()? }.to_bytes(),
                 vec![
                     AccountMeta::new_readonly(pool_pda, false),
                     AccountMeta::new_readonly(payer.pubkey(), true),

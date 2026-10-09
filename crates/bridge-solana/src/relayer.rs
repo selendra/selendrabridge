@@ -517,6 +517,39 @@ pub fn decode_evm_auto_params(blob: &[u8]) -> Result<Option<AutoParamsWire>, Aut
     }))
 }
 
+/// The inverse of [`decode_evm_auto_params`]: `abi.encode(AutoParamsTo)` of a
+/// Solana event's payload, i.e. the `auto_params` blob the store (and every EVM
+/// component) reads (audit round 7, H7-6).
+///
+/// The Solana relayer used to store a with-auto transfer with `auto_params:
+/// "0x"`. The store recomputes the id from the record, got the PLAIN id, which
+/// is a different hash from the one the program emitted, and refused the record
+/// `IdMismatch` — on every retry, so one such `send` halted the scanner.
+pub fn encode_evm_auto_params(w: &AutoParamsWire) -> Vec<u8> {
+    fn word(v: u128) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[16..].copy_from_slice(&v.to_be_bytes());
+        o
+    }
+    fn padded(b: &[u8]) -> Vec<u8> {
+        let mut out = word(b.len() as u128).to_vec();
+        out.extend_from_slice(b);
+        out.resize(32 + b.len().div_ceil(32) * 32, 0);
+        out
+    }
+    let fallback = padded(&w.fallback_address);
+    let data = padded(&w.data);
+    let mut out = Vec::with_capacity(32 * 5 + fallback.len() + data.len());
+    out.extend_from_slice(&word(32)); // offset of the tuple
+    out.extend_from_slice(&word(w.execution_fee));
+    out.extend_from_slice(&word(w.flags as u128));
+    out.extend_from_slice(&word(128)); // fallbackAddress, relative to the tuple
+    out.extend_from_slice(&word(128 + fallback.len() as u128)); // data
+    out.extend_from_slice(&fallback);
+    out.extend_from_slice(&data);
+    out
+}
+
 /// Build the Borsh `Claim` instruction the keeper submits to the Solana gate.
 ///
 /// Signatures are sorted by recovered signer address strictly ascending — exactly
@@ -984,6 +1017,37 @@ mod tests {
                 &bridge_core::decode_auto_params(&encoded, &native_sender).unwrap().unwrap(),
             );
             assert_eq!(ours, theirs.0, "id from decoded auto-params diverged from bridge-core");
+        }
+    }
+
+    /// H7-6: the encoder must produce byte-for-byte what alloy's
+    /// `abi_encode` does, and decode back to the same fields.
+    #[test]
+    fn evm_auto_params_encode_matches_alloy() {
+        use alloy::sol_types::SolValue;
+        use bridge_core::abi::AutoParamsTo;
+
+        for (fee, flags, fallback, data) in [
+            (0u128, 0u64, vec![], vec![]),
+            (1_000_000, 1, vec![0xAAu8; 20], vec![1, 2, 3]),
+            (u128::MAX, u64::MAX, vec![0xBB; 32], vec![0u8; 100]),
+            (7, 2, vec![], vec![0xCC; 33]),
+        ] {
+            let wire = AutoParamsWire {
+                execution_fee: fee,
+                flags,
+                fallback_address: fallback.clone(),
+                data: data.clone(),
+            };
+            let theirs = AutoParamsTo {
+                executionFee: alloy_primitives::U256::from(fee),
+                flags: alloy_primitives::U256::from(flags),
+                fallbackAddress: fallback.into(),
+                data: data.into(),
+            }
+            .abi_encode();
+            assert_eq!(encode_evm_auto_params(&wire), theirs);
+            assert_eq!(decode_evm_auto_params(&theirs), Ok(Some(wire)));
         }
     }
 

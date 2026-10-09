@@ -255,15 +255,25 @@ async fn setup_with(hub_reserve: u64, alt_reserve: u64, user_hub_balance: u64, f
     Fx { ctx, owner, user, hub_mint, alt_mint, hub_vault, alt_vault, user_hub, user_alt, new_mint, new_vault }
 }
 
-fn set_price_ix(fx: &Fx, mint: Pubkey, price: u128) -> Instruction {
+/// `SetPriceFrom`, expecting the price the token has right now (M7-4).
+async fn set_price_ix(ctx: &mut ProgramTestContext, oracle: Pubkey, mint: Pubkey, price: u128) -> Instruction {
+    let expected = rec(ctx, mint).await.price;
+    set_price_from(oracle, mint, expected, price)
+}
+
+fn set_price_from_ix(fx: &Fx, mint: Pubkey, expected: u128, price: u128) -> Instruction {
+    set_price_from(fx.owner.pubkey(), mint, expected, price)
+}
+
+fn set_price_from(oracle: Pubkey, mint: Pubkey, expected: u128, price: u128) -> Instruction {
     Instruction {
         program_id: PROGRAM_ID,
         accounts: vec![
             AccountMeta::new_readonly(pool_pda(), false),
-            AccountMeta::new_readonly(fx.owner.pubkey(), true),
+            AccountMeta::new_readonly(oracle, true),
             AccountMeta::new(token_pda(&mint), false),
         ],
-        data: SwapInstruction::SetPrice { price }.to_bytes(),
+        data: SwapInstruction::SetPriceFrom { expected, price }.to_bytes(),
     }
 }
 
@@ -469,7 +479,7 @@ async fn the_hub_price_can_never_be_moved() {
             AccountMeta::new_readonly(fx.owner.pubkey(), true),
             AccountMeta::new(token_pda(&fx.hub_mint), false),
         ],
-        data: SwapInstruction::SetPrice { price: 2 * PRICE_ONE }.to_bytes(),
+        data: SwapInstruction::SetPriceFrom { expected: PRICE_ONE, price: 2 * PRICE_ONE }.to_bytes(),
     };
     let owner = fx.owner.insecure_clone();
     send(&mut fx.ctx, ix, &owner).await.expect_err("the unit of account is pinned at 1.0");
@@ -481,16 +491,16 @@ async fn a_price_move_past_the_deviation_cap_is_refused() {
     let mut fx = setup(0, 1_000, 1_000, 0).await;
     let owner = fx.owner.insecure_clone();
     // The first move after listing skips the COOLDOWN (a -5.7% step, within cap).
-    let ix = set_price_ix(&fx, fx.alt_mint, 3000 * PRICE_ONE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, 3000 * PRICE_ONE).await;
     send(&mut fx.ctx, ix, &owner).await.expect("first reprice: no cooldown, within cap");
     assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, 3000 * PRICE_ONE);
     // Immediately again: the cooldown binds now.
-    let ix = set_price_ix(&fx, fx.alt_mint, 3100 * PRICE_ONE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, 3100 * PRICE_ONE).await;
     let err = send(&mut fx.ctx, ix, &owner).await.expect_err("second reprice inside the cooldown");
     assert!(err.contains(&custom(SwapError::PriceUpdateTooSoon)), "got: {err}");
     // Past the cooldown, the cap binds — 10% here, and this asks for +100%.
     advance_clock(&mut fx.ctx, 3601).await;
-    let ix = set_price_ix(&fx, fx.alt_mint, 6000 * PRICE_ONE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, 6000 * PRICE_ONE).await;
     let err = send(&mut fx.ctx, ix, &owner).await.expect_err("a 100% step past a 10% cap must be refused");
     assert!(err.contains(&custom(SwapError::PriceDeviationTooHigh)), "got: {err}");
     assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, 3000 * PRICE_ONE, "price unchanged");
@@ -504,16 +514,16 @@ async fn the_first_reprice_after_listing_is_capped_too() {
     let owner = fx.owner.insecure_clone();
     assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.last_price_update, 0, "never repriced");
     // A compromised oracle key's play: price the fresh listing at ~0 …
-    let ix = set_price_ix(&fx, fx.alt_mint, 1);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, 1).await;
     let err = send(&mut fx.ctx, ix, &owner).await.expect_err("first move past the cap must be refused");
     assert!(err.contains(&custom(SwapError::PriceDeviationTooHigh)), "got: {err}");
     // … or at 2x. Both exceed a 10% cap.
-    let ix = set_price_ix(&fx, fx.alt_mint, 2 * ALT_PRICE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, 2 * ALT_PRICE).await;
     let err = send(&mut fx.ctx, ix, &owner).await.expect_err("first move past the cap must be refused");
     assert!(err.contains(&custom(SwapError::PriceDeviationTooHigh)), "got: {err}");
     assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, ALT_PRICE, "price unchanged");
     // Exactly at the cap (+10%) passes, and is still cooldown-free.
-    let ix = set_price_ix(&fx, fx.alt_mint, ALT_PRICE + ALT_PRICE / 10);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, ALT_PRICE + ALT_PRICE / 10).await;
     send(&mut fx.ctx, ix, &owner).await.expect("a step exactly at the cap is allowed");
     assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, ALT_PRICE + ALT_PRICE / 10);
 }
@@ -579,7 +589,7 @@ async fn a_stale_price_refuses_swaps_until_the_oracle_confirms_it() {
 
     // The oracle re-confirms the SAME price (a zero move is within any cap and
     // the first reprice has no cooldown) and trading resumes.
-    let ix = set_price_ix(&fx, fx.alt_mint, ALT_PRICE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, ALT_PRICE).await;
     send(&mut fx.ctx, ix, &owner).await.expect("re-confirming the price");
     let ix = swap_ix(&fx, amount_in + 2, 0, false);
     send(&mut fx.ctx, ix, &user).await.expect("confirmed price trades again");
@@ -605,7 +615,7 @@ async fn a_legacy_record_fails_closed_until_repriced() {
     assert!(err.contains(&custom(SwapError::StalePrice)), "got: {err}");
 
     // Every other handler still reads the legacy record fine.
-    let ix = set_price_ix(&fx, fx.alt_mint, ALT_PRICE);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, ALT_PRICE).await;
     send(&mut fx.ctx, ix, &owner).await.expect("legacy record reprices");
     assert_ne!(rec(&mut fx.ctx, fx.alt_mint).await.price_set_at, 0);
     let ix = swap_ix(&fx, amount_in, 0, false);
@@ -680,10 +690,10 @@ async fn set_max_price_deviation_is_bounded_and_takes_effect() {
     send(&mut fx.ctx, ix, &owner).await.expect("owner tightens to 5%");
     assert_eq!(pool(&mut fx.ctx).await.max_price_deviation_bps, 500);
     // A 6% move now fails where it passed under the 10% cap.
-    let ix = set_price_ix(&fx, fx.alt_mint, ALT_PRICE + ALT_PRICE * 6 / 100);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, ALT_PRICE + ALT_PRICE * 6 / 100).await;
     let err = send(&mut fx.ctx, ix, &owner).await.expect_err("6% past a 5% cap");
     assert!(err.contains(&custom(SwapError::PriceDeviationTooHigh)), "got: {err}");
-    let ix = set_price_ix(&fx, fx.alt_mint, ALT_PRICE + ALT_PRICE * 4 / 100);
+    let ix = set_price_ix(&mut fx.ctx, fx.owner.pubkey(), fx.alt_mint, ALT_PRICE + ALT_PRICE * 4 / 100).await;
     send(&mut fx.ctx, ix, &owner).await.expect("4% within a 5% cap");
 }
 
@@ -726,4 +736,47 @@ async fn a_swap_cannot_be_pointed_at_another_assets_vault() {
     ix.accounts[7] = AccountMeta::new(fx.hub_vault, false); // out-vault := hub's
     let user = fx.user.insecure_clone();
     send(&mut fx.ctx, ix, &user).await.expect_err("vault must match the token record");
+}
+
+
+// ---------------------------------------------------------------------------
+// M7-4 (audit round 7): the oracle's step is bound to the price it planned from.
+// ---------------------------------------------------------------------------
+
+/// A step planned from a lied read reverts instead of landing: the price the
+/// oracle believed it was moving from is not the one on-chain.
+#[tokio::test]
+async fn m7_4_a_step_planned_from_a_stale_or_lied_price_is_refused() {
+    let mut fx = setup(0, 1_000, 1_000, 0).await;
+    let owner = fx.owner.insecure_clone();
+    // The lie: an RPC said the price was 5% higher, and the oracle stepped up
+    // from there. The move itself is inside the cap; only its premise is false.
+    let lied = ALT_PRICE + ALT_PRICE * 5 / 100;
+    let ix = set_price_from_ix(&fx, fx.alt_mint, lied, lied + lied / 100);
+    let err = send(&mut fx.ctx, ix, &owner).await.expect_err("planned from a price that is not on-chain");
+    assert!(err.contains(&custom(SwapError::PriceChanged)), "got {err:?}");
+    assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, ALT_PRICE, "nothing landed");
+
+    // From the true price, the same size of step lands.
+    let ix = set_price_from_ix(&fx, fx.alt_mint, ALT_PRICE, ALT_PRICE + ALT_PRICE / 100);
+    send(&mut fx.ctx, ix, &owner).await.expect("planned from the real price");
+    assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, ALT_PRICE + ALT_PRICE / 100);
+}
+
+#[tokio::test]
+async fn m7_4_the_unconditional_set_price_is_refused() {
+    let mut fx = setup(0, 1_000, 1_000, 0).await;
+    let owner = fx.owner.insecure_clone();
+    let ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(pool_pda(), false),
+            AccountMeta::new_readonly(fx.owner.pubkey(), true),
+            AccountMeta::new(token_pda(&fx.alt_mint), false),
+        ],
+        data: SwapInstruction::SetPrice { price: ALT_PRICE + 1 }.to_bytes(),
+    };
+    let err = send(&mut fx.ctx, ix, &owner).await.expect_err("removed");
+    assert!(err.contains(&custom(SwapError::SetPriceRemoved)), "got {err:?}");
+    assert_eq!(rec(&mut fx.ctx, fx.alt_mint).await.price, ALT_PRICE);
 }

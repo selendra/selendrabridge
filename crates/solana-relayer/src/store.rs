@@ -23,6 +23,36 @@ pub const REFUND_PAGE: u64 = 500;
 /// Mirrors `bridge_core::backend::MAX_REFUND_PAGES`.
 pub const MAX_REFUND_PAGES: u64 = 20;
 
+/// The sig-store answered a POST with a non-success status.
+#[derive(Debug)]
+pub struct StoreRejected {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for StoreRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sig-store rejected the submission ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for StoreRejected {}
+
+impl StoreRejected {
+    /// The store will refuse this exact record however often it is resent: it
+    /// is malformed or fails a binding (400), too large (413), undecodable
+    /// (422), or conflicts with what is stored (409).
+    ///
+    /// Everything else is NOT permanent and must keep the scanner where it is:
+    /// 401/403 is a token or signer-binding fault on THIS relayer, which would
+    /// refuse every record alike, so scanning past it would drop every transfer
+    /// until an operator noticed; 404, 408, 429 and 5xx are the store being
+    /// misrouted, slow, busy or down.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self.status, 400 | 409 | 413 | 422)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignerSig {
     pub signer: String,
@@ -123,13 +153,17 @@ impl Store {
     /// POST a record plus this validator's signature. The server enforces the
     /// id⇄params binding and signature authenticity, so a bug here cannot poison
     /// the store — it can only get us rejected.
+    ///
+    /// A refusal comes back as a [`StoreRejected`] inside the error, so the
+    /// scanner can tell a record the store will never take from a store that is
+    /// down or misconfigured (audit round 7, H7-6).
     pub async fn upsert(&self, record: &SubmissionRecord) -> anyhow::Result<()> {
         let res =
             self.client.post(format!("{}/submissions", self.base)).json(record).send().await?;
         if !res.status().is_success() {
-            let status = res.status();
+            let status = res.status().as_u16();
             let body = error_text(res).await;
-            anyhow::bail!("sig-store rejected the submission ({status}): {body}");
+            return Err(StoreRejected { status, body }.into());
         }
         Ok(())
     }

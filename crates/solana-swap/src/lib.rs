@@ -92,7 +92,8 @@ pub enum SwapInstruction {
     Init(InitPoolArgs),
     /// List a mint at `price` (PRICE_ONE-scaled, quoted in hub units).
     ListToken { price: u128 },
-    /// Move a listed token's price. Oracle-gated, deviation- and cooldown-capped.
+    /// REMOVED (audit round 7, M7-4): always fails `SetPriceRemoved`. Kept so the
+    /// discriminants after it stay put. Use [`SwapInstruction::SetPriceFrom`].
     SetPrice { price: u128 },
     /// Move `amount` from the owner into the token's vault as reserve.
     SeedLiquidity { amount: u64 },
@@ -118,6 +119,16 @@ pub enum SwapInstruction {
     /// Owner only; the reprice cooldown, in seconds (zero disables it, as
     /// `SwapPool.setMinPriceUpdateInterval` allows; negative is refused).
     SetMinPriceUpdateInterval { seconds: i64 },
+    /// Move a listed token's price — only if it is still `expected`. Oracle-gated,
+    /// deviation- and cooldown-capped. Mirrors `SwapPool.setPrice(token,
+    /// expectedOld, newPrice)` (audit round 7, M7-4).
+    ///
+    /// The oracle plans every step from the price it READ, and a read is only as
+    /// honest as the endpoint that served it. Without the expected price bound
+    /// into the instruction, a lying RPC could steer one capped step per interval
+    /// away from the target, every interval, with the oracle signing each one.
+    /// Bound, a step planned from a lie reverts `PriceChanged` instead of landing.
+    SetPriceFrom { expected: u128, price: u128 },
 }
 
 impl SwapInstruction {
@@ -172,6 +183,12 @@ pub enum SwapError {
     StalePrice,
     #[error("fee exceeds the 10% cap")]
     FeeTooHigh,
+    /// M7-4: `SetPriceFrom` named a price the token no longer has.
+    #[error("the on-chain price is not the one this update was planned from")]
+    PriceChanged,
+    /// M7-4: the unconditional `SetPrice` was called.
+    #[error("SetPrice is removed — use SetPriceFrom with the expected current price")]
+    SetPriceRemoved,
 }
 
 impl From<SwapError> for ProgramError {
@@ -215,7 +232,13 @@ pub fn process_instruction(
     match ix {
         SwapInstruction::Init(args) => process_init(program_id, accounts, args),
         SwapInstruction::ListToken { price } => process_list_token(program_id, accounts, price),
-        SwapInstruction::SetPrice { price } => process_set_price(program_id, accounts, price),
+        SwapInstruction::SetPrice { .. } => {
+            msg!("SetPrice is removed (M7-4): use SetPriceFrom");
+            Err(SwapError::SetPriceRemoved.into())
+        }
+        SwapInstruction::SetPriceFrom { expected, price } => {
+            process_set_price(program_id, accounts, expected, price)
+        }
         SwapInstruction::SeedLiquidity { amount } => process_liquidity(program_id, accounts, amount, true),
         SwapInstruction::WithdrawLiquidity { amount } => process_liquidity(program_id, accounts, amount, false),
         SwapInstruction::Swap { amount_in, min_amount_out } => {
@@ -546,7 +569,12 @@ fn process_list_token(program_id: &Pubkey, accounts: &[AccountInfo], price: u128
 }
 
 /// Accounts: [pool, oracle(s), token_rec(w)]
-fn process_set_price(program_id: &Pubkey, accounts: &[AccountInfo], price: u128) -> ProgramResult {
+fn process_set_price(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    expected: u128,
+    price: u128,
+) -> ProgramResult {
     let it = &mut accounts.iter();
     let pool_ai = next_account_info(it)?;
     let oracle = next_account_info(it)?;
@@ -567,6 +595,14 @@ fn process_set_price(program_id: &Pubkey, accounts: &[AccountInfo], price: u128)
     }
     if rec.mint == pool.hub_mint {
         return Err(SwapError::HubRepriceForbidden.into());
+    }
+
+    // M7-4: compare-and-set, before anything else about the move is judged —
+    // the cap and the cooldown are measured from a price the oracle must agree it
+    // is moving from.
+    if rec.price != expected {
+        msg!("price is {}, not the expected {}", rec.price, expected);
+        return Err(SwapError::PriceChanged.into());
     }
 
     let now = Clock::get()?.unix_timestamp;

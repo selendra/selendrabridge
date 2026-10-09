@@ -245,6 +245,24 @@ test.describe("slippage floors (M7-7)", () => {
       });
     }
   }
+  // Live on mesh12 (2026-10-08): the API could not list the destination pool
+  // (its RPC refused the pool's log history), so the destination stable was
+  // unknown — and the button said "Checking the stable's bridge scale…" for
+  // ever, with nothing being checked. Unknown must be SAID, and still refuse.
+  test("an unknown destination stable is reported, not left 'Checking…' for ever", async ({ page }) => {
+    await startApp(page, {
+      wallet: { chainId: 1337, calls: CALLS, receiptLogs: [sentLog] },
+      backend: { swapPool: { 1337: pool(1337, STABLE_A, 18, TOKEN_18, 18), 1338: null } },
+    });
+    await connectWallet(page);
+    await gotoView(page, "Bridge");
+    await page.getByRole("button", { name: "Swap on arrival" }).click();
+    await field(page, "Final token").fill(STABLE_B);
+    await amountInput(page).fill("5");
+    await expect(primaryButton(page)).toHaveText("Can't read the stable's bridge scale", { timeout: 10_000 });
+    await expect(primaryButton(page)).toBeDisabled();
+    expect(await sentTransactions(page)).toHaveLength(0);
+  });
 });
 
 test.describe("the swapAndBridge → finalize lifecycle", () => {
